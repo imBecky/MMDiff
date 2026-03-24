@@ -74,8 +74,8 @@ def log_projection_gradients(model, logger, writer, step_for_tb: int):
 
 def compute_classification_loss(model, data_dict, labels, loss_fn):
     """
-    训练用：可选 全局 GAP + 中心区域 双项 CE/Focal（见 param.USE_CENTER_LOSS）。
-    loss_fn 与 MultimodalClassifier.loss_func 一致（ce 或 focal）。
+    训练用：可选 全局 + 中心 双项交叉熵（见 param.USE_CENTER_LOSS）。
+    loss_fn 与 MultimodalClassifier.loss_func 一致（CrossEntropyLoss）。
     返回的 logits 用于 train_acc 统计：若 USE_CENTER_LOSS 则用 logits_c，与 eval 保持一致。
     """
     if USE_CENTER_LOSS:

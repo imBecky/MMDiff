@@ -148,9 +148,14 @@ FEAT_SCALES = [
 CLS_DIFFUSION_TIMESTEPS = [50]
 CLS_INIT_TYPE = 'kaiming'
 CLS_INIT_SCALE = 0.1
-CLS_LOSS_TYPE = 'focal'
-CLS_FOCAL_GAMMA = 2.0
 CLS_OUTPUT_CM_SIZE = 3
+# 多模态 Transformer 分类头（见 model/multimodal.py）
+CLS_TOKEN_DIM = 256
+CLS_TRANSFORMER_HEADS = 4
+CLS_TRANSFORMER_LAYERS = 2
+CLS_TRANSFORMER_FF_DIM = 512
+CLS_TRANSFORMER_DROPOUT = 0.1
+CLS_HEAD_HIDDEN = 128
 
 
 def build_opt():
@@ -251,10 +256,14 @@ def build_opt():
             ('init_type', CLS_INIT_TYPE),
             ('scale', CLS_INIT_SCALE),
             ('out_channels', NUM_CLASSES),
-            ('loss_type', CLS_LOSS_TYPE),
-            ('focal_gamma', CLS_FOCAL_GAMMA),
             ('output_cm_size', CLS_OUTPUT_CM_SIZE),
             ('t', list(CLS_DIFFUSION_TIMESTEPS)),
+            ('token_dim', CLS_TOKEN_DIM),
+            ('transformer_heads', CLS_TRANSFORMER_HEADS),
+            ('transformer_layers', CLS_TRANSFORMER_LAYERS),
+            ('transformer_ff_dim', CLS_TRANSFORMER_FF_DIM),
+            ('transformer_dropout', CLS_TRANSFORMER_DROPOUT),
+            ('head_hidden', CLS_HEAD_HIDDEN),
             ('resume_state', None),
         ]
     )
