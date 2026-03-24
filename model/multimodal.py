@@ -171,9 +171,10 @@ class MultimodalClassifier(nn.Module):
         ch_map = _probe_diffusion_layer_channels(
             diffusion, self.feat_layer_names, img_size, self.diffusion_t,
         )
-        self.rgb_projs = nn.ModuleDict({
-            name: RGBLayerToToken(ch_map[name], d_model) for name in self.feat_layer_names
-        })
+        # ModuleDict 的 key 不能含 "."（与 down_blocks.1 等 UNet 子模块名冲突），用 ModuleList 与 feat_layer_names 顺序对齐
+        self.rgb_projs = nn.ModuleList(
+            [RGBLayerToToken(ch_map[name], d_model) for name in self.feat_layer_names]
+        )
 
         self.hsi_encoder = HSICenterSpectralEncoder(self.hsi_channels, d_model)
         self.lidar_encoder = LidarMorphEncoder(
@@ -279,8 +280,8 @@ class MultimodalClassifier(nn.Module):
         lidar_g, lidar_c = self.lidar_encoder(lidar)
 
         rgb_toks = []
-        for name in self.feat_layer_names:
-            rgb_toks.append(self.rgb_projs[name](layer_feats[name]))
+        for name, proj in zip(self.feat_layer_names, self.rgb_projs):
+            rgb_toks.append(proj(layer_feats[name]))
         rgb_stack = torch.stack(rgb_toks, dim=1)
 
         b = hsi_tok.shape[0]
