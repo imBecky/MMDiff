@@ -5,6 +5,7 @@ from datetime import datetime
 from pathlib import Path
 
 from param import (
+    BEST_MODEL_FILENAME,
     BATCH_SIZE,
     CHECK_PROJECTION_GRAD,
     DATA_DIR,
@@ -15,7 +16,7 @@ from param import (
     LOG_PATH,
     LOSS_WEIGHT_CENTER,
     LOSS_WEIGHT_GLOBAL,
-    MODEL_PATH,
+    RUN_NAME_PREFIX,
     MULTIMODAL_ABLATION_LOG_LINE,
     NUM_CLASSES,
     NUM_EPOCHS,
@@ -41,9 +42,9 @@ def prepare_tb_run_dir():
     tag = os.environ.get('GFDIFF_EXPERIMENT_TAG', '').strip()
     if tag:
         safe = re.sub(r'[^\w\-.]', '_', tag)
-        run_name = f'{MODEL_PATH.stem}_{safe}_{datetime.now().strftime("%Y%m%d-%H%M%S")}'
+        run_name = f'{RUN_NAME_PREFIX}_{safe}_{datetime.now().strftime("%Y%m%d-%H%M%S")}'
     else:
-        run_name = f'{MODEL_PATH.stem}_{datetime.now().strftime("%Y%m%d-%H%M%S")}'
+        run_name = f'{RUN_NAME_PREFIX}_{datetime.now().strftime("%Y%m%d-%H%M%S")}'
     run_dir = TB_LOG_ROOT / run_name
     run_dir.mkdir(parents=True, exist_ok=True)
     return run_dir
@@ -76,6 +77,26 @@ def get_logger(log_path=None):
         base_log.propagate = False
 
     return logger
+
+
+def get_console_logger():
+    """仅控制台输出，不创建日志文件（配合 --no-artifacts）。"""
+    fmt = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+    log = logging.getLogger('MMDiff.training')
+    if not log.handlers:
+        log.setLevel(logging.INFO)
+        ch = logging.StreamHandler()
+        ch.setFormatter(fmt)
+        log.addHandler(ch)
+        log.propagate = False
+    base_log = logging.getLogger('base')
+    if not base_log.handlers:
+        base_log.setLevel(logging.INFO)
+        ch2 = logging.StreamHandler()
+        ch2.setFormatter(fmt)
+        base_log.addHandler(ch2)
+        base_log.propagate = False
+    return log
 
 
 def log_and_print(logger, *parts):
@@ -155,7 +176,7 @@ def log_config(
             f'dataset.modalities: {opt.get("dataset", {}).get("modalities")}',
             f'TRAIN_LABELS_PATH: {TRAIN_LABELS_PATH}',
             f'TEST_LABELS_PATH: {TEST_LABELS_PATH}',
-            f'MODEL_PATH: {MODEL_PATH}',
+            f'best_model (per run ckpt dir): {BEST_MODEL_FILENAME}',
             f'LOG_PATH: {log_file_path if log_file_path is not None else LOG_PATH}',
         ]),
     )

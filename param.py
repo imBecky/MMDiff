@@ -16,8 +16,13 @@ TRAIN_LABELS_PATH = DATA_DIR / 'train_labels.npy'
 TEST_LABELS_PATH = DATA_DIR / 'test_labels.npy'
 USE_RGB_PATCHES = TRAIN_RGB_PATCHES_PATH.is_file() and TEST_RGB_PATCHES_PATH.is_file()
 RGB_CHANNELS = 3
+# TensorBoard / 断点子目录名前缀（与旧版用 model.pt 的 stem 无关）
+RUN_NAME_PREFIX = 'cls'
+# 验证集最佳权重保存在本次 run 的断点目录下：{run_ckps_dir}/{BEST_MODEL_FILENAME}
+BEST_MODEL_FILENAME = 'best_model.pt'
+# 仅兼容旧说明；训练流程不再写入此路径
 MODEL_PATH = Path('./models/model.pt')
-# 训练断点根目录（每次运行会创建子目录 run_tag，内含 checkpoint-<epoch> 与 final）
+# 训练断点根目录（每次运行会创建子目录 run_tag，内含 checkpoint-<epoch>、final、best_model.pt）
 CKPS_DIR = Path('../../autodl-tmp/classifier')
 # 每 N 个 epoch 保存一次断点；仅当 run_selection 为真（epoch>=EVAL_VAL_START_EPOCH、有 val、且 train_acc>=EVAL_MIN_TRAIN_ACC）时保存。0 表示不按间隔保存（仍会写 final）。若希望尽快只靠准确率门槛触发验证与断点，可将 EVAL_VAL_START_EPOCH 设为 0
 SAVE_EVERY_EPOCH = 5

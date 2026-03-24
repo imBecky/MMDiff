@@ -7,8 +7,9 @@
 import os
 import sys
 import time
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Optional
 
 import numpy as np
 import torch
@@ -16,6 +17,7 @@ from tqdm import tqdm
 
 from param import (
     BATCH_SIZE,
+    BEST_MODEL_FILENAME,
     CHECK_PROJECTION_GRAD,
     CHECK_PROJECTION_GRAD_INTERVAL,
     CKPS_DIR,
@@ -26,7 +28,6 @@ from param import (
     EVAL_VAL_START_EPOCH,
     FEAT_SCALES,
     LOG_PATH,
-    MODEL_PATH,
     MULTIMODAL_ABLATION_LOG_LINE,
     NUM_CLASSES,
     NUM_EPOCHS,
@@ -46,7 +47,6 @@ from param import (
 
 from .checkpoint import (
     _CKPT_STEP_RE,
-    ensure_model_path_parent,
     save_classifier_checkpoint,
 )
 from .data import (
@@ -57,6 +57,7 @@ from .data import (
     subset_train_balanced_per_class,
 )
 from .logging_utils import (
+    get_console_logger,
     get_logger,
     get_summary_writer,
     log_and_print,
@@ -75,6 +76,12 @@ from .student_diffusion import StudentDiffusionWrapper
 CreateClassifierFn = Callable[[Any, Any], torch.nn.Module]
 
 
+@dataclass
+class TrainingRunOptions:
+    """训练运行选项（由 main 解析传入）。"""
+    no_artifacts: bool = False
+
+
 def _normalize_resume_path(resume_checkpoint: str) -> str:
     s = (resume_checkpoint or '').strip()
     if not s:
@@ -86,8 +93,14 @@ def _normalize_resume_path(resume_checkpoint: str) -> str:
     return abs_s
 
 
-def run_training(create_classifier: CreateClassifierFn) -> None:
+def run_training(
+    create_classifier: CreateClassifierFn,
+    run_options: Optional[TrainingRunOptions] = None,
+) -> None:
     """完整训练 + 验证 + 测试；模型由 create_classifier(opt, diffusion) 提供。"""
+    opts = run_options or TrainingRunOptions()
+    no_artifacts = bool(opts.no_artifacts)
+
     resume_ckpt = _normalize_resume_path(RESUME_CHECKPOINT)
     resume_ts = None
     run_log_dir_str = ''
@@ -132,23 +145,33 @@ def run_training(create_classifier: CreateClassifierFn) -> None:
                 else:
                     print('[恢复] 仅将加载 classifier.pt / model.pt，epoch 与优化器从 0 开始')
 
-    if run_log_dir_str and os.path.isdir(run_log_dir_str):
+    if no_artifacts:
+        run_log_dir_str = ''
+        run_ckps_dir_str = ''
+
+    if no_artifacts:
+        run_dir = None
+        log_path = None
+        logger = get_console_logger()
+        writer = None
+    elif run_log_dir_str and os.path.isdir(run_log_dir_str):
         run_dir = Path(run_log_dir_str)
+        log_path = run_dir / 'model.log'
+        logger = get_logger(log_path)
+        writer = get_summary_writer(logger, run_dir)
     else:
         run_dir = prepare_tb_run_dir()
         run_log_dir_str = str(run_dir)
         if resume_ts is not None:
-            # 原日志目录已删除时，新 run 不应继续写入旧 checkpoint 根路径
             run_ckps_dir_str = ''
+        log_path = run_dir / 'model.log'
+        logger = get_logger(log_path)
+        writer = get_summary_writer(logger, run_dir)
 
-    log_path = run_dir / 'model.log'
-    logger = get_logger(log_path)
-    writer = get_summary_writer(logger, run_dir)
     torch.manual_seed(RANDOM_SEED)
     np.random.seed(RANDOM_SEED)
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    ensure_model_path_parent(MODEL_PATH)
 
     train_hsi, train_lidar, train_rgb, train_labels, test_hsi, test_lidar, test_rgb, test_labels = load_data()
     if TRAIN_QUICK_VERIFY:
@@ -221,11 +244,18 @@ def run_training(create_classifier: CreateClassifierFn) -> None:
         log_file_path=log_path,
     )
 
-    if not run_ckps_dir_str:
-        CKPS_DIR.mkdir(parents=True, exist_ok=True)
-        run_ckps_dir_str = str(CKPS_DIR / run_dir.name)
-    os.makedirs(run_ckps_dir_str, exist_ok=True)
-    logger.info('Checkpoint 目录: %s', run_ckps_dir_str)
+    if not no_artifacts:
+        if not run_ckps_dir_str:
+            CKPS_DIR.mkdir(parents=True, exist_ok=True)
+            run_ckps_dir_str = str(CKPS_DIR / run_dir.name)
+        os.makedirs(run_ckps_dir_str, exist_ok=True)
+        logger.info('Checkpoint 目录: %s', run_ckps_dir_str)
+    else:
+        logger.info('无文件产物模式（--no-artifacts）：不创建 TB/断点目录，不写 TensorBoard、周期断点、final')
+
+    best_path = (
+        os.path.join(run_ckps_dir_str, BEST_MODEL_FILENAME) if run_ckps_dir_str else None
+    )
 
     diffusion = StudentDiffusionWrapper(
         STUDENT_CHECKPOINT,
@@ -284,6 +314,8 @@ def run_training(create_classifier: CreateClassifierFn) -> None:
     last_eval_sel_acc = float('nan')
     last_kappa = 0.0
     last_s_sqr = 0.0
+
+    best_state_dict = None
 
     epoch_bar = tqdm(range(start_epoch, NUM_EPOCHS), desc='Epochs')
 
@@ -402,8 +434,11 @@ def run_training(create_classifier: CreateClassifierFn) -> None:
                 )
 
             if should_run_eval and ovr_acc >= best_acc:
-                ensure_model_path_parent(MODEL_PATH)
-                torch.save(model.state_dict(), MODEL_PATH)
+                if best_path:
+                    torch.save(model.state_dict(), best_path)
+                best_state_dict = {
+                    k: v.detach().cpu().clone() for k, v in model.state_dict().items()
+                }
                 best_acc = ovr_acc
                 best_epoch = epoch
                 logger.info(
@@ -412,6 +447,8 @@ def run_training(create_classifier: CreateClassifierFn) -> None:
                     selection_split,
                     ovr_acc,
                 )
+                if best_path:
+                    logger.info('  best 权重: %s', best_path)
                 if writer is not None:
                     writer.add_scalar(f'best/{selection_split}_overall_accuracy', best_acc, epoch + 1)
 
@@ -452,45 +489,56 @@ def run_training(create_classifier: CreateClassifierFn) -> None:
                 best_epoch=best_epoch + 1,
             )
 
-        if not MODEL_PATH.exists():
-            ensure_model_path_parent(MODEL_PATH)
-            torch.save(model.state_dict(), MODEL_PATH)
+        if run_ckps_dir_str and best_path and not os.path.isfile(best_path):
+            torch.save(model.state_dict(), best_path)
             best_epoch = NUM_EPOCHS - 1
-            logger.warning('训练过程中未保存过 checkpoint（可能未满足评估条件），已写入最后一轮权重到 %s', MODEL_PATH)
+            logger.warning(
+                '训练过程中未出现新的 best 记录，已将最后一轮权重写入 %s',
+                best_path,
+            )
 
-        final_dir = os.path.join(run_ckps_dir_str, 'final')
-        save_classifier_checkpoint(
-            model,
-            optimizer,
-            lr_scheduler,
-            NUM_EPOCHS,
-            global_step,
-            best_acc,
-            best_epoch,
-            final_dir,
-            run_log_dir_str,
-            run_ckps_dir_str,
-        )
-        logger.info('训练结束，最终断点已保存至 %s（含 classifier.pt 与 training_state.pt）', final_dir)
+        if run_ckps_dir_str:
+            final_dir = os.path.join(run_ckps_dir_str, 'final')
+            save_classifier_checkpoint(
+                model,
+                optimizer,
+                lr_scheduler,
+                NUM_EPOCHS,
+                global_step,
+                best_acc,
+                best_epoch,
+                final_dir,
+                run_log_dir_str,
+                run_ckps_dir_str,
+            )
+            logger.info(
+                '训练结束，最终断点已保存至 %s（含 classifier.pt 与 training_state.pt）',
+                final_dir,
+            )
 
         best_model = create_classifier(opt, diffusion).to(device)
-        # MODEL_PATH 可能被历史实验或旧代码结构覆盖；与当前 opt 不一致时会 load 失败。
-        # 优先读 MODEL_PATH（与 val best 一致）；失败则使用内存中本轮训练结束时的 model（与 final/ 一致）。
-        if MODEL_PATH.exists():
+        loaded = False
+        if best_path and os.path.isfile(best_path):
             try:
                 best_model.load_state_dict(
-                    torch.load(MODEL_PATH, map_location=device), strict=True
+                    torch.load(best_path, map_location=device), strict=True
                 )
-                logger.info('Final test 使用 MODEL_PATH 权重: %s', MODEL_PATH)
+                loaded = True
+                logger.info('Final test 使用 best 权重: %s', best_path)
             except RuntimeError as e:
                 logger.warning(
-                    'MODEL_PATH 与当前模型结构不一致（常为旧实验残留），改用本轮最后一轮 model 权重做 final test: %s',
+                    'best 权重与当前模型结构不一致，尝试内存或最后一轮权重: %s',
                     e,
                 )
+        if not loaded:
+            if best_state_dict is not None:
+                best_model.load_state_dict(
+                    {k: v.to(device) for k, v in best_state_dict.items()}
+                )
+                logger.info('Final test 使用内存中记录的 best 权重')
+            else:
                 best_model.load_state_dict(model.state_dict())
-        else:
-            best_model.load_state_dict(model.state_dict())
-            logger.info('MODEL_PATH 不存在，Final test 使用最后一轮 model 权重')
+                logger.info('Final test 使用最后一轮 model 权重')
 
         use_center_final = bool(USE_CENTER_LOSS)
         _, _, conf_final, eval_loss_final, eval_acc_final = evaluate(

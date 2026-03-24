@@ -21,7 +21,7 @@ from .data import (
 )
 from .loop import compute_classification_loss, evaluate, train_one_epoch
 from .metrics import accuracies
-from .runner import run_training, verify_projection_gradients
+from .runner import TrainingRunOptions, run_training, verify_projection_gradients
 from .student_diffusion import StudentDiffusionWrapper, normalize_student_checkpoint_dir
 
 __all__ = [
@@ -36,6 +36,7 @@ __all__ = [
     'get_latest_checkpoint_path',
     'load_data',
     'normalize_student_checkpoint_dir',
+    'TrainingRunOptions',
     'run_training',
     'save_classifier_checkpoint',
     'save_classifier_training_state',
