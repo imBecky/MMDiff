@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 
 import torch
+import torch.nn.functional as F
 from diffusers import DDPMPipeline, DDPMScheduler
 
 from param import (
@@ -14,6 +15,7 @@ from param import (
     RANDOM_SEED,
     STUDENT_NUM_TRAIN_TIMESTEPS,
 )
+from utils.unet_hw import unet_sample_hw
 
 
 def normalize_student_checkpoint_dir(checkpoint_path) -> str:
@@ -68,6 +70,10 @@ class StudentDiffusionWrapper:
         )
         # 与 train_distill 一致的 UNet 子模块名列表；空列表则退回 fe/fd 整数下标
         self.feat_layers = list(feat_layers) if feat_layers else []
+
+    def rgb_spatial_size_for_unet(self) -> tuple[int, int]:
+        """兼容旧代码；与 unet_sample_hw(self.netG) 相同。"""
+        return unet_sample_hw(self.netG)
 
     def feed_data(self, data):
         self.data = {}
@@ -126,6 +132,14 @@ class StudentDiffusionWrapper:
                 x = self._normalize_rgb_for_diffusion(rgb)
             else:
                 x = rgb
+            th, tw = unet_sample_hw(self.netG)
+            if x.shape[-2] != th or x.shape[-1] != tw:
+                x = F.interpolate(
+                    x,
+                    size=(th, tw),
+                    mode='bilinear',
+                    align_corners=False,
+                )
             B = x.shape[0]
             timestep = torch.full((B,), t, device=self.device, dtype=torch.long)
             noise = self._sample_noise(x, int(t), training)

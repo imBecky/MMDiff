@@ -1,3 +1,5 @@
+import logging
+
 import numpy as np
 import torch
 import torch.nn as nn
@@ -16,6 +18,16 @@ from param import (
 )
 
 from .data import batch_to_dict
+
+
+def _log_train_step_line(logger, msg: str) -> None:
+    """有文件 handler 时只 logger.info；仅控制台时用 tqdm.write，避免与进度条抢行、混成 lr=…it/s。"""
+    has_file = any(isinstance(h, logging.FileHandler) for h in logger.handlers)
+    has_stream = any(isinstance(h, logging.StreamHandler) for h in logger.handlers)
+    if has_file:
+        logger.info(msg)
+    if has_stream and not has_file:
+        tqdm.write(msg)
 
 
 def _module_grad_l2_norm(module: nn.Module):
@@ -109,7 +121,7 @@ def train_one_epoch(
     correct = 0
     total = 0
 
-    progress_bar = tqdm(loader, desc='Train', leave=False)
+    progress_bar = tqdm(loader, desc='Train', leave=False, dynamic_ncols=True)
 
     for batch_idx, batch in enumerate(progress_bar, start=1):
         data_dict, labels = batch_to_dict(batch, device, use_rgb)
@@ -150,16 +162,17 @@ def train_one_epoch(
             writer.add_scalar('train/lr', current_lr, global_step)
 
         if batch_idx % TRAIN_LOG_INTERVAL == 0 or batch_idx == len(loader):
-            logger.info(
-                'Epoch %03d Train step %04d/%04d | batch_loss=%.4f batch_acc=%.4f running_loss=%.4f running_acc=%.4f lr=%.8f',
-                epoch + 1,
-                batch_idx,
-                len(loader),
-                batch_loss,
-                batch_acc,
-                running_loss / total,
-                correct / total,
-                current_lr,
+            _log_train_step_line(
+                logger,
+                'Epoch %03d Train %04d/%04d | loss=%.4f acc=%.4f lr=%.4g'
+                % (
+                    epoch + 1,
+                    batch_idx,
+                    len(loader),
+                    running_loss / total,
+                    correct / total,
+                    current_lr,
+                ),
             )
 
     epoch_loss = running_loss / total
@@ -187,7 +200,7 @@ def evaluate(
     total = 0
 
     with torch.no_grad():
-        progress_bar = tqdm(loader, desc='Eval', leave=False)
+        progress_bar = tqdm(loader, desc='Eval', leave=False, dynamic_ncols=True)
 
         for batch_idx, batch in enumerate(progress_bar, start=1):
             data_dict, labels = batch_to_dict(batch, device, use_rgb)
@@ -213,15 +226,17 @@ def evaluate(
             )
 
             if batch_idx % EVAL_LOG_INTERVAL == 0 or batch_idx == len(loader):
-                logger.info(
-                    'Epoch %03d %s step %04d/%04d | batch_loss=%.4f batch_acc=%.4f running_loss=%.4f',
-                    epoch + 1,
-                    split.capitalize(),
-                    batch_idx,
-                    len(loader),
-                    loss.item(),
-                    batch_acc,
-                    running_loss / total,
+                _log_train_step_line(
+                    logger,
+                    'Epoch %03d %s %04d/%04d | loss=%.4f acc=%.4f'
+                    % (
+                        epoch + 1,
+                        split.capitalize(),
+                        batch_idx,
+                        len(loader),
+                        running_loss / total,
+                        batch_acc,
+                    ),
                 )
 
     preds = np.concatenate(preds)

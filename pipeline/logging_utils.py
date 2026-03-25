@@ -153,7 +153,7 @@ def log_config(
             test_labels.shape,
         )
     logger.info(
-        'Training config | batch_size=%d epochs=%d lr=%.8f betas=%s weight_decay=%.6f',
+        'Training config | batch_size=%d epochs=%d lr=%.4g betas=%s weight_decay=%.6f',
         BATCH_SIZE,
         NUM_EPOCHS,
         LEARNING_RATE,
@@ -198,7 +198,7 @@ def log_config(
             f'EVAL_INTERVAL_EPOCHS: {EVAL_INTERVAL_EPOCHS}',
             f'EVAL_VAL_START_EPOCH: {EVAL_VAL_START_EPOCH}',
             f'CHECK_PROJECTION_GRAD: {CHECK_PROJECTION_GRAD}',
-            f"module_cast3 hsi_group_size/mid: {mc3.get('hsi_group_size', '-')}/{mc3.get('mid', '-')}",
+            f"module_cast3 lidar_hidden: {mc3.get('lidar_hidden', '-')}",
             MULTIMODAL_ABLATION_LOG_LINE,
         ]),
     )

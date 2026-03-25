@@ -7,7 +7,7 @@ import utils.logger as Logger
 # ---------------------------------------------------------------------------
 # 数据与训练（常用修改处）
 # ---------------------------------------------------------------------------
-DATA_DIR = Path('G:/data/houston2018/prepared')
+DATA_DIR = Path('../../autodl-fs/houston2018/prepared')
 TRAIN_PATCHES_PATH = DATA_DIR / 'train_patches.npy'
 TEST_PATCHES_PATH = DATA_DIR / 'test_patches.npy'
 TRAIN_RGB_PATCHES_PATH = DATA_DIR / 'train_rgb_patches.npy'
@@ -16,7 +16,6 @@ TRAIN_LABELS_PATH = DATA_DIR / 'train_labels.npy'
 TEST_LABELS_PATH = DATA_DIR / 'test_labels.npy'
 USE_RGB_PATCHES = TRAIN_RGB_PATCHES_PATH.is_file() and TEST_RGB_PATCHES_PATH.is_file()
 RGB_CHANNELS = 3
-# TensorBoard / 断点子目录名前缀（与旧版用 model.pt 的 stem 无关）
 RUN_NAME_PREFIX = 'cls'
 # 验证集最佳权重保存在本次 run 的断点目录下：{run_ckps_dir}/{BEST_MODEL_FILENAME}
 BEST_MODEL_FILENAME = 'best_model.pt'
@@ -41,16 +40,15 @@ LOG_PATH = TB_LOG_ROOT / 'model.log'
 TRAIN_QUICK_VERIFY = False
 TRAIN_QUICK_VERIFY_SAMPLES_PER_CLASS = 150
 
-HSI_CHANNELS = 32
+HSI_CHANNELS = 50
 LIDAR_CHANNELS = 1
-# Houston2018 前景地物类为 20；GT 中背景常为 0，patch 仅含 y>0 像素，标签平移后为 0..19。
-# 勿设为 21，否则会多一个从未出现的「幽灵类」，User/Producer 最后一维恒为 0。
+# Houston2018 前景地物类为 20；GT 中背景常为 0，patch 仅含 y>0 像素，标签平移后为 0....19。
 NUM_CLASSES = 20
 
 RANDOM_SEED = 42
-NUM_WORKERS = 0
-BATCH_SIZE = 4
-NUM_EPOCHS = 150
+NUM_WORKERS = 13
+BATCH_SIZE = 512
+NUM_EPOCHS = 200
 LEARNING_RATE = 1e-3
 OPTIMIZER_BETAS = (0.9, 0.999)
 WEIGHT_DECAY = 1e-4
@@ -76,20 +74,12 @@ USE_CENTER_LOSS = True
 LOSS_WEIGHT_GLOBAL = 0.2
 LOSS_WEIGHT_CENTER = 0.8
 
-# 清单实验：center/global、hsi_group_size、HSI mid 三组对比（一次只改一个轴，其余与 baseline 一致）
-# 生效方式：在 param 中设置 MULTIMODAL_ABLATION_AXIS / INDEX，或环境变量 GFDIFF_ABLATION_AXIS / GFDIFF_ABLATION_INDEX
+# 清单实验：仅 center/global loss 权重对比；生效：MULTIMODAL_ABLATION_AXIS / INDEX 或 GFDIFF_ABLATION_* 环境变量
 CENTER_GLOBAL_ABLATION = ((0.2, 0.8), (0.3, 0.7))
-HSI_GROUP_SIZE_ABLATION = (4, 8, 16)
-HSI_MID_ABLATION = (5, 16, 32)
-MULTIMODAL_ABLATION_AXIS = None  # None | 'center_global' | 'hsi_group_size' | 'hsi_mid'
+MULTIMODAL_ABLATION_AXIS = None  # None | 'center_global'
 MULTIMODAL_ABLATION_INDEX = 0
 
-# 与 module_cast3 一致；无消融时与原先默认 hsi_group_size=8、mid=5 对齐
-HSI_GROUP_SIZE_CFG = 8
-HSI_PROJ_MID_CFG = 5
-# HSI 投影：组内 SE 波段门控（model/multimodal_flexible/projections.py）
-HSI_PROJ_USE_SPECTRAL_GATE = True
-# LiDAR 投影：CNN stem 隐藏通道（model/multimodal_flexible/projections.py LidarProjection）
+# LiDAR 形态编码器 stem 隐藏通道（model/multimodal.py LidarMorphEncoder）
 LIDAR_PROJ_HIDDEN_CFG = 16
 
 _EFFECTIVE_ABLATION_AXIS = None
@@ -97,8 +87,8 @@ _EFFECTIVE_ABLATION_INDEX = None
 
 
 def _apply_multimodal_ablation():
-    """按轴覆盖 LOSS_WEIGHT_* 或 HSI_GROUP_SIZE_CFG / HSI_PROJ_MID_CFG；未选轴时保持上方默认值。"""
-    global LOSS_WEIGHT_GLOBAL, LOSS_WEIGHT_CENTER, HSI_GROUP_SIZE_CFG, HSI_PROJ_MID_CFG
+    """按轴覆盖 LOSS_WEIGHT_*；未选轴时保持上方默认值。"""
+    global LOSS_WEIGHT_GLOBAL, LOSS_WEIGHT_CENTER
     global _EFFECTIVE_ABLATION_AXIS, _EFFECTIVE_ABLATION_INDEX
     axis = (os.environ.get('GFDIFF_ABLATION_AXIS') or '').strip() or (MULTIMODAL_ABLATION_AXIS or '')
     axis = axis.strip() or None
@@ -115,16 +105,9 @@ def _apply_multimodal_ablation():
     if axis == 'center_global':
         idx = max(0, min(idx, len(CENTER_GLOBAL_ABLATION) - 1))
         LOSS_WEIGHT_GLOBAL, LOSS_WEIGHT_CENTER = CENTER_GLOBAL_ABLATION[idx]
-    elif axis == 'hsi_group_size':
-        idx = max(0, min(idx, len(HSI_GROUP_SIZE_ABLATION) - 1))
-        HSI_GROUP_SIZE_CFG = HSI_GROUP_SIZE_ABLATION[idx]
-    elif axis == 'hsi_mid':
-        idx = max(0, min(idx, len(HSI_MID_ABLATION) - 1))
-        HSI_PROJ_MID_CFG = HSI_MID_ABLATION[idx]
     else:
         raise ValueError(
-            f'未知 MULTIMODAL_ABLATION_AXIS / GFDIFF_ABLATION_AXIS={axis!r}，'
-            f"应为 'center_global'、'hsi_group_size'、'hsi_mid' 之一"
+            f'未知 MULTIMODAL_ABLATION_AXIS / GFDIFF_ABLATION_AXIS={axis!r}，应为 "center_global"'
         )
     _EFFECTIVE_ABLATION_INDEX = idx
 
@@ -280,14 +263,7 @@ def build_opt():
             ('checkpoint', 'checkpoint'),
         ]
     )
-    cast3 = OrderedDict(
-        [
-            ('hsi_group_size', HSI_GROUP_SIZE_CFG),
-            ('mid', HSI_PROJ_MID_CFG),
-            ('hsi_spectral_gate', HSI_PROJ_USE_SPECTRAL_GATE),
-            ('lidar_hidden', LIDAR_PROJ_HIDDEN_CFG),
-        ]
-    )
+    cast3 = OrderedDict([('lidar_hidden', LIDAR_PROJ_HIDDEN_CFG)])
 
     return OrderedDict(
         [
@@ -337,10 +313,8 @@ opt['model_cls']['loss_weight_center'] = LOSS_WEIGHT_CENTER
 
 def _apply_gfdiff_env_overrides():
     """
-    在 build_opt 之后仍可覆盖 loss 与 module_cast3（与 _apply_multimodal_ablation 使用的 CFG 变量一致）。
+    在 build_opt 之后覆盖 loss 与 LiDAR 投影宽度（与 LIDAR_PROJ_HIDDEN_CFG 一致）。
     GFDIFF_LOSS_WEIGHT_GLOBAL / GFDIFF_LOSS_WEIGHT_CENTER
-    GFDIFF_HSI_GROUP_SIZE / GFDIFF_HSI_MID → HSI_GROUP_SIZE_CFG / HSI_PROJ_MID_CFG
-    GFDIFF_HSI_SPECTRAL_GATE → HSI_PROJ_USE_SPECTRAL_GATE（0/1）
     GFDIFF_LIDAR_HIDDEN → LIDAR_PROJ_HIDDEN_CFG
     """
     g = globals()
@@ -359,27 +333,8 @@ def _apply_gfdiff_env_overrides():
 
     _float('GFDIFF_LOSS_WEIGHT_GLOBAL', 'LOSS_WEIGHT_GLOBAL')
     _float('GFDIFF_LOSS_WEIGHT_CENTER', 'LOSS_WEIGHT_CENTER')
-    _int('GFDIFF_HSI_GROUP_SIZE', 'HSI_GROUP_SIZE_CFG')
-    _int('GFDIFF_HSI_MID', 'HSI_PROJ_MID_CFG')
-
-    v_se = os.environ.get('GFDIFF_HSI_SPECTRAL_GATE')
-    if v_se is not None and str(v_se).strip() != '':
-        g['HSI_PROJ_USE_SPECTRAL_GATE'] = bool(int(v_se))
-
     _int('GFDIFF_LIDAR_HIDDEN', 'LIDAR_PROJ_HIDDEN_CFG')
 
-    gs = int(g['HSI_GROUP_SIZE_CFG'])
-    if HSI_CHANNELS % gs != 0:
-        raise ValueError(
-            f'HSI_CHANNELS={HSI_CHANNELS} 必须能被 hsi_group_size={gs} 整除，请检查 GFDIFF_HSI_GROUP_SIZE'
-        )
-    mid = int(g['HSI_PROJ_MID_CFG'])
-    if mid < 1:
-        raise ValueError(f'HSI mid 通道须 >= 1，当前 {mid}')
-
-    opt['module_cast3']['hsi_group_size'] = gs
-    opt['module_cast3']['mid'] = mid
-    opt['module_cast3']['hsi_spectral_gate'] = bool(g['HSI_PROJ_USE_SPECTRAL_GATE'])
     lh = int(g['LIDAR_PROJ_HIDDEN_CFG'])
     if lh < 1:
         raise ValueError(f'LiDAR 投影 lidar_hidden 须 >= 1，当前 {lh}')
@@ -393,8 +348,6 @@ _apply_gfdiff_env_overrides()
 MULTIMODAL_ABLATION_LOG_LINE = (
     f"multimodal_ablation: axis={_EFFECTIVE_ABLATION_AXIS or 'none'} "
     f"index={_EFFECTIVE_ABLATION_INDEX if _EFFECTIVE_ABLATION_AXIS else '-'} | "
-    f"hsi_group_size={HSI_GROUP_SIZE_CFG} mid={HSI_PROJ_MID_CFG} "
-    f"hsi_spectral_gate={HSI_PROJ_USE_SPECTRAL_GATE} "
     f"lidar_hidden={LIDAR_PROJ_HIDDEN_CFG} "
     f"loss_global/center={LOSS_WEIGHT_GLOBAL}/{LOSS_WEIGHT_CENTER}"
 )

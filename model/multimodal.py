@@ -6,6 +6,13 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from utils.unet_hw import unet_sample_hw
+
+
+def _unet_input_hw(diffusion) -> Tuple[int, int]:
+    """与 get_feats 内 resize 目标一致（单源：unet_sample_hw）。"""
+    return unet_sample_hw(diffusion.netG)
+
 
 class ClassifierHead(nn.Module):
     def __init__(self, in_channels: int, hidden_channels: int, num_classes: int, dropout: float = 0.2):
@@ -101,11 +108,11 @@ class RGBLayerToToken(nn.Module):
 def _probe_diffusion_layer_channels(
     diffusion,
     feat_names: List[str],
-    image_size: int,
     diffusion_t: int,
 ) -> Dict[str, int]:
     dev = next(diffusion.netG.parameters()).device
-    dummy_rgb = torch.zeros(1, 3, image_size, image_size, device=dev, dtype=torch.float32)
+    th, tw = _unet_input_hw(diffusion)
+    dummy_rgb = torch.zeros(1, 3, th, tw, device=dev, dtype=torch.float32)
     dummy_idx = torch.zeros(1, dtype=torch.long, device=dev)
     diffusion.feed_data({'rgb': dummy_rgb, 'sample_indices': dummy_idx})
     out = diffusion.get_feats(diffusion_t, training=False)
@@ -137,7 +144,7 @@ class MultimodalClassifier(nn.Module):
         ds_cfg = opt.get('dataset', {})
         cls_cfg = opt.get('model_cls', {})
         train_cfg = opt.get('train', {})
-        cast3 = opt.get('module_cast3', {})
+        proj_cfg = opt.get('module_cast3') or {}
 
         self.num_classes = int(cls_cfg.get('out_channels') or ds_cfg.get('n_cls') or 2)
         self.hsi_channels = int(ds_cfg.get('hsi_channels') or 32)
@@ -150,8 +157,7 @@ class MultimodalClassifier(nn.Module):
         if not self.feat_layer_names:
             raise ValueError('model_cls.feat_scales 不能为空')
 
-        img_size = int(opt.get('model', {}).get('image_size') or 32)
-        self._image_size = img_size
+        self._unet_input_hw = _unet_input_hw(diffusion)
 
         d_model = int(cls_cfg.get('token_dim') or 256)
         self.d_model = d_model
@@ -165,11 +171,11 @@ class MultimodalClassifier(nn.Module):
         tx_dropout = float(cls_cfg.get('transformer_dropout') or 0.1)
         head_hidden = int(cls_cfg.get('head_hidden') or 128)
 
-        lidar_hidden = int(cast3.get('lidar_hidden') or 16)
+        lidar_hidden = int(proj_cfg.get('lidar_hidden') or 16)
         lidar_feat_ch = max(32, lidar_hidden * 2)
 
         ch_map = _probe_diffusion_layer_channels(
-            diffusion, self.feat_layer_names, img_size, self.diffusion_t,
+            diffusion, self.feat_layer_names, self.diffusion_t,
         )
         # ModuleDict 的 key 不能含 "."（与 down_blocks.1 等 UNet 子模块名冲突），用 ModuleList 与 feat_layer_names 顺序对齐
         self.rgb_projs = nn.ModuleList(
