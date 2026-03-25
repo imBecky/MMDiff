@@ -20,6 +20,7 @@ from param import (
     TRAIN_RGB_PATCHES_PATH,
     TRAIN_ROT_AUGMENT_FACTOR,
     USE_RGB_PATCHES,
+    USE_SUPCON,
 )
 
 
@@ -89,6 +90,27 @@ def _apply_rot_k(patch_hwc: np.ndarray, k: int) -> np.ndarray:
     return np.rot90(patch_hwc, k=k, axes=(0, 1)).copy()
 
 
+def _tensorize_view_from_crops(
+    fp_hwc: np.ndarray,
+    rgb_hwc: Optional[np.ndarray],
+    *,
+    rot_factor: int,
+    training: bool,
+):
+    """同一空间 patch 上独立随机旋转一次，得到单视图张量。"""
+    rk = _random_rot_k(rot_factor) if training and rot_factor > 1 else 0
+    fp = _apply_rot_k(fp_hwc, rk)
+    hsi = _patch_array_to_float32(np.transpose(fp[:, :, :HSI_CHANNELS], (2, 0, 1)))
+    lidar = _patch_array_to_float32(
+        np.transpose(fp[:, :, HSI_CHANNELS : HSI_CHANNELS + LIDAR_CHANNELS], (2, 0, 1))
+    )
+    if rgb_hwc is not None:
+        rp = _apply_rot_k(rgb_hwc, rk)
+        rgb = _patch_array_to_float32(np.transpose(rp, (2, 0, 1)))
+        return torch.from_numpy(hsi), torch.from_numpy(lidar), torch.from_numpy(rgb)
+    return torch.from_numpy(hsi), torch.from_numpy(lidar)
+
+
 class PatchDataset(torch.utils.data.Dataset):
     """
     feats: (H,W,C) HSI+LiDAR；rgb: (H,W,3) 或 None。
@@ -104,6 +126,7 @@ class PatchDataset(torch.utils.data.Dataset):
         window_size: int,
         training: bool,
         rot_factor: int = 1,
+        supcon_dual_view: bool = False,
     ):
         super().__init__()
         self.feats = feats_vol
@@ -112,6 +135,7 @@ class PatchDataset(torch.utils.data.Dataset):
         self.window_size = int(window_size)
         self.training = training
         self.rot_factor = int(rot_factor)
+        self.supcon_dual_view = bool(supcon_dual_view)
 
     def __len__(self):
         return len(self.indices)
@@ -122,6 +146,27 @@ class PatchDataset(torch.utils.data.Dataset):
         col = int(self.indices[index, 2])
         w = self.window_size
         fp = _crop_patch_hwc(self.feats, row, col, w)
+        idx = torch.tensor(index, dtype=torch.long)
+        lab_t = torch.tensor(lab, dtype=torch.long)
+
+        if self.training and self.supcon_dual_view:
+            if self.rgb is not None:
+                rp = _crop_patch_hwc(self.rgb, row, col, w)
+                h1, l1, r1 = _tensorize_view_from_crops(
+                    fp, rp, rot_factor=self.rot_factor, training=self.training,
+                )
+                h2, l2, r2 = _tensorize_view_from_crops(
+                    fp, rp, rot_factor=self.rot_factor, training=self.training,
+                )
+                return h1, l1, r1, h2, l2, r2, lab_t, idx
+            h1, l1 = _tensorize_view_from_crops(
+                fp, None, rot_factor=self.rot_factor, training=self.training,
+            )
+            h2, l2 = _tensorize_view_from_crops(
+                fp, None, rot_factor=self.rot_factor, training=self.training,
+            )
+            return h1, l1, h2, l2, lab_t, idx
+
         rk = _random_rot_k(self.rot_factor) if self.training and self.rot_factor > 1 else 0
         fp = _apply_rot_k(fp, rk)
         hsi = _patch_array_to_float32(np.transpose(fp[:, :, :HSI_CHANNELS], (2, 0, 1)))
@@ -136,14 +181,14 @@ class PatchDataset(torch.utils.data.Dataset):
                 torch.from_numpy(hsi),
                 torch.from_numpy(lidar),
                 torch.from_numpy(rgb),
-                torch.tensor(lab, dtype=torch.long),
-                torch.tensor(index, dtype=torch.long),
+                lab_t,
+                idx,
             )
         return (
             torch.from_numpy(hsi),
             torch.from_numpy(lidar),
-            torch.tensor(lab, dtype=torch.long),
-            torch.tensor(index, dtype=torch.long),
+            lab_t,
+            idx,
         )
 
 
@@ -231,6 +276,7 @@ def build_test_loader(
         window_size=PATCH_WINDOW_SIZE,
         training=False,
         rot_factor=1,
+        supcon_dual_view=False,
     )
     pin_memory = torch.cuda.is_available()
     return DataLoader(
@@ -264,6 +310,7 @@ def build_dataloaders(
         window_size=PATCH_WINDOW_SIZE,
         training=True,
         rot_factor=rot,
+        supcon_dual_view=USE_SUPCON,
     )
     train_loader = DataLoader(
         train_ds,
@@ -282,6 +329,7 @@ def build_dataloaders(
             window_size=PATCH_WINDOW_SIZE,
             training=False,
             rot_factor=1,
+            supcon_dual_view=False,
         )
         val_loader = DataLoader(
             val_ds,
@@ -298,7 +346,26 @@ def build_dataloaders(
     return train_loader, val_loader, test_loader
 
 
-def batch_to_dict(batch, device, use_rgb_patches: bool):
+def batch_to_dict(batch, device, use_rgb_patches: bool, use_supcon: bool = False):
+    if use_supcon:
+        if use_rgb_patches:
+            hsi1, lidar1, rgb1, hsi2, lidar2, rgb2, labels, sample_indices = batch
+            hsi = torch.cat([hsi1, hsi2], dim=0).to(device=device, dtype=torch.float32)
+            lidar = torch.cat([lidar1, lidar2], dim=0).to(device=device, dtype=torch.float32)
+            rgb = torch.cat([rgb1, rgb2], dim=0).to(device=device, dtype=torch.float32)
+            labels = labels.to(device).long()
+            labels = torch.cat([labels, labels], dim=0)
+            sample_indices = sample_indices.to(device=device, dtype=torch.long)
+            sample_indices = torch.cat([sample_indices, sample_indices], dim=0)
+            return {'hsi': hsi, 'lidar': lidar, 'rgb': rgb, 'sample_indices': sample_indices}, labels
+        hsi1, lidar1, hsi2, lidar2, labels, sample_indices = batch
+        hsi = torch.cat([hsi1, hsi2], dim=0).to(device=device, dtype=torch.float32)
+        lidar = torch.cat([lidar1, lidar2], dim=0).to(device=device, dtype=torch.float32)
+        labels = labels.to(device).long()
+        labels = torch.cat([labels, labels], dim=0)
+        sample_indices = sample_indices.to(device=device, dtype=torch.long)
+        sample_indices = torch.cat([sample_indices, sample_indices], dim=0)
+        return {'hsi': hsi, 'lidar': lidar, 'sample_indices': sample_indices}, labels
     if use_rgb_patches:
         hsi, lidar, rgb, labels, sample_indices = batch
         hsi = hsi.to(device=device, dtype=torch.float32)

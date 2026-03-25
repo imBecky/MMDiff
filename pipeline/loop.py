@@ -3,6 +3,7 @@ import logging
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from sklearn.metrics import confusion_matrix
 from tqdm import tqdm
 
@@ -12,9 +13,12 @@ from param import (
     EVAL_LOG_INTERVAL,
     LOSS_WEIGHT_CENTER,
     LOSS_WEIGHT_GLOBAL,
+    SUPCON_TEMPERATURE,
+    SUPCON_WEIGHT,
     TRAIN_LOG_INTERVAL,
     USE_CENTER_LOSS,
     USE_RGB_PATCHES,
+    USE_SUPCON,
 )
 
 from .data import batch_to_dict
@@ -84,21 +88,68 @@ def log_projection_gradients(model, logger, writer, step_for_tb: int):
     return all_nonzero
 
 
+def supervised_contrastive_loss(
+    features: torch.Tensor,
+    labels: torch.Tensor,
+    temperature: float,
+) -> torch.Tensor:
+    """SupCon：同 batch 内同类为正（含另一视图），分母为除自身外全体。"""
+    device = features.device
+    features = F.normalize(features, dim=1)
+    batch_size = features.shape[0]
+    similarity_matrix = torch.matmul(features, features.T) / temperature
+
+    labels = labels.contiguous().view(-1, 1)
+    labels_eq = torch.eq(labels, labels.T).float().to(device)
+    eye = torch.eye(batch_size, device=device, dtype=labels_eq.dtype)
+    mask_pos = labels_eq * (1.0 - eye)
+
+    eye_mask = 1.0 - eye
+    exp_logits = torch.exp(similarity_matrix) * eye_mask
+    log_prob = similarity_matrix - torch.log(exp_logits.sum(1, keepdim=True) + 1e-12)
+
+    denom = mask_pos.sum(1).clamp(min=1e-12)
+    mean_log_prob_pos = (mask_pos * log_prob).sum(1) / denom
+    return -mean_log_prob_pos.mean()
+
+
 def compute_classification_loss(model, data_dict, labels, loss_fn):
     """
     训练用：可选 全局 + 中心 双项交叉熵（见 param.USE_CENTER_LOSS）。
+    可选 SupCon：param.USE_SUPCON，在 c_rep 投影上监督对比，与 CE 相加。
     loss_fn 与 MultimodalClassifier.loss_func 一致（CrossEntropyLoss）。
     返回的 logits 用于 train_acc 统计：若 USE_CENTER_LOSS 则用 logits_c，与 eval 保持一致。
     """
+    extra = {}
+    if USE_SUPCON:
+        if USE_CENTER_LOSS:
+            logits_g, logits_c, z = model(
+                data_dict, return_center_logits=True, return_supcon_proj=True,
+            )
+            loss_ce = (
+                LOSS_WEIGHT_GLOBAL * loss_fn(logits_g, labels)
+                + LOSS_WEIGHT_CENTER * loss_fn(logits_c, labels)
+            )
+            logits = logits_c
+        else:
+            logits_c, z = model(data_dict, return_supcon_proj=True)
+            loss_ce = loss_fn(logits_c, labels)
+            logits = logits_c
+        loss_s = supervised_contrastive_loss(z, labels, SUPCON_TEMPERATURE)
+        loss = loss_ce + SUPCON_WEIGHT * loss_s
+        extra['ce'] = float(loss_ce.detach().item())
+        extra['supcon'] = float(loss_s.detach().item())
+        return loss, logits, extra
+
     if USE_CENTER_LOSS:
         logits_g, logits_c = model(data_dict, return_center_logits=True)
         loss = (
             LOSS_WEIGHT_GLOBAL * loss_fn(logits_g, labels)
             + LOSS_WEIGHT_CENTER * loss_fn(logits_c, labels)
         )
-        return loss, logits_c
+        return loss, logits_c, extra
     logits = model(data_dict)
-    return loss_fn(logits, labels), logits
+    return loss_fn(logits, labels), logits, extra
 
 
 def train_one_epoch(
@@ -116,6 +167,7 @@ def train_one_epoch(
 ):
     """训练一个 epoch。"""
     use_rgb = USE_RGB_PATCHES
+    use_supcon = USE_SUPCON
     model.train()
     running_loss = 0.0
     correct = 0
@@ -124,10 +176,10 @@ def train_one_epoch(
     progress_bar = tqdm(loader, desc='Train', leave=False, dynamic_ncols=True)
 
     for batch_idx, batch in enumerate(progress_bar, start=1):
-        data_dict, labels = batch_to_dict(batch, device, use_rgb)
+        data_dict, labels = batch_to_dict(batch, device, use_rgb, use_supcon)
 
         optimizer.zero_grad()
-        loss, logits = compute_classification_loss(model, data_dict, labels, loss_fn)
+        loss, logits, extra = compute_classification_loss(model, data_dict, labels, loss_fn)
         loss.backward()
         if CHECK_PROJECTION_GRAD and (
             batch_idx % CHECK_PROJECTION_GRAD_INTERVAL == 0
@@ -160,6 +212,10 @@ def train_one_epoch(
             writer.add_scalar('train/step_loss', batch_loss, global_step)
             writer.add_scalar('train/step_acc', batch_acc, global_step)
             writer.add_scalar('train/lr', current_lr, global_step)
+            if extra.get('supcon') is not None:
+                writer.add_scalar('train/step_supcon', extra['supcon'], global_step)
+            if extra.get('ce') is not None:
+                writer.add_scalar('train/step_ce', extra['ce'], global_step)
 
         if batch_idx % TRAIN_LOG_INTERVAL == 0 or batch_idx == len(loader):
             _log_train_step_line(

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -47,22 +47,49 @@ def _crop_center_3x3(x: torch.Tensor) -> torch.Tensor:
 
 
 class HSICenterSpectralEncoder(nn.Module):
-    """中心 3x3 光谱编码 -> 1 个 token 向量 (d_model)。"""
-    def __init__(self, in_channels: int, d_model: int):
+    """
+    中心 3x3：9 个像素各做 1D 光谱卷积（沿波段维），空间平均后接轻量 SE 通道门控，再投影为 1 个 token。
+    """
+    def __init__(
+        self,
+        in_channels: int,
+        d_model: int,
+        conv_hidden: int = 64,
+        se_ratio: int = 8,
+    ):
         super().__init__()
-        flat = int(in_channels) * 9
-        hid = max(d_model, flat // 2)
-        self.net = nn.Sequential(
-            nn.Linear(flat, hid),
+        c = int(in_channels)
+        h = max(32, int(conv_hidden))
+        se_mid = max(8, h // max(1, int(se_ratio)))
+        self.stem = nn.Sequential(
+            nn.Conv1d(1, h // 2, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm1d(h // 2),
             nn.ReLU(inplace=True),
-            nn.Linear(hid, d_model),
+            nn.Conv1d(h // 2, h, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm1d(h),
+            nn.ReLU(inplace=True),
+            nn.Conv1d(h, h, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm1d(h),
+            nn.ReLU(inplace=True),
         )
+        self.pool = nn.AdaptiveAvgPool1d(1)
+        self.se = nn.Sequential(
+            nn.Linear(h, se_mid, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Linear(se_mid, h, bias=False),
+            nn.Sigmoid(),
+        )
+        self.proj = nn.Linear(h, int(d_model))
 
     def forward(self, hsi: torch.Tensor) -> torch.Tensor:
         patch = _crop_center_3x3(hsi)
-        b = patch.shape[0]
-        v = patch.reshape(b, -1)
-        return self.net(v)
+        b, c, _, _ = patch.shape
+        x = patch.permute(0, 2, 3, 1).contiguous().view(b * 9, c).unsqueeze(1)
+        feat = self.stem(x)
+        feat = self.pool(feat).squeeze(-1)
+        feat = feat.view(b, 9, -1).mean(dim=1)
+        feat = feat * self.se(feat)
+        return self.proj(feat)
 
 
 class LidarMorphEncoder(nn.Module):
@@ -128,7 +155,7 @@ def _probe_diffusion_layer_channels(
 
 class MultimodalClassifier(nn.Module):
     """
-    HSI：中心 3x3 光谱 -> 1 token
+    HSI：中心 3x3，1D 光谱卷积 + SE 门控 -> 1 token
     RGB：冻结 UNet，单层 t，多尺度层各 1 token（与 FEAT_SCALES 一致）
     LiDAR：小 CNN -> global + center 共 2 token
     融合：Transformer Encoder + global_cls / center_cls
@@ -173,6 +200,8 @@ class MultimodalClassifier(nn.Module):
 
         lidar_hidden = int(proj_cfg.get('lidar_hidden') or 16)
         lidar_feat_ch = max(32, lidar_hidden * 2)
+        hsi_conv_hidden = int(proj_cfg.get('hsi_conv_hidden') or 64)
+        hsi_se_ratio = int(proj_cfg.get('hsi_se_ratio') or 8)
 
         ch_map = _probe_diffusion_layer_channels(
             diffusion, self.feat_layer_names, self.diffusion_t,
@@ -182,7 +211,12 @@ class MultimodalClassifier(nn.Module):
             [RGBLayerToToken(ch_map[name], d_model) for name in self.feat_layer_names]
         )
 
-        self.hsi_encoder = HSICenterSpectralEncoder(self.hsi_channels, d_model)
+        self.hsi_encoder = HSICenterSpectralEncoder(
+            self.hsi_channels,
+            d_model,
+            conv_hidden=hsi_conv_hidden,
+            se_ratio=hsi_se_ratio,
+        )
         self.lidar_encoder = LidarMorphEncoder(
             self.lidar_in_ch, lidar_hidden, lidar_feat_ch, d_model,
         )
@@ -207,13 +241,25 @@ class MultimodalClassifier(nn.Module):
         self.global_head = ClassifierHead(d_model, head_hidden, self.num_classes)
         self.center_head = ClassifierHead(d_model, head_hidden, self.num_classes)
 
-        self.projections = nn.ModuleDict(
-            {
-                'hsi': self.hsi_encoder,
-                'lidar': self.lidar_encoder,
-                'rgb': self.rgb_projs,
-            }
-        )
+        self.use_supcon = bool(cls_cfg.get('use_supcon', False))
+        supcon_dim = int(cls_cfg.get('supcon_proj_dim') or 128)
+        if self.use_supcon:
+            self.supcon_proj = nn.Sequential(
+                nn.Linear(d_model, d_model),
+                nn.ReLU(inplace=True),
+                nn.Linear(d_model, supcon_dim),
+            )
+        else:
+            self.supcon_proj = None
+
+        proj_dict = {
+            'hsi': self.hsi_encoder,
+            'lidar': self.lidar_encoder,
+            'rgb': self.rgb_projs,
+        }
+        if self.use_supcon and self.supcon_proj is not None:
+            proj_dict['supcon'] = self.supcon_proj
+        self.projections = nn.ModuleDict(proj_dict)
 
         self._init_weights(
             init_type=str(cls_cfg.get('init_type') or 'kaiming'),
@@ -248,19 +294,54 @@ class MultimodalClassifier(nn.Module):
         total_epochs = int(train_cfg.get('n_epoch') or 1)
         steps_per_epoch = int(self.opt.get('len_train_dataloader') or 1)
         total_steps = max(1, total_epochs * steps_per_epoch)
+        step_ratios = sched_cfg.get('step_ratios')
+        gammas_multi = sched_cfg.get('gammas')
+
+        def _two_step_lambda() -> Tuple[float, float, float, float]:
+            """
+            返回 (b1, b2, g1, g2)：step>=b1 乘 g1，step>=b2 再乘 g2（相对 base 的累积乘子为 g1 或 g1*g2）。
+            """
+            if not isinstance(step_ratios, (list, tuple)) or len(step_ratios) < 2:
+                raise ValueError('scheduler.step_ratios 需为长度≥2的列表')
+            ratios = sorted(float(x) for x in step_ratios[:2])
+            r0, r1 = max(0.0, min(1.0, ratios[0])), max(0.0, min(1.0, ratios[1]))
+            if r1 <= r0:
+                raise ValueError(f'scheduler.step_ratios 需为升序，当前 {step_ratios!r}')
+            g = gammas_multi if isinstance(gammas_multi, (list, tuple)) else ()
+            if len(g) < 2:
+                raise ValueError('scheduler.gammas 需为长度≥2，与两阶衰减对应')
+            g1, g2 = float(g[0]), float(g[1])
+            b1 = int(total_steps * r0)
+            b2 = int(total_steps * r1)
+            b2 = max(b1 + 1, b2)
+            return float(b1), float(b2), g1, g2
+
+        if isinstance(step_ratios, (list, tuple)) and len(step_ratios) >= 2:
+            b1, b2, g1, g2 = _two_step_lambda()
+
+            def lr_lambda(step: int) -> float:
+                m = 1.0
+                if step >= b1:
+                    m *= g1
+                if step >= b2:
+                    m *= g2
+                return m
+
+            return torch.optim.lr_scheduler.LambdaLR(self.optimizer, lr_lambda=lr_lambda)
+
         constant_ratio = float(sched_cfg.get('constant_ratio') or 0.8)
         gamma = float(sched_cfg.get('gamma') or 0.1)
         step_boundary = int(total_steps * constant_ratio)
 
-        def lr_lambda(step: int) -> float:
+        def lr_lambda_legacy(step: int) -> float:
             return 1.0 if step < step_boundary else gamma
 
-        return torch.optim.lr_scheduler.LambdaLR(self.optimizer, lr_lambda=lr_lambda)
+        return torch.optim.lr_scheduler.LambdaLR(self.optimizer, lr_lambda=lr_lambda_legacy)
 
     def _init_weights(self, init_type: str, scale: float) -> None:
         init_name = init_type.lower()
         for module in self.modules():
-            if isinstance(module, (nn.Conv2d, nn.Linear)):
+            if isinstance(module, (nn.Conv1d, nn.Conv2d, nn.Linear)):
                 if init_name == 'xavier':
                     nn.init.xavier_normal_(module.weight)
                 else:
@@ -268,7 +349,7 @@ class MultimodalClassifier(nn.Module):
                 module.weight.data.mul_(scale)
                 if module.bias is not None:
                     nn.init.zeros_(module.bias)
-            elif isinstance(module, nn.BatchNorm2d):
+            elif isinstance(module, (nn.BatchNorm1d, nn.BatchNorm2d)):
                 nn.init.ones_(module.weight)
                 nn.init.zeros_(module.bias)
 
@@ -315,12 +396,27 @@ class MultimodalClassifier(nn.Module):
         self,
         data_dict: Dict[str, torch.Tensor],
         return_center_logits: bool = False,
-    ):
+        return_supcon_proj: bool = False,
+    ) -> Union[
+        torch.Tensor,
+        Tuple[torch.Tensor, torch.Tensor],
+        Tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+    ]:
         g_rep, c_rep = self._forward_tokens(data_dict)
         logits_g = self.global_head(g_rep)
         logits_c = self.center_head(c_rep)
+        z = None
+        if return_supcon_proj:
+            if self.supcon_proj is None:
+                raise RuntimeError('return_supcon_proj=True 但 model_cls.use_supcon 未启用')
+            z = self.supcon_proj(c_rep)
+
         if return_center_logits:
+            if return_supcon_proj:
+                return logits_g, logits_c, z
             return logits_g, logits_c
+        if return_supcon_proj:
+            return logits_c, z
         return logits_c
 
 

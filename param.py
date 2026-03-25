@@ -68,6 +68,11 @@ CHECK_PROJECTION_GRAD_INTERVAL = 10  # 每 N 个 batch；第 1 个与每 epoch �
 VAL_RATIO = 0.1
 DIFFUSION_NOISE_MODE = 'deterministic'
 DIFFUSION_NORMALIZE_INPUT = True
+# LR 两阶衰减（相对总 optimizer step = epoch × len(train_loader)）：
+# step < r0*T → lr=base；r0*T ≤ step < r1*T → lr=base*g0；step ≥ r1*T → lr=base*g0*g1。
+# 默认 g0*g1=0.5*0.2=0.1，与旧版「单阶最后乘 0.1」量级一致，但中间多一次中等 lr 精调。
+SCHED_STEP_RATIOS = [0.55, 0.82]
+SCHED_GAMMAS = [0.5, 0.2]
 CLIP_GRAD_NORM = 1.0
 EVAL_VAL_START_EPOCH = 10
 # 本 epoch 训练准确率低于该值时不跑验证/选集 eval（0~1）；目标「先过拟合训练集」
@@ -79,6 +84,13 @@ USE_CENTER_LOSS = True
 LOSS_WEIGHT_GLOBAL = 0.2
 LOSS_WEIGHT_CENTER = 0.8
 
+# 监督对比损失 SupCon（Khosla et al.）：在 c_rep 上接 projection，训练集双视图（独立随机旋转）
+# 需要 RGB+扩散特征；与 CE 联合：L = L_ce + SUPCON_WEIGHT * L_supcon
+USE_SUPCON = True
+SUPCON_WEIGHT = 0.1
+SUPCON_TEMPERATURE = 0.07
+SUPCON_PROJ_DIM = 128
+
 # 清单实验：仅 center/global loss 权重对比；生效：MULTIMODAL_ABLATION_AXIS / INDEX 或 GFDIFF_ABLATION_* 环境变量
 CENTER_GLOBAL_ABLATION = ((0.2, 0.8), (0.3, 0.7))
 MULTIMODAL_ABLATION_AXIS = None  # None | 'center_global'
@@ -86,6 +98,9 @@ MULTIMODAL_ABLATION_INDEX = 0
 
 # LiDAR 形态编码器 stem 隐藏通道（model/multimodal.py LidarMorphEncoder）
 LIDAR_PROJ_HIDDEN_CFG = 16
+# HSI 1D 光谱卷积 hidden 与 SE 压缩比（model/multimodal.py HSICenterSpectralEncoder）
+HSI_CONV_HIDDEN_CFG = 64
+HSI_SE_RATIO_CFG = 8
 
 _EFFECTIVE_ABLATION_AXIS = None
 _EFFECTIVE_ABLATION_INDEX = None
@@ -155,12 +170,13 @@ def build_opt():
     """完整训练配置 """
     inner = STUDENT_CHANNELS[0]
     mult = [c // inner for c in STUDENT_CHANNELS]
-    # 前 80% 步数恒定 lr，最后 20% 乘 gamma 一次（不衰减到 0）
+    # 两阶分段衰减，见 SCHED_STEP_RATIOS / SCHED_GAMMAS；仍支持仅 constant_ratio+gamma 的旧 dict
     sched = OrderedDict(
         [
-            ('name', 'constant_then_step'),
+            ('name', 'piecewise_two_step'),
+            ('step_ratios', list(SCHED_STEP_RATIOS)),
+            ('gammas', list(SCHED_GAMMAS)),
             ('constant_ratio', 0.8),
-            ('milestones', [0.8]),
             ('gamma', 0.1),
         ]
     )
@@ -257,6 +273,10 @@ def build_opt():
             ('transformer_ff_dim', CLS_TRANSFORMER_FF_DIM),
             ('transformer_dropout', CLS_TRANSFORMER_DROPOUT),
             ('head_hidden', CLS_HEAD_HIDDEN),
+            ('use_supcon', USE_SUPCON),
+            ('supcon_weight', SUPCON_WEIGHT),
+            ('supcon_temperature', SUPCON_TEMPERATURE),
+            ('supcon_proj_dim', SUPCON_PROJ_DIM),
             ('resume_state', None),
         ]
     )
@@ -268,7 +288,13 @@ def build_opt():
             ('checkpoint', 'checkpoint'),
         ]
     )
-    cast3 = OrderedDict([('lidar_hidden', LIDAR_PROJ_HIDDEN_CFG)])
+    cast3 = OrderedDict(
+        [
+            ('lidar_hidden', LIDAR_PROJ_HIDDEN_CFG),
+            ('hsi_conv_hidden', HSI_CONV_HIDDEN_CFG),
+            ('hsi_se_ratio', HSI_SE_RATIO_CFG),
+        ]
+    )
 
     return OrderedDict(
         [
@@ -314,6 +340,10 @@ opt['dataset']['modalities'] = modal
 opt['model_cls']['use_center_loss'] = USE_CENTER_LOSS
 opt['model_cls']['loss_weight_global'] = LOSS_WEIGHT_GLOBAL
 opt['model_cls']['loss_weight_center'] = LOSS_WEIGHT_CENTER
+opt['model_cls']['use_supcon'] = USE_SUPCON
+opt['model_cls']['supcon_weight'] = SUPCON_WEIGHT
+opt['model_cls']['supcon_temperature'] = SUPCON_TEMPERATURE
+opt['model_cls']['supcon_proj_dim'] = SUPCON_PROJ_DIM
 
 
 def _apply_gfdiff_env_overrides():
@@ -321,6 +351,8 @@ def _apply_gfdiff_env_overrides():
     在 build_opt 之后覆盖 loss 与 LiDAR 投影宽度（与 LIDAR_PROJ_HIDDEN_CFG 一致）。
     GFDIFF_LOSS_WEIGHT_GLOBAL / GFDIFF_LOSS_WEIGHT_CENTER
     GFDIFF_LIDAR_HIDDEN → LIDAR_PROJ_HIDDEN_CFG
+    GFDIFF_SUPCON_WEIGHT → SUPCON_WEIGHT
+    GFDIFF_USE_SUPCON → USE_SUPCON（0/1）
     """
     g = globals()
 
@@ -336,8 +368,16 @@ def _apply_gfdiff_env_overrides():
             return
         g[key] = int(v)
 
+    def _bool_env(name, key):
+        v = os.environ.get(name)
+        if v is None or v.strip() == '':
+            return
+        g[key] = v.strip().lower() in ('1', 'true', 'yes', 'y')
+
     _float('GFDIFF_LOSS_WEIGHT_GLOBAL', 'LOSS_WEIGHT_GLOBAL')
     _float('GFDIFF_LOSS_WEIGHT_CENTER', 'LOSS_WEIGHT_CENTER')
+    _float('GFDIFF_SUPCON_WEIGHT', 'SUPCON_WEIGHT')
+    _bool_env('GFDIFF_USE_SUPCON', 'USE_SUPCON')
     _int('GFDIFF_LIDAR_HIDDEN', 'LIDAR_PROJ_HIDDEN_CFG')
 
     lh = int(g['LIDAR_PROJ_HIDDEN_CFG'])
@@ -346,13 +386,23 @@ def _apply_gfdiff_env_overrides():
     opt['module_cast3']['lidar_hidden'] = lh
     opt['model_cls']['loss_weight_global'] = float(g['LOSS_WEIGHT_GLOBAL'])
     opt['model_cls']['loss_weight_center'] = float(g['LOSS_WEIGHT_CENTER'])
+    opt['model_cls']['use_supcon'] = bool(g['USE_SUPCON'])
+    opt['model_cls']['supcon_weight'] = float(g['SUPCON_WEIGHT'])
 
 
 _apply_gfdiff_env_overrides()
+
+if USE_SUPCON and not USE_RGB_PATCHES:
+    raise ValueError(
+        'USE_SUPCON=True 需要 RGB 与扩散特征：请准备 train_rgb_patches.npy 并确保 USE_RGB_PATCHES，'
+        '或设 USE_SUPCON=False / GFDIFF_USE_SUPCON=0'
+    )
 
 MULTIMODAL_ABLATION_LOG_LINE = (
     f"multimodal_ablation: axis={_EFFECTIVE_ABLATION_AXIS or 'none'} "
     f"index={_EFFECTIVE_ABLATION_INDEX if _EFFECTIVE_ABLATION_AXIS else '-'} | "
     f"lidar_hidden={LIDAR_PROJ_HIDDEN_CFG} "
-    f"loss_global/center={LOSS_WEIGHT_GLOBAL}/{LOSS_WEIGHT_CENTER}"
+    f"hsi_conv_hidden={HSI_CONV_HIDDEN_CFG} hsi_se_ratio={HSI_SE_RATIO_CFG} | "
+    f"loss_global/center={LOSS_WEIGHT_GLOBAL}/{LOSS_WEIGHT_CENTER} | "
+    f"use_supcon={USE_SUPCON} supcon_w={SUPCON_WEIGHT} tau={SUPCON_TEMPERATURE}"
 )

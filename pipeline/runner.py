@@ -41,6 +41,7 @@ from param import (
     TRAIN_QUICK_VERIFY_SAMPLES_PER_CLASS,
     USE_CENTER_LOSS,
     USE_RGB_PATCHES,
+    USE_SUPCON,
     VAL_RATIO,
     opt,
 )
@@ -319,6 +320,9 @@ def run_training(
 
     best_state_dict = None
 
+    # 周期性 checkpoint-<n> 仅从总 epoch 数的后 20% 起写（epoch 为 0-based）；best / final 仍照常
+    periodic_ckpt_min_epoch = max(0, int(NUM_EPOCHS * 0.8))
+
     epoch_bar = tqdm(range(start_epoch, NUM_EPOCHS), desc='Epochs')
 
     try:
@@ -454,11 +458,12 @@ def run_training(
                 if writer is not None:
                     writer.add_scalar(f'best/{selection_split}_overall_accuracy', best_acc, epoch + 1)
 
-            # 仅在已满足验证且 train_acc 过门槛时按间隔保存（与 run_selection 一致）
+            # 仅在已满足验证且 train_acc 过门槛时按间隔保存（与 run_selection 一致）；且仅在总 epoch 后 20%
             if (
                 run_selection
                 and SAVE_EVERY_EPOCH > 0
                 and run_ckps_dir_str
+                and epoch >= periodic_ckpt_min_epoch
                 and (epoch + 1) % SAVE_EVERY_EPOCH == 0
             ):
                 ep_ckpt = os.path.join(run_ckps_dir_str, f'checkpoint-{epoch + 1}')
@@ -475,10 +480,11 @@ def run_training(
                     run_ckps_dir_str,
                 )
                 logger.info(
-                    '断点已保存至 %s (next_epoch=%d, 每 %d epoch 一次，且需 train_acc≥%.0f%%)',
+                    '断点已保存至 %s (next_epoch=%d, 每 %d epoch 一次；仅 epoch≥%d 即后 20%%；且需 train_acc≥%.0f%%)',
                     ep_ckpt,
                     epoch + 1,
                     SAVE_EVERY_EPOCH,
+                    periodic_ckpt_min_epoch + 1,
                     100 * EVAL_MIN_TRAIN_ACC,
                 )
 
@@ -626,9 +632,9 @@ def verify_projection_gradients(create_classifier: CreateClassifierFn) -> None:
     optimizer = model.optimizer
     model.train()
     batch = next(iter(train_loader))
-    data_dict, labels = batch_to_dict(batch, device, USE_RGB_PATCHES)
+    data_dict, labels = batch_to_dict(batch, device, USE_RGB_PATCHES, USE_SUPCON)
     optimizer.zero_grad()
-    loss, _ = compute_classification_loss(model, data_dict, labels, loss_fn)
+    loss, _, _ = compute_classification_loss(model, data_dict, labels, loss_fn)
     loss.backward()
     ok = log_projection_gradients(model, logger, None, 0)
     if ok:
