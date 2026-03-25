@@ -12,12 +12,14 @@ from .checkpoint import (
     save_classifier_training_state,
 )
 from .data import (
-    IndexedTensorDataset,
+    PatchDataset,
     batch_to_dict,
     build_dataloaders,
-    load_data,
-    split_train_val,
-    subset_train_balanced_per_class,
+    build_test_loader,
+    load_test_indices_shifted,
+    load_train_bundle,
+    split_train_val_indices,
+    subset_train_indices_balanced,
 )
 from .loop import compute_classification_loss, evaluate, train_one_epoch
 from .metrics import accuracies
@@ -25,23 +27,25 @@ from .runner import TrainingRunOptions, run_training, verify_projection_gradient
 from .student_diffusion import StudentDiffusionWrapper, normalize_student_checkpoint_dir
 
 __all__ = [
-    'IndexedTensorDataset',
+    'PatchDataset',
     'StudentDiffusionWrapper',
     'accuracies',
     'batch_to_dict',
-    'build_dataloaders',
     'compute_classification_loss',
     'ensure_model_path_parent',
     'evaluate',
     'get_latest_checkpoint_path',
-    'load_data',
+    'build_dataloaders',
+    'build_test_loader',
+    'load_test_indices_shifted',
+    'load_train_bundle',
     'normalize_student_checkpoint_dir',
     'TrainingRunOptions',
     'run_training',
     'save_classifier_checkpoint',
     'save_classifier_training_state',
-    'split_train_val',
-    'subset_train_balanced_per_class',
+    'split_train_val_indices',
+    'subset_train_indices_balanced',
     'train_one_epoch',
     'verify_projection_gradients',
 ]

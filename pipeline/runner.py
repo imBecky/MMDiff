@@ -52,9 +52,11 @@ from .checkpoint import (
 from .data import (
     batch_to_dict,
     build_dataloaders,
-    load_data,
-    split_train_val,
-    subset_train_balanced_per_class,
+    build_test_loader,
+    load_test_indices_shifted,
+    load_train_bundle,
+    split_train_val_indices,
+    subset_train_indices_balanced,
 )
 from .logging_utils import (
     get_console_logger,
@@ -173,46 +175,39 @@ def run_training(
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-    train_hsi, train_lidar, train_rgb, train_labels, test_hsi, test_lidar, test_rgb, test_labels = load_data()
+    feats_vol, rgb_vol, train_indices, label_shift = load_train_bundle()
     if TRAIN_QUICK_VERIFY:
-        n_before = len(test_labels)
-        test_hsi, test_lidar, test_rgb, test_labels = subset_train_balanced_per_class(
-            test_hsi,
-            test_lidar,
-            test_rgb,
-            test_labels,
+        n_before = len(train_indices)
+        train_indices = subset_train_indices_balanced(
+            train_indices,
             TRAIN_QUICK_VERIFY_SAMPLES_PER_CLASS,
             RANDOM_SEED,
             NUM_CLASSES,
         )
         logger.info(
-            '[Quick verify] 训练集分层子集: %d -> %d 样本（每类至多 %d）',
+            '[Quick verify] 训练索引分层子集: %d -> %d（每类至多 %d）',
             n_before,
-            len(train_labels),
+            len(train_indices),
             TRAIN_QUICK_VERIFY_SAMPLES_PER_CLASS,
         )
-    tr_h, tr_l, tr_rgb, tr_y, va_h, va_l, va_rgb, va_y = split_train_val(
-        train_hsi,
-        train_lidar,
-        train_rgb,
-        train_labels,
-        VAL_RATIO,
-        RANDOM_SEED,
-    )
+    tr_idx, va_idx = split_train_val_indices(train_indices, VAL_RATIO, RANDOM_SEED)
+    defer_test_load = 0 < VAL_RATIO < 1.0
+    test_idx = None
+    if not defer_test_load:
+        test_idx = load_test_indices_shifted(label_shift)
+    if defer_test_load:
+        logger.info(
+            '延迟加载 test_labels（仅 final eval）；训练期选优使用验证集 (VAL_RATIO=%s)',
+            VAL_RATIO,
+        )
     train_loader, val_loader, test_loader = build_dataloaders(
-        tr_h,
-        tr_l,
-        tr_rgb,
-        tr_y,
-        va_h,
-        va_l,
-        va_rgb,
-        va_y,
-        test_hsi,
-        test_lidar,
-        test_rgb,
-        test_labels,
+        feats_vol,
+        rgb_vol,
+        tr_idx,
+        va_idx,
+        test_idx,
         BATCH_SIZE,
+        defer_test=defer_test_load,
     )
     opt['len_train_dataloader'] = len(train_loader)
     logger.info(
@@ -229,18 +224,25 @@ def run_training(
             'CHECK_PROJECTION_GRAD=True，将在 backward 后按间隔记录投影梯度（间隔=%d）',
             CHECK_PROJECTION_GRAD_INTERVAL,
         )
+    logger.info(
+        '数据 | train_patches=%s train_rgb_patches=%s | train_labels 行数=%s val=%s',
+        feats_vol.shape,
+        rgb_vol.shape if rgb_vol is not None else None,
+        tr_idx.shape,
+        va_idx.shape if va_idx is not None else None,
+    )
     log_config(
         logger,
         writer,
         device,
-        tr_h,
-        tr_l,
-        tr_y,
-        test_hsi,
-        test_lidar,
-        test_labels,
-        train_rgb=tr_rgb,
-        test_rgb=test_rgb,
+        None,
+        None,
+        tr_idx[:, 0],
+        None,
+        None,
+        test_idx[:, 0] if test_idx is not None else None,
+        train_rgb=None,
+        test_rgb=None,
         log_file_path=log_path,
     )
 
@@ -541,6 +543,12 @@ def run_training(
                 logger.info('Final test 使用最后一轮 model 权重')
 
         use_center_final = bool(USE_CENTER_LOSS)
+        if test_loader is None:
+            logger.info('加载测试集（final evaluation）...')
+            ti = load_test_indices_shifted(label_shift)
+            test_loader = build_test_loader(
+                feats_vol, rgb_vol, ti, BATCH_SIZE
+            )
         _, _, conf_final, eval_loss_final, eval_acc_final = evaluate(
             best_model,
             test_loader,
@@ -591,29 +599,18 @@ def verify_projection_gradients(create_classifier: CreateClassifierFn) -> None:
     logger = get_logger(log_path)
     logger.info('[verify_projection_grad] %s', MULTIMODAL_ABLATION_LOG_LINE)
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    train_hsi, train_lidar, train_rgb, train_labels, test_hsi, test_lidar, test_rgb, test_labels = load_data()
-    tr_h, tr_l, tr_rgb, tr_y, va_h, va_l, va_rgb, va_y = split_train_val(
-        train_hsi,
-        train_lidar,
-        train_rgb,
-        train_labels,
-        VAL_RATIO,
-        RANDOM_SEED,
-    )
+    fv, rv, tr_ind, ls = load_train_bundle()
+    tr_i, va_i = split_train_val_indices(tr_ind, VAL_RATIO, RANDOM_SEED)
+    defer = 0 < VAL_RATIO < 1.0
+    te_i = None if defer else load_test_indices_shifted(ls)
     train_loader, _, _ = build_dataloaders(
-        tr_h,
-        tr_l,
-        tr_rgb,
-        tr_y,
-        va_h,
-        va_l,
-        va_rgb,
-        va_y,
-        test_hsi,
-        test_lidar,
-        test_rgb,
-        test_labels,
+        fv,
+        rv,
+        tr_i,
+        va_i,
+        te_i,
         BATCH_SIZE,
+        defer_test=defer,
     )
     opt['len_train_dataloader'] = len(train_loader)
     diffusion = StudentDiffusionWrapper(

@@ -12,15 +12,17 @@ from param import (
     EVAL_INTERVAL_EPOCHS,
     EVAL_MIN_TRAIN_ACC,
     EVAL_VAL_START_EPOCH,
+    LABEL_SHIFT_PATH,
     LEARNING_RATE,
     LOG_PATH,
     LOSS_WEIGHT_CENTER,
     LOSS_WEIGHT_GLOBAL,
-    RUN_NAME_PREFIX,
     MULTIMODAL_ABLATION_LOG_LINE,
     NUM_CLASSES,
     NUM_EPOCHS,
     OPTIMIZER_BETAS,
+    PATCH_WINDOW_SIZE,
+    RUN_NAME_PREFIX,
     TB_LOG_ROOT,
     TEST_LABELS_PATH,
     TEST_PATCHES_PATH,
@@ -128,29 +130,38 @@ def log_config(
     test_rgb=None,
     log_file_path=None,
 ):
+    def _sh(x):
+        return x.shape if x is not None else None
+
     logger.info('Using device: %s', device)
-    if train_rgb is not None:
+    if train_hsi is None and train_lidar is None:
+        logger.info(
+            'Data shapes (patches + label indices) | train_labels=%s test_labels=%s',
+            _sh(train_labels),
+            _sh(test_labels),
+        )
+    elif train_rgb is not None:
         logger.info(
             'Data shapes | train_hsi=%s train_lidar=%s train_rgb=%s train_labels=%s '
             'test_hsi=%s test_lidar=%s test_rgb=%s test_labels=%s',
-            train_hsi.shape,
-            train_lidar.shape,
-            train_rgb.shape,
-            train_labels.shape,
-            test_hsi.shape,
-            test_lidar.shape,
-            test_rgb.shape,
-            test_labels.shape,
+            _sh(train_hsi),
+            _sh(train_lidar),
+            _sh(train_rgb),
+            _sh(train_labels),
+            _sh(test_hsi),
+            _sh(test_lidar),
+            _sh(test_rgb),
+            _sh(test_labels),
         )
     else:
         logger.info(
             'Data shapes | train_hsi=%s train_lidar=%s train_labels=%s test_hsi=%s test_lidar=%s test_labels=%s',
-            train_hsi.shape,
-            train_lidar.shape,
-            train_labels.shape,
-            test_hsi.shape,
-            test_lidar.shape,
-            test_labels.shape,
+            _sh(train_hsi),
+            _sh(train_lidar),
+            _sh(train_labels),
+            _sh(test_hsi),
+            _sh(test_lidar),
+            _sh(test_labels),
         )
     logger.info(
         'Training config | batch_size=%d epochs=%d lr=%.4g betas=%s weight_decay=%.6f',
@@ -176,6 +187,8 @@ def log_config(
             f'dataset.modalities: {opt.get("dataset", {}).get("modalities")}',
             f'TRAIN_LABELS_PATH: {TRAIN_LABELS_PATH}',
             f'TEST_LABELS_PATH: {TEST_LABELS_PATH}',
+            f'LABEL_SHIFT_PATH: {LABEL_SHIFT_PATH}',
+            f'PATCH_WINDOW_SIZE: {PATCH_WINDOW_SIZE}',
             f'best_model (per run ckpt dir): {BEST_MODEL_FILENAME}',
             f'LOG_PATH: {log_file_path if log_file_path is not None else LOG_PATH}',
         ]),

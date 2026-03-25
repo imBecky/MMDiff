@@ -1,3 +1,7 @@
+from __future__ import annotations
+
+from typing import Optional, Tuple
+
 import numpy as np
 import torch
 from sklearn.model_selection import train_test_split
@@ -5,239 +9,296 @@ from torch.utils.data import DataLoader
 
 from param import (
     HSI_CHANNELS,
+    LABEL_SHIFT_PATH,
     LIDAR_CHANNELS,
     NUM_CLASSES,
-    RGB_CHANNELS,
+    NUM_WORKERS,
+    PATCH_WINDOW_SIZE,
     TEST_LABELS_PATH,
-    TEST_PATCHES_PATH,
-    TEST_RGB_PATCHES_PATH,
     TRAIN_LABELS_PATH,
     TRAIN_PATCHES_PATH,
     TRAIN_RGB_PATCHES_PATH,
+    TRAIN_ROT_AUGMENT_FACTOR,
     USE_RGB_PATCHES,
 )
 
 
-def load_data():
-    train_patches = np.load(TRAIN_PATCHES_PATH)
-    test_patches = np.load(TEST_PATCHES_PATH)
+def _patch_array_to_float32(x: np.ndarray) -> np.ndarray:
+    if x.dtype == np.float32:
+        return x
+    if x.dtype == np.float16:
+        return x.astype(np.float32, copy=False)
+    if x.dtype == np.float64:
+        return x.astype(np.float32, copy=False)
+    raise ValueError(f'patch 数组应为浮点类型，当前 dtype={x.dtype}')
 
-    train_labels = np.load(TRAIN_LABELS_PATH)
-    test_labels = np.load(TEST_LABELS_PATH)
 
-    expected_channels = HSI_CHANNELS + LIDAR_CHANNELS
-    if train_patches.shape[-1] != expected_channels or test_patches.shape[-1] != expected_channels:
-        raise ValueError(
-            f'Expected patch channels to be {expected_channels}, '
-            f'but got train={train_patches.shape[-1]}, test={test_patches.shape[-1]}'
+def _require_prepared_data_files():
+    req = [
+        TRAIN_PATCHES_PATH,
+        TRAIN_LABELS_PATH,
+        TEST_LABELS_PATH,
+        LABEL_SHIFT_PATH,
+    ]
+    missing = [p for p in req if not p.is_file()]
+    if missing:
+        raise FileNotFoundError(
+            '缺少数据文件（请先运行 data_prepare.py）：\n'
+            + '\n'.join(str(p) for p in missing)
+        )
+    if USE_RGB_PATCHES and not TRAIN_RGB_PATCHES_PATH.is_file():
+        raise FileNotFoundError(
+            f'USE_RGB_PATCHES 为真但缺少 {TRAIN_RGB_PATCHES_PATH}，请运行 data_prepare 生成 train_rgb_patches.npy'
         )
 
-    train_hsi = np.transpose(train_patches[:, :, :, :HSI_CHANNELS], (0, 3, 1, 2))
-    train_lidar = np.transpose(train_patches[:, :, :, HSI_CHANNELS:HSI_CHANNELS + LIDAR_CHANNELS], (0, 3, 1, 2))
 
-    test_hsi = np.transpose(test_patches[:, :, :, :HSI_CHANNELS], (0, 3, 1, 2))
-    test_lidar = np.transpose(test_patches[:, :, :, HSI_CHANNELS:HSI_CHANNELS + LIDAR_CHANNELS], (0, 3, 1, 2))
+def _crop_patch_hwc(vol_hwc: np.ndarray, row: int, col: int, window_size: int) -> np.ndarray:
+    m = window_size // 2
+    h, w, c = vol_hwc.shape
+    r0, r1 = row - m, row + m + 1
+    c0, c1 = col - m, col + m + 1
+    pad_top = max(0, -r0)
+    pad_bottom = max(0, r1 - h)
+    pad_left = max(0, -c0)
+    pad_right = max(0, c1 - w)
+    r0c, r1c = max(0, r0), min(h, r1)
+    c0c, c1c = max(0, c0), min(w, c1)
+    patch = vol_hwc[r0c:r1c, c0c:c1c, :].astype(np.float32, copy=False)
+    if pad_top or pad_bottom or pad_left or pad_right:
+        patch = np.pad(
+            patch,
+            ((pad_top, pad_bottom), (pad_left, pad_right), (0, 0)),
+            mode='constant',
+            constant_values=0.0,
+        )
+    assert patch.shape[0] == window_size and patch.shape[1] == window_size
+    return patch
 
-    train_rgb, test_rgb = None, None
-    if USE_RGB_PATCHES:
-        train_rgb_arr = np.load(TRAIN_RGB_PATCHES_PATH)
-        test_rgb_arr = np.load(TEST_RGB_PATCHES_PATH)
-        if train_rgb_arr.shape[-1] != RGB_CHANNELS or test_rgb_arr.shape[-1] != RGB_CHANNELS:
-            raise ValueError(
-                f'RGB patches last dim must be RGB_CHANNELS={RGB_CHANNELS}, '
-                f'got train={train_rgb_arr.shape[-1]}, test={test_rgb_arr.shape[-1]}'
+
+def _random_rot_k(factor: int) -> int:
+    if factor == 1:
+        return 0
+    if factor == 2:
+        return 0 if np.random.randint(0, 2) == 0 else 2
+    return int(np.random.randint(0, 4))
+
+
+def _apply_rot_k(patch_hwc: np.ndarray, k: int) -> np.ndarray:
+    if k == 0:
+        return patch_hwc
+    return np.rot90(patch_hwc, k=k, axes=(0, 1)).copy()
+
+
+class PatchDataset(torch.utils.data.Dataset):
+    """
+    feats: (H,W,C) HSI+LiDAR；rgb: (H,W,3) 或 None。
+    indices: (N,3) [label, row, col]，label 已为 0..NUM_CLASSES-1。
+    """
+
+    def __init__(
+        self,
+        feats_vol: np.ndarray,
+        rgb_vol: Optional[np.ndarray],
+        indices: np.ndarray,
+        *,
+        window_size: int,
+        training: bool,
+        rot_factor: int = 1,
+    ):
+        super().__init__()
+        self.feats = feats_vol
+        self.rgb = rgb_vol
+        self.indices = np.asarray(indices, dtype=np.int64)
+        self.window_size = int(window_size)
+        self.training = training
+        self.rot_factor = int(rot_factor)
+
+    def __len__(self):
+        return len(self.indices)
+
+    def __getitem__(self, index: int):
+        lab = int(self.indices[index, 0])
+        row = int(self.indices[index, 1])
+        col = int(self.indices[index, 2])
+        w = self.window_size
+        fp = _crop_patch_hwc(self.feats, row, col, w)
+        rk = _random_rot_k(self.rot_factor) if self.training and self.rot_factor > 1 else 0
+        fp = _apply_rot_k(fp, rk)
+        hsi = _patch_array_to_float32(np.transpose(fp[:, :, :HSI_CHANNELS], (2, 0, 1)))
+        lidar = _patch_array_to_float32(
+            np.transpose(fp[:, :, HSI_CHANNELS : HSI_CHANNELS + LIDAR_CHANNELS], (2, 0, 1))
+        )
+        if self.rgb is not None:
+            rp = _crop_patch_hwc(self.rgb, row, col, w)
+            rp = _apply_rot_k(rp, rk)
+            rgb = _patch_array_to_float32(np.transpose(rp, (2, 0, 1)))
+            return (
+                torch.from_numpy(hsi),
+                torch.from_numpy(lidar),
+                torch.from_numpy(rgb),
+                torch.tensor(lab, dtype=torch.long),
+                torch.tensor(index, dtype=torch.long),
             )
-        train_rgb = np.transpose(train_rgb_arr, (0, 3, 1, 2))
-        test_rgb = np.transpose(test_rgb_arr, (0, 3, 1, 2))
-        for name, a, ref in (('train', train_rgb, train_hsi), ('test', test_rgb, test_hsi)):
-            if a.shape[0] != ref.shape[0]:
-                raise ValueError(f'{name} RGB N mismatch: rgb={a.shape[0]} vs hsi={ref.shape[0]}')
-            if a.shape[2:] != ref.shape[2:]:
-                raise ValueError(f'{name} RGB spatial shape mismatch: rgb={a.shape[2:]} vs hsi={ref.shape[2:]}')
-
-    # CrossEntropyLoss expects 0-based class indices；train/test 用同一全局偏移，避免 split 后类别编号错位
-    global_min = int(min(train_labels.min(), test_labels.min()))
-    train_labels = train_labels - global_min
-    test_labels = test_labels - global_min
-    if int(train_labels.max()) >= NUM_CLASSES or int(test_labels.max()) >= NUM_CLASSES:
-        raise ValueError(
-            f'Label range exceeds NUM_CLASSES={NUM_CLASSES} after shift by {global_min}: '
-            f'train max={int(train_labels.max())}, test max={int(test_labels.max())}'
+        return (
+            torch.from_numpy(hsi),
+            torch.from_numpy(lidar),
+            torch.tensor(lab, dtype=torch.long),
+            torch.tensor(index, dtype=torch.long),
         )
 
-    return train_hsi, train_lidar, train_rgb, train_labels, test_hsi, test_lidar, test_rgb, test_labels
+
+def load_train_bundle():
+    """
+    mmap 整幅 HSI+LiDAR / RGB + 训练索引；label 已按 label_shift 平移。
+    """
+    _require_prepared_data_files()
+    feats = np.load(TRAIN_PATCHES_PATH, mmap_mode='r')
+    rgb = np.load(TRAIN_RGB_PATCHES_PATH, mmap_mode='r') if USE_RGB_PATCHES else None
+    train_indices = np.load(TRAIN_LABELS_PATH).astype(np.int64, copy=True)
+    label_shift = int(np.load(LABEL_SHIFT_PATH))
+    train_indices[:, 0] = train_indices[:, 0] - label_shift
+    if int(train_indices[:, 0].max()) >= NUM_CLASSES or int(train_indices[:, 0].min()) < 0:
+        raise ValueError(
+            f'训练标签越界: min={int(train_indices[:, 0].min())} max={int(train_indices[:, 0].max())} '
+            f'NUM_CLASSES={NUM_CLASSES}'
+        )
+    return feats, rgb, train_indices, label_shift
 
 
-def subset_train_balanced_per_class(
-    train_hsi,
-    train_lidar,
-    train_rgb,
-    train_labels,
+def load_test_indices_shifted(label_shift: int) -> np.ndarray:
+    if not TEST_LABELS_PATH.is_file():
+        raise FileNotFoundError(f'缺少 {TEST_LABELS_PATH}')
+    test_indices = np.load(TEST_LABELS_PATH).astype(np.int64, copy=True)
+    test_indices[:, 0] = test_indices[:, 0] - int(label_shift)
+    if int(test_indices[:, 0].max()) >= NUM_CLASSES or int(test_indices[:, 0].min()) < 0:
+        raise ValueError(
+            f'测试标签越界: min={int(test_indices[:, 0].min())} max={int(test_indices[:, 0].max())}'
+        )
+    return test_indices
+
+
+def subset_train_indices_balanced(
+    train_indices: np.ndarray,
     samples_per_class: int,
     seed: int,
     num_classes: int,
-):
-    """
-    从训练集中每类随机至多取 samples_per_class 个样本（分层），用于小数据快速验证。
-    labels 须已为 0..num_classes-1。
-    """
-    y = np.asarray(train_labels)
+) -> np.ndarray:
+    labels = train_indices[:, 0]
     rng = np.random.RandomState(seed)
     parts = []
     for c in range(num_classes):
-        idx = np.where(y == c)[0]
+        idx = np.where(labels == c)[0]
         if len(idx) == 0:
             continue
         n_take = min(int(samples_per_class), len(idx))
         chosen = rng.choice(idx, size=n_take, replace=False)
         parts.append(chosen)
     if not parts:
-        return train_hsi, train_lidar, train_rgb, train_labels
+        return train_indices
     all_idx = np.concatenate(parts)
     rng.shuffle(all_idx)
-    tr_h = train_hsi[all_idx]
-    tr_l = train_lidar[all_idx]
-    tr_y = y[all_idx]
-    tr_rgb = train_rgb[all_idx] if train_rgb is not None else None
-    return tr_h, tr_l, tr_rgb, tr_y
+    return train_indices[all_idx]
 
 
-def split_train_val(
-    train_hsi,
-    train_lidar,
-    train_rgb,
-    train_labels,
-    val_ratio,
-    seed,
-):
-    """从训练 patch 中划分验证集（分层），test 集保持独立仅用于最终评估。"""
+def split_train_val_indices(
+    train_indices: np.ndarray,
+    val_ratio: float,
+    seed: int,
+) -> Tuple[np.ndarray, Optional[np.ndarray]]:
     if val_ratio <= 0 or val_ratio >= 1.0:
-        return (
-            train_hsi,
-            train_lidar,
-            train_rgb,
-            train_labels,
-            None,
-            None,
-            None,
-            None,
-        )
-    n = len(train_labels)
-    idx = np.arange(n)
+        return train_indices, None
+    labels = train_indices[:, 0]
+    idx = np.arange(len(train_indices))
     train_idx, val_idx = train_test_split(
         idx,
         test_size=val_ratio,
         random_state=seed,
-        stratify=train_labels,
+        stratify=labels,
     )
-    tr_h = train_hsi[train_idx]
-    va_h = train_hsi[val_idx]
-    tr_l = train_lidar[train_idx]
-    va_l = train_lidar[val_idx]
-    tr_y = train_labels[train_idx]
-    va_y = train_labels[val_idx]
-    tr_rgb, va_rgb = None, None
-    if train_rgb is not None:
-        tr_rgb = train_rgb[train_idx]
-        va_rgb = train_rgb[val_idx]
-    return tr_h, tr_l, tr_rgb, tr_y, va_h, va_l, va_rgb, va_y
+    return train_indices[train_idx], train_indices[val_idx]
 
 
-class IndexedTensorDataset(torch.utils.data.Dataset):
-    """TensorDataset + 样本下标，供扩散特征确定性噪声使用。"""
-
-    def __init__(self, *tensors):
-        self.tensors = tensors
-        assert all(len(tensors[0]) == len(t) for t in tensors)
-
-    def __getitem__(self, index):
-        return tuple(t[index] for t in self.tensors) + (index,)
-
-    def __len__(self):
-        return len(self.tensors[0])
+def build_test_loader(
+    feats_vol: np.ndarray,
+    rgb_vol: Optional[np.ndarray],
+    test_indices: np.ndarray,
+    batch_size: int,
+) -> DataLoader:
+    ds = PatchDataset(
+        feats_vol,
+        rgb_vol,
+        test_indices,
+        window_size=PATCH_WINDOW_SIZE,
+        training=False,
+        rot_factor=1,
+    )
+    pin_memory = torch.cuda.is_available()
+    return DataLoader(
+        ds,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=NUM_WORKERS,
+        pin_memory=pin_memory,
+    )
 
 
 def build_dataloaders(
-    train_hsi,
-    train_lidar,
-    train_rgb,
-    train_labels,
-    val_hsi,
-    val_lidar,
-    val_rgb,
-    val_labels,
-    test_hsi,
-    test_lidar,
-    test_rgb,
-    test_labels,
-    batch_size,
+    feats_vol: np.ndarray,
+    rgb_vol: Optional[np.ndarray],
+    tr_idx: np.ndarray,
+    va_idx: Optional[np.ndarray],
+    test_idx: Optional[np.ndarray],
+    batch_size: int,
+    *,
+    defer_test: bool,
 ):
-    if train_rgb is not None:
-        train_dataset = IndexedTensorDataset(
-            torch.from_numpy(train_hsi),
-            torch.from_numpy(train_lidar),
-            torch.from_numpy(train_rgb),
-            torch.from_numpy(train_labels),
-        )
-        test_dataset = IndexedTensorDataset(
-            torch.from_numpy(test_hsi),
-            torch.from_numpy(test_lidar),
-            torch.from_numpy(test_rgb),
-            torch.from_numpy(test_labels),
-        )
-    else:
-        train_dataset = IndexedTensorDataset(
-            torch.from_numpy(train_hsi),
-            torch.from_numpy(train_lidar),
-            torch.from_numpy(train_labels),
-        )
-        test_dataset = IndexedTensorDataset(
-            torch.from_numpy(test_hsi),
-            torch.from_numpy(test_lidar),
-            torch.from_numpy(test_labels),
-        )
     pin_memory = torch.cuda.is_available()
+    rot = int(TRAIN_ROT_AUGMENT_FACTOR)
+    if rot not in (1, 2, 4):
+        rot = 1
+
+    train_ds = PatchDataset(
+        feats_vol,
+        rgb_vol,
+        tr_idx,
+        window_size=PATCH_WINDOW_SIZE,
+        training=True,
+        rot_factor=rot,
+    )
     train_loader = DataLoader(
-        train_dataset,
+        train_ds,
         batch_size=batch_size,
         shuffle=True,
-        num_workers=18,
+        num_workers=NUM_WORKERS,
         pin_memory=pin_memory,
     )
-    test_loader = DataLoader(
-        test_dataset,
-        batch_size=batch_size,
-        shuffle=False,
-        num_workers=18,
-        pin_memory=pin_memory,
-    )
+
     val_loader = None
-    if val_hsi is not None and len(val_hsi) > 0:
-        if val_rgb is not None:
-            val_dataset = IndexedTensorDataset(
-                torch.from_numpy(val_hsi),
-                torch.from_numpy(val_lidar),
-                torch.from_numpy(val_rgb),
-                torch.from_numpy(val_labels),
-            )
-        else:
-            val_dataset = IndexedTensorDataset(
-                torch.from_numpy(val_hsi),
-                torch.from_numpy(val_lidar),
-                torch.from_numpy(val_labels),
-            )
+    if va_idx is not None and len(va_idx) > 0:
+        val_ds = PatchDataset(
+            feats_vol,
+            rgb_vol,
+            va_idx,
+            window_size=PATCH_WINDOW_SIZE,
+            training=False,
+            rot_factor=1,
+        )
         val_loader = DataLoader(
-            val_dataset,
+            val_ds,
             batch_size=batch_size,
             shuffle=False,
-            num_workers=18,
+            num_workers=NUM_WORKERS,
             pin_memory=pin_memory,
         )
+
+    test_loader = None
+    if not defer_test and test_idx is not None and len(test_idx) > 0:
+        test_loader = build_test_loader(feats_vol, rgb_vol, test_idx, batch_size)
+
     return train_loader, val_loader, test_loader
 
 
 def batch_to_dict(batch, device, use_rgb_patches: bool):
-    """与 opt['dataset']['modalities'] 一致，构造分类器所需的 data_dict（键名需与模态名相同）。"""
     if use_rgb_patches:
         hsi, lidar, rgb, labels, sample_indices = batch
         hsi = hsi.to(device=device, dtype=torch.float32)

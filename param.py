@@ -8,13 +8,18 @@ import utils.logger as Logger
 # 数据与训练（常用修改处）
 # ---------------------------------------------------------------------------
 DATA_DIR = Path('../../autodl-fs/houston2018/prepared')
+# 由 data_prepare.py 生成：整幅 HSI+LiDAR / RGB + 像素索引表（文件名与旧版一致）
 TRAIN_PATCHES_PATH = DATA_DIR / 'train_patches.npy'
-TEST_PATCHES_PATH = DATA_DIR / 'test_patches.npy'
+TEST_PATCHES_PATH = TRAIN_PATCHES_PATH
 TRAIN_RGB_PATCHES_PATH = DATA_DIR / 'train_rgb_patches.npy'
-TEST_RGB_PATCHES_PATH = DATA_DIR / 'test_rgb_patches.npy'
+TEST_RGB_PATCHES_PATH = TRAIN_RGB_PATCHES_PATH
 TRAIN_LABELS_PATH = DATA_DIR / 'train_labels.npy'
 TEST_LABELS_PATH = DATA_DIR / 'test_labels.npy'
-USE_RGB_PATCHES = TRAIN_RGB_PATCHES_PATH.is_file() and TEST_RGB_PATCHES_PATH.is_file()
+LABEL_SHIFT_PATH = DATA_DIR / 'label_shift.npy'
+PATCH_WINDOW_SIZE = 11  # 须与 data_prepare 一致
+# 训练时在线旋转增强：1=关；2=0/180°；4=0/90/180/270°
+TRAIN_ROT_AUGMENT_FACTOR = 4
+USE_RGB_PATCHES = TRAIN_RGB_PATCHES_PATH.is_file()
 RGB_CHANNELS = 3
 RUN_NAME_PREFIX = 'cls'
 # 验证集最佳权重保存在本次 run 的断点目录下：{run_ckps_dir}/{BEST_MODEL_FILENAME}
@@ -33,7 +38,7 @@ LOG_PATH = TB_LOG_ROOT / 'model.log'
 
 # ---------------------------------------------------------------------------
 # 小数据快速验证：仅用训练集的部分样本跑通流程、观察能否过拟合（不改 test 集）
-# True 时：在 load_data 之后、train/val 划分之前，从训练集按类分层随机抽取
+# True 时：在 load_train_bundle 之后、train/val 划分之前，从训练索引按类分层随机抽取
 # 每类至多 TRAIN_QUICK_VERIFY_SAMPLES_PER_CLASS 条；再按 VAL_RATIO 划验证集
 # 若每类样本过少导致 stratify 报错，可暂设 VAL_RATIO = 0
 # ---------------------------------------------------------------------------
