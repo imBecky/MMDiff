@@ -4,14 +4,23 @@ import re
 from datetime import datetime
 from pathlib import Path
 
+import numpy as np
+import torch.nn as nn
+
 from param import (
     BEST_MODEL_FILENAME,
     BATCH_SIZE,
     CHECK_PROJECTION_GRAD,
+    CLIP_GRAD_NORM,
     DATA_DIR,
+    DIFFUSION_NOISE_MODE,
+    DIFFUSION_NORMALIZE_INPUT,
     EVAL_INTERVAL_EPOCHS,
     EVAL_MIN_TRAIN_ACC,
     EVAL_VAL_START_EPOCH,
+    HSI_CONV_HIDDEN_CFG,
+    HSI_RESIDUAL_BLOCKS_CFG,
+    HSI_SE_RATIO_CFG,
     LABEL_SHIFT_PATH,
     LEARNING_RATE,
     LOG_PATH,
@@ -20,9 +29,14 @@ from param import (
     MULTIMODAL_ABLATION_LOG_LINE,
     NUM_CLASSES,
     NUM_EPOCHS,
+    NUM_WORKERS,
     OPTIMIZER_BETAS,
     PATCH_WINDOW_SIZE,
+    RANDOM_SEED,
     RUN_NAME_PREFIX,
+    SAVE_EVERY_EPOCH,
+    STUDENT_CHECKPOINT,
+    STUDENT_SIZE,
     SUPCON_TEMPERATURE,
     SUPCON_WEIGHT,
     TB_LOG_ROOT,
@@ -32,9 +46,11 @@ from param import (
     TRAIN_LABELS_PATH,
     TRAIN_PATCHES_PATH,
     TRAIN_RGB_PATCHES_PATH,
+    TRAIN_ROT_AUGMENT_FACTOR,
     USE_CENTER_LOSS,
     USE_RGB_PATCHES,
     USE_SUPCON,
+    VAL_RATIO,
     WEIGHT_DECAY,
     opt,
 )
@@ -44,7 +60,7 @@ from torch.utils.tensorboard import SummaryWriter
 def prepare_tb_run_dir():
     """与 TensorBoard 使用同一 run 目录（TB_LOG_ROOT / run_name）。"""
     TB_LOG_ROOT.mkdir(parents=True, exist_ok=True)
-    tag = os.environ.get('GFDIFF_EXPERIMENT_TAG', '').strip()
+    tag = os.environ.get('MMDIFF_EXPERIMENT_TAG', '').strip()
     if tag:
         safe = re.sub(r'[^\w\-.]', '_', tag)
         run_name = f'{RUN_NAME_PREFIX}_{safe}_{datetime.now().strftime("%Y%m%d-%H%M%S")}'
@@ -53,6 +69,52 @@ def prepare_tb_run_dir():
     run_dir = TB_LOG_ROOT / run_name
     run_dir.mkdir(parents=True, exist_ok=True)
     return run_dir
+
+
+def save_confusion_detail_log(
+    out_path: Path,
+    conf: np.ndarray,
+    num_classes: int,
+    *,
+    global_top_k: int = 40,
+) -> None:
+    """
+    将测试集混淆矩阵与主要误分类对写入单独文件（与 model.log 同目录时常用文件名 conf_detail.log）。
+    conf: sklearn confusion_matrix，行=真实类，列=预测类。
+    """
+    cm = np.asarray(conf, dtype=np.int64)
+    if cm.shape != (num_classes, num_classes):
+        raise ValueError(f'conf shape {cm.shape} 与 num_classes={num_classes} 不一致')
+
+    lines: list[str] = []
+    lines.append('confusion matrix (rows=true class index, cols=pred class index)')
+    lines.append(np.array2string(cm))
+    lines.append('')
+    lines.append('--- Per true class: top off-diagonal predictions (true -> pred : count) ---')
+    for i in range(num_classes):
+        row = cm[i].copy()
+        row[i] = 0
+        order = np.argsort(row)[::-1]
+        parts: list[str] = []
+        for j in order[: min(3, num_classes)]:
+            if int(row[j]) > 0:
+                parts.append(f'{i} -> {j}: {int(row[j])}')
+        lines.append(f'true class {i}: ' + ('; '.join(parts) if parts else '(none)'))
+
+    pairs: list[tuple[int, int, int]] = []
+    for i in range(num_classes):
+        for j in range(num_classes):
+            if i != j and cm[i, j] > 0:
+                pairs.append((int(cm[i, j]), i, j))
+    pairs.sort(key=lambda x: -x[0])
+    lines.append('')
+    lines.append(f'--- Global off-diagonal pairs sorted by count (top {global_top_k}) ---')
+    for cnt, i, j in pairs[:global_top_k]:
+        lines.append(f'{i} -> {j}: {cnt}')
+
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text('\n'.join(lines) + '\n', encoding='utf-8')
 
 
 def get_logger(log_path=None):
@@ -137,6 +199,14 @@ def log_config(
         return x.shape if x is not None else None
 
     logger.info('Using device: %s', device)
+    logger.info(
+        'Data paths | DATA_DIR=%s TRAIN_PATCHES=%s TRAIN_RGB=%s USE_RGB_PATCHES=%s LABEL_SHIFT=%s',
+        DATA_DIR,
+        TRAIN_PATCHES_PATH,
+        TRAIN_RGB_PATCHES_PATH,
+        USE_RGB_PATCHES,
+        LABEL_SHIFT_PATH,
+    )
     if train_hsi is None and train_lidar is None:
         logger.info(
             'Data shapes (patches + label indices) | train_labels=%s test_labels=%s',
@@ -218,6 +288,206 @@ def log_config(
             f'EVAL_VAL_START_EPOCH: {EVAL_VAL_START_EPOCH}',
             f'CHECK_PROJECTION_GRAD: {CHECK_PROJECTION_GRAD}',
             f"module_cast3 lidar_hidden: {mc3.get('lidar_hidden', '-')}",
+            f"module_cast3 hsi_residual_blocks: {mc3.get('hsi_residual_blocks', '-')}",
+            f"module_cast3 hsi_conv_hidden: {mc3.get('hsi_conv_hidden', '-')}",
+            f"module_cast3 hsi_se_ratio: {mc3.get('hsi_se_ratio', '-')}",
             MULTIMODAL_ABLATION_LOG_LINE,
         ]),
     )
+
+
+def log_model_and_training_detail(
+    logger,
+    writer,
+    model: nn.Module,
+    opt,
+    clip_grad_norm: float,
+    diffusion=None,
+):
+    """
+    在模型构建（及可选 resume）之后写入：参数量与子模块规模、opt 训练/调度/分类头、扩散与数据相关要点。
+    同时写入 TensorBoard config/model、config/train_extended（若 writer 非空）。
+    """
+    train_cfg = opt.get('train') or {}
+    optim_cfg = train_cfg.get('optimizer') or {}
+    sched_cfg = dict(train_cfg.get('scheduler') or {})
+    mc = opt.get('model_cls') or {}
+    ds = opt.get('dataset') or {}
+    mc3 = opt.get('module_cast3') or {}
+    unet_cfg = (opt.get('model') or {}).get('unet') or {}
+
+    total = sum(p.numel() for p in model.parameters())
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+
+    logger.info('========== Model ==========')
+    logger.info('class=%s', type(model).__name__)
+    logger.info(
+        'parameters total=%d (%.2fM) trainable=%d (%.2fM)',
+        total,
+        total / 1e6,
+        trainable,
+        trainable / 1e6,
+    )
+    for name, child in model.named_children():
+        if not isinstance(child, nn.Module):
+            continue
+        n = sum(p.numel() for p in child.parameters())
+        if n:
+            logger.info('  submodule %-20s %9d params', name, n)
+
+    if hasattr(model, 'd_model'):
+        logger.info(
+            'classifier layout | fusion=cross d_model=%s seq_len=%s num_classes=%s diffusion_ts=%s feat_layers=%s',
+            getattr(model, 'd_model', '-'),
+            getattr(model, 'seq_len', '-'),
+            getattr(model, 'num_classes', '-'),
+            getattr(model, 'diffusion_ts', getattr(model, 'diffusion_t', '-')),
+            getattr(model, 'feat_layer_names', '-'),
+        )
+
+    logger.info('========== Training / opt ==========')
+    logger.info(
+        'run | RANDOM_SEED=%s VAL_RATIO=%s num_workers=%s TRAIN_ROT_AUGMENT_FACTOR=%s',
+        RANDOM_SEED,
+        VAL_RATIO,
+        ds.get('num_workers', NUM_WORKERS),
+        TRAIN_ROT_AUGMENT_FACTOR,
+    )
+    logger.info(
+        'file hparams | BATCH_SIZE=%s NUM_EPOCHS=%s LEARNING_RATE=%s betas=%s weight_decay=%s CLIP_GRAD_NORM=%s',
+        BATCH_SIZE,
+        NUM_EPOCHS,
+        LEARNING_RATE,
+        OPTIMIZER_BETAS,
+        WEIGHT_DECAY,
+        CLIP_GRAD_NORM,
+    )
+    logger.info(
+        'optimizer (opt) | type=%s lr=%s weight_decay=%s betas=%s',
+        optim_cfg.get('type'),
+        optim_cfg.get('lr'),
+        optim_cfg.get('weight_decay'),
+        optim_cfg.get('betas'),
+    )
+    logger.info(
+        'effective clip_grad (runner)=%s | center_loss=%s w_global=%s w_center=%s supcon=%s supcon_w=%s tau=%s',
+        clip_grad_norm,
+        USE_CENTER_LOSS,
+        LOSS_WEIGHT_GLOBAL,
+        LOSS_WEIGHT_CENTER,
+        USE_SUPCON,
+        SUPCON_WEIGHT,
+        SUPCON_TEMPERATURE,
+    )
+    logger.info('lr_scheduler (opt train.scheduler)=%s', sched_cfg)
+    logger.info(
+        'model_cls | fusion=cross token_dim=%s transformer: heads=%s layers=%s ff=%s dropout=%s head_hidden=%s',
+        mc.get('token_dim'),
+        mc.get('transformer_heads'),
+        mc.get('transformer_layers'),
+        mc.get('transformer_ff_dim'),
+        mc.get('transformer_dropout'),
+        mc.get('head_hidden'),
+    )
+    logger.info(
+        'model_cls | init_type=%s scale=%s feat_scales(t)=%s t=%s',
+        mc.get('init_type'),
+        mc.get('scale'),
+        mc.get('feat_scales'),
+        mc.get('t'),
+    )
+    logger.info(
+        'dataset (opt) | n_cls=%s hsi_channels=%s lidar_channel=%s modalities=%s resolution=%s',
+        ds.get('n_cls'),
+        ds.get('hsi_channels'),
+        ds.get('lidar_channel'),
+        ds.get('modalities'),
+        ds.get('resolution'),
+    )
+    logger.info(
+        'module_cast3 | lidar_hidden=%s hsi_residual_blocks=%s hsi_conv_hidden=%s hsi_se_ratio=%s',
+        mc3.get('lidar_hidden'),
+        mc3.get('hsi_residual_blocks', HSI_RESIDUAL_BLOCKS_CFG),
+        mc3.get('hsi_conv_hidden', HSI_CONV_HIDDEN_CFG),
+        mc3.get('hsi_se_ratio', HSI_SE_RATIO_CFG),
+    )
+    logger.info(
+        'student (param) | STUDENT_CHECKPOINT=%s STUDENT_SIZE=%s DIFFUSION_NOISE_MODE=%s NORMALIZE_INPUT=%s',
+        STUDENT_CHECKPOINT,
+        STUDENT_SIZE,
+        DIFFUSION_NOISE_MODE,
+        DIFFUSION_NORMALIZE_INPUT,
+    )
+    logger.info(
+        'checkpoint habit | SAVE_EVERY_EPOCH=%s periodic from epoch>=%d (1-based, last 20%% of NUM_EPOCHS) BEST=%s',
+        SAVE_EVERY_EPOCH,
+        max(1, int(NUM_EPOCHS * 0.8) + 1),
+        BEST_MODEL_FILENAME,
+    )
+    logger.info(
+        'eval gates | EVAL_VAL_START_EPOCH=%s EVAL_MIN_TRAIN_ACC=%s EVAL_INTERVAL_EPOCHS=%s',
+        EVAL_VAL_START_EPOCH,
+        EVAL_MIN_TRAIN_ACC,
+        EVAL_INTERVAL_EPOCHS,
+    )
+    logger.info('%s', MULTIMODAL_ABLATION_LOG_LINE)
+    if unet_cfg:
+        logger.info('model.unet (condensed) | inner_channel=%s multiplier=%s res_blocks=%s dropout=%s',
+                    unet_cfg.get('inner_channel'), unet_cfg.get('channel_multiplier'),
+                    unet_cfg.get('res_blocks'), unet_cfg.get('dropout'))
+
+
+    if diffusion is not None:
+        logger.info(
+            'diffusion wrapper | feat_layers=%s noise_mode=%s normalize_input=%s',
+            getattr(diffusion, 'feat_layers', None),
+            getattr(diffusion, 'noise_mode', None),
+            getattr(diffusion, 'normalize_diffusion_input', None),
+        )
+
+    logger.info('========== (model / training detail end) ==========')
+
+    if writer is None:
+        return
+
+    mod_lines = [
+        f'class: {type(model).__name__}',
+        f'total_params: {total} ({total / 1e6:.2f}M)',
+        f'trainable_params: {trainable} ({trainable / 1e6:.2f}M)',
+    ]
+    for name, child in model.named_children():
+        if isinstance(child, nn.Module):
+            n = sum(p.numel() for p in child.parameters())
+            if n:
+                mod_lines.append(f'{name}: {n}')
+    if hasattr(model, 'd_model'):
+        mod_lines.extend([
+            f'd_model: {getattr(model, "d_model", None)}',
+            f'seq_len: {getattr(model, "seq_len", None)}',
+            f'feat_layer_names: {getattr(model, "feat_layer_names", None)}',
+        ])
+    writer.add_text('config/model', '\n'.join(mod_lines))
+
+    ext_lines = [
+        f'RANDOM_SEED: {RANDOM_SEED}',
+        f'VAL_RATIO: {VAL_RATIO}',
+        f'train_rot_augment_factor: {TRAIN_ROT_AUGMENT_FACTOR}',
+        f'num_workers (dataset): {ds.get("num_workers", NUM_WORKERS)}',
+        f'CLIP_GRAD_NORM (param): {CLIP_GRAD_NORM}',
+        f'clip_grad_norm (runner effective): {clip_grad_norm}',
+        f'optimizer: {optim_cfg}',
+        f'lr_scheduler: {sched_cfg}',
+        f'model_cls: {mc}',
+        f'module_cast3: {mc3}',
+        f'dataset: {ds}',
+        f'STUDENT_CHECKPOINT: {STUDENT_CHECKPOINT}',
+        f'STUDENT_SIZE: {STUDENT_SIZE}',
+        f'DIFFUSION_NOISE_MODE: {DIFFUSION_NOISE_MODE}',
+        f'DIFFUSION_NORMALIZE_INPUT: {DIFFUSION_NORMALIZE_INPUT}',
+        f'SAVE_EVERY_EPOCH: {SAVE_EVERY_EPOCH}',
+        f'periodic_ckpt_1based_min_epoch: {max(1, int(NUM_EPOCHS * 0.8) + 1)}',
+        MULTIMODAL_ABLATION_LOG_LINE,
+    ]
+    if diffusion is not None:
+        ext_lines.append(f'diffusion.feat_layers: {getattr(diffusion, "feat_layers", None)}')
+    writer.add_text('config/train_extended', '\n'.join(ext_lines))

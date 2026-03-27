@@ -22,11 +22,19 @@ if __name__ == '__main__':
         action='store_true',
         help='不创建 TensorBoard/断点目录，不写 checkpoint、final、best_model；仅控制台日志，最佳权重保留在内存供 Final test',
     )
+    parser.add_argument(
+        '--no-conf-detail',
+        action='store_true',
+        help='不单独写入混淆矩阵/误分类对日志 conf_detail.log（默认会写）',
+    )
     args = parser.parse_args()
     if args.verify_projection_grad:
         verify_projection_gradients(create_classifier)
     else:
         run_training(
             create_classifier,
-            TrainingRunOptions(no_artifacts=args.no_artifacts),
+            TrainingRunOptions(
+                no_artifacts=args.no_artifacts,
+                save_conf_detail=not args.no_conf_detail,
+            ),
         )

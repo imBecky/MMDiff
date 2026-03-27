@@ -46,9 +46,27 @@ def _crop_center_3x3(x: torch.Tensor) -> torch.Tensor:
     return x[:, :, y0:y1, x0:x1]
 
 
+class _HSISpectralResidualBlock(nn.Module):
+    """沿光谱轴 1D 卷积残差块：Conv-BN-ReLU-Conv-BN + 恒等映射。"""
+    def __init__(self, channels: int):
+        super().__init__()
+        ch = int(channels)
+        self.conv1 = nn.Conv1d(ch, ch, kernel_size=3, padding=1, bias=False)
+        self.bn1 = nn.BatchNorm1d(ch)
+        self.conv2 = nn.Conv1d(ch, ch, kernel_size=3, padding=1, bias=False)
+        self.bn2 = nn.BatchNorm1d(ch)
+        self.relu = nn.ReLU(inplace=True)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        out = self.relu(self.bn1(self.conv1(x)))
+        out = self.bn2(self.conv2(out))
+        return self.relu(out + x)
+
+
 class HSICenterSpectralEncoder(nn.Module):
     """
-    中心 3x3：9 个像素各做 1D 光谱卷积（沿波段维），空间平均后接轻量 SE 通道门控，再投影为 1 个 token。
+    中心 3x3：9 个像素各做 1D 光谱卷积（沿波段维），stem 后经若干光谱残差块加深，再全局池化、
+    空间平均、SE 通道门控，投影为 1 个 token。
     """
     def __init__(
         self,
@@ -56,6 +74,7 @@ class HSICenterSpectralEncoder(nn.Module):
         d_model: int,
         conv_hidden: int = 64,
         se_ratio: int = 8,
+        residual_blocks: int = 2,
     ):
         super().__init__()
         c = int(in_channels)
@@ -72,6 +91,8 @@ class HSICenterSpectralEncoder(nn.Module):
             nn.BatchNorm1d(h),
             nn.ReLU(inplace=True),
         )
+        n_res = max(0, int(residual_blocks))
+        self.res_blocks = nn.Sequential(*[_HSISpectralResidualBlock(h) for _ in range(n_res)])
         self.pool = nn.AdaptiveAvgPool1d(1)
         self.se = nn.Sequential(
             nn.Linear(h, se_mid, bias=False),
@@ -86,6 +107,7 @@ class HSICenterSpectralEncoder(nn.Module):
         b, c, _, _ = patch.shape
         x = patch.permute(0, 2, 3, 1).contiguous().view(b * 9, c).unsqueeze(1)
         feat = self.stem(x)
+        feat = self.res_blocks(feat)
         feat = self.pool(feat).squeeze(-1)
         feat = feat.view(b, 9, -1).mean(dim=1)
         feat = feat * self.se(feat)
@@ -156,9 +178,9 @@ def _probe_diffusion_layer_channels(
 class MultimodalClassifier(nn.Module):
     """
     HSI：中心 3x3，1D 光谱卷积 + SE 门控 -> 1 token
-    RGB：冻结 UNet，单层 t，多尺度层各 1 token（与 FEAT_SCALES 一致）
+    RGB：冻结 UNet，可多时间步 t，每个 t 下多尺度层各 1 token（与 FEAT_SCALES 一致）
     LiDAR：小 CNN -> global + center 共 2 token
-    融合：Transformer Encoder + global_cls / center_cls
+    融合：两枚可学习 CLS 为 query，模态 token 为 memory，TransformerDecoder（交叉注意力 + CLS 间自注意力）
     双头：global_head(cls[0])，center_head(cls[1])
     """
     def __init__(self, opt, diffusion=None):
@@ -178,7 +200,12 @@ class MultimodalClassifier(nn.Module):
         self.lidar_in_ch = int(ds_cfg.get('lidar_channel') or 1)
 
         ts = cls_cfg.get('t') or [50]
-        self.diffusion_t = int(ts[0] if isinstance(ts, (list, tuple)) else ts)
+        self.diffusion_ts: List[int] = (
+            [int(x) for x in ts] if isinstance(ts, (list, tuple)) else [int(ts)]
+        )
+        if not self.diffusion_ts:
+            raise ValueError('model_cls.t 不能为空')
+        self.diffusion_t = self.diffusion_ts[0]
 
         self.feat_layer_names: List[str] = list(cls_cfg.get('feat_scales') or [])
         if not self.feat_layer_names:
@@ -202,6 +229,7 @@ class MultimodalClassifier(nn.Module):
         lidar_feat_ch = max(32, lidar_hidden * 2)
         hsi_conv_hidden = int(proj_cfg.get('hsi_conv_hidden') or 64)
         hsi_se_ratio = int(proj_cfg.get('hsi_se_ratio') or 8)
+        hsi_residual_blocks = int(proj_cfg.get('hsi_residual_blocks') or 2)
 
         ch_map = _probe_diffusion_layer_channels(
             diffusion, self.feat_layer_names, self.diffusion_t,
@@ -216,18 +244,22 @@ class MultimodalClassifier(nn.Module):
             d_model,
             conv_hidden=hsi_conv_hidden,
             se_ratio=hsi_se_ratio,
+            residual_blocks=hsi_residual_blocks,
         )
         self.lidar_encoder = LidarMorphEncoder(
             self.lidar_in_ch, lidar_hidden, lidar_feat_ch, d_model,
         )
 
-        n_rgb = len(self.feat_layer_names)
-        self.seq_len = 2 + 1 + n_rgb + 2
+        n_rgb = len(self.diffusion_ts) * len(self.feat_layer_names)
+        self.mem_len = 1 + n_rgb + 2  # HSI + (每 t × 多尺度) RGB + LiDAR global/center
+        self.seq_len = 2 + self.mem_len  # 两枚 CLS + memory 长度（日志用）
+
         self.global_cls = nn.Parameter(torch.randn(1, 1, d_model))
         self.center_cls = nn.Parameter(torch.randn(1, 1, d_model))
-        self.pos_embed = nn.Parameter(torch.randn(1, self.seq_len, d_model))
 
-        enc_layer = nn.TransformerEncoderLayer(
+        self.pos_embed_mem = nn.Parameter(torch.randn(1, self.mem_len, d_model))
+        self.pos_embed_tgt = nn.Parameter(torch.randn(1, 2, d_model))
+        dec_layer = nn.TransformerDecoderLayer(
             d_model=d_model,
             nhead=nhead,
             dim_feedforward=ff,
@@ -236,7 +268,7 @@ class MultimodalClassifier(nn.Module):
             batch_first=True,
             norm_first=True,
         )
-        self.transformer = nn.TransformerEncoder(enc_layer, num_layers=n_tx)
+        self.decoder = nn.TransformerDecoder(dec_layer, num_layers=n_tx)
 
         self.global_head = ClassifierHead(d_model, head_hidden, self.num_classes)
         self.center_head = ClassifierHead(d_model, head_hidden, self.num_classes)
@@ -267,7 +299,8 @@ class MultimodalClassifier(nn.Module):
         )
         nn.init.normal_(self.global_cls, std=0.02)
         nn.init.normal_(self.center_cls, std=0.02)
-        nn.init.normal_(self.pos_embed, std=0.02)
+        nn.init.normal_(self.pos_embed_mem, std=0.02)
+        nn.init.normal_(self.pos_embed_tgt, std=0.02)
 
         self.loss_func = self._build_loss(cls_cfg)
         self.optimizer = self._build_optimizer(train_cfg)
@@ -290,10 +323,17 @@ class MultimodalClassifier(nn.Module):
     def _build_scheduler(self, train_cfg):
         sched_cfg = train_cfg.get('scheduler', {})
         if not sched_cfg:
+            self._scheduler_lr_total_steps = 0
             return None
         total_epochs = int(train_cfg.get('n_epoch') or 1)
         steps_per_epoch = int(self.opt.get('len_train_dataloader') or 1)
         total_steps = max(1, total_epochs * steps_per_epoch)
+        # 续训时 opt['scheduler_lr_total_steps'] 为「首次训练」用于计算衰减边界的总 optimizer step 数；
+        # 若仍用新 n_epoch 重算边界，会与 checkpoint 里 last_epoch 错位，导致 LR 从 schedule 起点跳变。
+        bound_override = int(self.opt.get('scheduler_lr_total_steps') or 0)
+        if bound_override > 0:
+            total_steps = bound_override
+        self._scheduler_lr_total_steps = int(total_steps)
         step_ratios = sched_cfg.get('step_ratios')
         gammas_multi = sched_cfg.get('gammas')
 
@@ -359,26 +399,25 @@ class MultimodalClassifier(nn.Module):
         hsi = data_dict['hsi']
         lidar = data_dict['lidar']
         self.diffusion.feed_data(data_dict)
-        layer_feats = self.diffusion.get_feats(self.diffusion_t, training=self.training)
-        if not isinstance(layer_feats, dict):
-            raise RuntimeError('扩散特征应为 dict（多层 hook），请检查 StudentDiffusionWrapper.feat_layers')
 
         hsi_tok = self.hsi_encoder(hsi)
         lidar_g, lidar_c = self.lidar_encoder(lidar)
 
         rgb_toks = []
-        for name, proj in zip(self.feat_layer_names, self.rgb_projs):
-            rgb_toks.append(proj(layer_feats[name]))
+        for t in self.diffusion_ts:
+            layer_feats = self.diffusion.get_feats(t, training=self.training)
+            if not isinstance(layer_feats, dict):
+                raise RuntimeError('扩散特征应为 dict（多层 hook），请检查 StudentDiffusionWrapper.feat_layers')
+            for name, proj in zip(self.feat_layer_names, self.rgb_projs):
+                rgb_toks.append(proj(layer_feats[name]))
         rgb_stack = torch.stack(rgb_toks, dim=1)
 
         b = hsi_tok.shape[0]
         g_cls = self.global_cls.expand(b, -1, -1)
         c_cls = self.center_cls.expand(b, -1, -1)
 
-        seq = torch.cat(
+        memory = torch.cat(
             [
-                g_cls,
-                c_cls,
                 hsi_tok.unsqueeze(1),
                 rgb_stack,
                 lidar_g.unsqueeze(1),
@@ -386,11 +425,13 @@ class MultimodalClassifier(nn.Module):
             ],
             dim=1,
         )
-        if seq.shape[1] != self.seq_len:
-            raise RuntimeError(f'seq 长度 {seq.shape[1]} 与预期 {self.seq_len} 不一致')
-        seq = seq + self.pos_embed
-        encoded = self.transformer(seq)
-        return encoded[:, 0], encoded[:, 1]
+        if memory.shape[1] != self.mem_len:
+            raise RuntimeError(f'memory 长度 {memory.shape[1]} 与预期 {self.mem_len} 不一致')
+        memory = memory + self.pos_embed_mem
+        tgt = torch.cat([g_cls, c_cls], dim=1)
+        tgt = tgt + self.pos_embed_tgt
+        out = self.decoder(tgt, memory)
+        return out[:, 0], out[:, 1]
 
     def forward(
         self,

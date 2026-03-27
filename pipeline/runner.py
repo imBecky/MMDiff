@@ -65,7 +65,9 @@ from .logging_utils import (
     get_summary_writer,
     log_and_print,
     log_config,
+    log_model_and_training_detail,
     prepare_tb_run_dir,
+    save_confusion_detail_log,
 )
 from .loop import (
     compute_classification_loss,
@@ -83,6 +85,7 @@ CreateClassifierFn = Callable[[Any, Any], torch.nn.Module]
 class TrainingRunOptions:
     """训练运行选项（由 main 解析传入）。"""
     no_artifacts: bool = False
+    save_conf_detail: bool = True
 
 
 def _normalize_resume_path(resume_checkpoint: str) -> str:
@@ -96,6 +99,18 @@ def _normalize_resume_path(resume_checkpoint: str) -> str:
     return abs_s
 
 
+def _scale_optimizer_learning_rate(
+    optimizer: torch.optim.Optimizer,
+    lr_scheduler: Optional[Any],
+    factor: float,
+) -> None:
+    """缩放当前各 param_group 的 lr；若有 LambdaLR 等基于 base_lrs 的调度器，同步缩放 base_lrs。"""
+    for g in optimizer.param_groups:
+        g['lr'] = float(g['lr']) * factor
+    if lr_scheduler is not None and hasattr(lr_scheduler, 'base_lrs'):
+        lr_scheduler.base_lrs = [float(b) * factor for b in lr_scheduler.base_lrs]
+
+
 def run_training(
     create_classifier: CreateClassifierFn,
     run_options: Optional[TrainingRunOptions] = None,
@@ -103,6 +118,7 @@ def run_training(
     """完整训练 + 验证 + 测试；模型由 create_classifier(opt, diffusion) 提供。"""
     opts = run_options or TrainingRunOptions()
     no_artifacts = bool(opts.no_artifacts)
+    save_conf_detail = bool(opts.save_conf_detail)
 
     resume_ckpt = _normalize_resume_path(RESUME_CHECKPOINT)
     resume_ts = None
@@ -211,6 +227,21 @@ def run_training(
         defer_test=defer_test_load,
     )
     opt['len_train_dataloader'] = len(train_loader)
+    # 续训：用首次训练时的总 step 数计算 LambdaLR 边界，避免仅因增大 NUM_EPOCHS 而重算 b1/b2 导致 LR 跳变
+    if resume_ts is not None:
+        slr = resume_ts.get('scheduler_lr_total_steps')
+        if slr is not None:
+            opt['scheduler_lr_total_steps'] = int(slr)
+        elif not opt.get('scheduler_lr_total_steps'):
+            logger.warning(
+                '断点 training_state 无 scheduler_lr_total_steps；若续训总 epoch 与首次不同，'
+                '请设环境变量 MMDIFF_SCHEDULER_LR_TOTAL_STEPS=首次训练时的 (n_epoch×train_batches)，否则 LR 边界可能与 last_epoch 错位。'
+            )
+        if opt.get('scheduler_lr_total_steps'):
+            logger.info(
+                '续训 LR 边界 scheduler_lr_total_steps=%s（LambdaLR 衰减比例仍按此总步数计算）',
+                opt['scheduler_lr_total_steps'],
+            )
     logger.info(
         'VAL_RATIO=%s | train_batches=%d val_batches=%s | diffusion_noise=%s normalize_input=%s',
         VAL_RATIO,
@@ -300,6 +331,15 @@ def run_training(
                 float(resume_ts.get('best_acc', -1.0)),
                 int(resume_ts.get('best_epoch', 0)),
             )
+
+        # 从断点续训：在已加载/初始化的 lr 上再打 0.5（不依赖改 param）
+        _scale_optimizer_learning_rate(optimizer, lr_scheduler, 0.5)
+        logger.info(
+            '续训学习率缩放 ×0.5 | 当前 param_group lr=%s',
+            [float(g['lr']) for g in optimizer.param_groups],
+        )
+
+    log_model_and_training_detail(logger, writer, model, opt, clip_grad, diffusion)
 
     best_acc = resume_best_acc
     best_epoch = resume_best_epoch
@@ -568,6 +608,13 @@ def run_training(
             use_center_logits=use_center_final,
         )
         ovr_acc_final, usr_acc, prod_acc, kappa, s_sqr = accuracies(conf_final)
+
+        if save_conf_detail and run_log_dir_str:
+            conf_log_path = Path(run_log_dir_str) / 'conf_detail.log'
+            save_confusion_detail_log(conf_log_path, conf_final, NUM_CLASSES)
+            logger.info('混淆矩阵与误分类对已写入 %s', conf_log_path)
+        elif save_conf_detail and not run_log_dir_str:
+            logger.info('未写入 conf_detail（无 run 目录，例如 --no-artifacts）')
 
         if writer is not None:
             writer.add_scalar('final/test_loss', eval_loss_final, best_epoch + 1)

@@ -42,6 +42,7 @@ def save_classifier_training_state(
     save_dir,
     run_log_dir: str,
     run_ckps_dir: str,
+    scheduler_lr_total_steps: int = 0,
 ):
     import torch
 
@@ -54,6 +55,7 @@ def save_classifier_training_state(
         "best_epoch": int(best_epoch),
         "run_log_dir": run_log_dir,
         "run_ckps_dir": run_ckps_dir,
+        "scheduler_lr_total_steps": int(scheduler_lr_total_steps),
     }
     os.makedirs(save_dir, exist_ok=True)
     torch.save(state, os.path.join(save_dir, "training_state.pt"))
@@ -74,6 +76,7 @@ def save_classifier_checkpoint(
     """保存分类器权重 + 训练状态（与 train_distill 的 pipeline+training_state 对应）。"""
     import torch
 
+    slr = int(getattr(model, '_scheduler_lr_total_steps', 0) or 0)
     os.makedirs(save_dir, exist_ok=True)
     torch.save(model.state_dict(), os.path.join(save_dir, "classifier.pt"))
     save_classifier_training_state(
@@ -86,4 +89,5 @@ def save_classifier_checkpoint(
         save_dir,
         run_log_dir,
         run_ckps_dir,
+        scheduler_lr_total_steps=slr,
     )
