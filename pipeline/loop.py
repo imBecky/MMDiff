@@ -66,6 +66,17 @@ def log_projection_gradients(model, logger, writer, step_for_tb: int):
     all_nonzero = True
     grad_eps = 1e-12
     for name, sub in model.projections.items():
+        # 多模态分支消融时，被关闭模态的 projection 虽然存在，但前向不会用到，
+        # 其梯度为 None/0 属于正常现象；此处只检查“启用的模态”。
+        if name == 'hsi' and hasattr(model, 'use_hsi') and not bool(model.use_hsi):
+            continue
+        if name == 'rgb' and hasattr(model, 'use_rgb') and not bool(model.use_rgb):
+            continue
+        if name == 'lidar' and hasattr(model, 'use_lidar') and not bool(model.use_lidar):
+            continue
+        if name == 'supcon' and hasattr(model, 'use_supcon') and not bool(model.use_supcon):
+            continue
+
         norm, n_with, n_missing = _module_grad_l2_norm(sub)
         has_trainable = any(p.requires_grad for p in sub.parameters())
         if has_trainable:

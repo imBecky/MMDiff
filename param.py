@@ -1,5 +1,6 @@
 from collections import OrderedDict
 import os
+import re
 from pathlib import Path
 import torch
 import utils.logger as Logger
@@ -10,13 +11,13 @@ import utils.logger as Logger
 # LR 两阶衰减（相对总 optimizer step = epoch × len(train_loader)）：
 # 与 300epoch 参考对齐：约 79% 总步数 ×0.1；第二段 gamma=1.0 等价单次衰减；1.5e-3 补偿更少总步数。
 # run.sh 深度对照时固定本段；HSI 结构通过 MMDIFF_HSI_* 覆盖 module_cast3。
-SCHED_STEP_RATIOS = [0.6, 0.75]
-SCHED_GAMMAS = [0.4, 0.2]
+SCHED_STEP_RATIOS = [0.6, 0.7]
+SCHED_GAMMAS = [0.4, 0.08]
 CLIP_GRAD_NORM = 1.0
-EVAL_VAL_START_EPOCH = 10
-LEARNING_RATE = 3e-3
+EVAL_VAL_START_EPOCH = 20
+LEARNING_RATE = 5e-4
 
-NUM_WORKERS = 13
+NUM_WORKERS = 23
 BATCH_SIZE = 512
 NUM_EPOCHS = 300
 # 续训时 LambdaLR 衰减边界用：与首次训练一致的总 step 数（通常由 checkpoint 自动写入；旧断点可 export MMDIFF_SCHEDULER_LR_TOTAL_STEPS）
@@ -34,7 +35,52 @@ LABEL_SHIFT_PATH = DATA_DIR / 'label_shift.npy'
 PATCH_WINDOW_SIZE = 11  # 须与 data_prepare 一致
 # 训练时在线旋转增强：1=关；2=0/180°；4=0/90/180/270°
 TRAIN_ROT_AUGMENT_FACTOR = 4
-USE_RGB_PATCHES = TRAIN_RGB_PATCHES_PATH.is_file()
+
+# ---------------------------------------------------------------------------
+# 多模态分支消融：启用的模态集合（HSI/RGB/LiDAR）
+# ---------------------------------------------------------------------------
+# 用户通过环境变量指定启用组合，示例：
+#   MMDIFF_MODALITY_COMBO=hsi
+#   MMDIFF_MODALITY_COMBO=rgb
+#   MMDIFF_MODALITY_COMBO=hsi+lidar
+#   MMDIFF_MODALITY_COMBO=hsi+rgb+lidar
+SUPPORTED_MODALITIES = ('hsi', 'rgb', 'lidar')
+DEFAULT_MODALITY_COMBO = 'hsi+rgb+lidar'
+
+def _parse_modality_combo(raw: str) -> tuple[str, ...]:
+    s = (raw or '').strip().lower()
+    if not s:
+        s = DEFAULT_MODALITY_COMBO
+    # 兼容 + , 空格与中横线作为分隔符
+    s = s.replace('-', '+').replace(',', '+')
+    toks = [t for t in re.split(r'\s*\+\s*', s) if t]
+    if len(toks) == 1 and toks[0] in ('all', 'allmodal', 'all_modal'):
+        return SUPPORTED_MODALITIES
+    enabled_set = set()
+    for t in toks:
+        t = t.strip()
+        if not t:
+            continue
+        if t not in SUPPORTED_MODALITIES:
+            raise ValueError(
+                f'未知模态 {t!r}；应为 {SUPPORTED_MODALITIES} 的组合，例如 "hsi+rgb"'
+            )
+        enabled_set.add(t)
+    if not enabled_set:
+        raise ValueError('MMDIFF_MODALITY_COMBO 解析为空，请指定非空组合')
+    # 固定顺序保证 token 拼接/日志稳定
+    ordered = tuple(m for m in SUPPORTED_MODALITIES if m in enabled_set)
+    return ordered
+
+
+ENABLED_MODALITIES = _parse_modality_combo(os.environ.get('MMDIFF_MODALITY_COMBO', '') or '')
+MODALITY_COMBO = '+'.join(ENABLED_MODALITIES)
+_RGB_ENABLED = 'rgb' in ENABLED_MODALITIES
+if _RGB_ENABLED and not TRAIN_RGB_PATCHES_PATH.is_file():
+    raise FileNotFoundError(
+        f'启用 rgb 模态但缺少 {TRAIN_RGB_PATCHES_PATH}（请先运行 data_prepare.py 生成 train_rgb_patches.npy）'
+    )
+USE_RGB_PATCHES = bool(_RGB_ENABLED)
 RGB_CHANNELS = 3
 RUN_NAME_PREFIX = 'cls'
 # 验证集最佳权重保存在本次 run 的断点目录下：{run_ckps_dir}/{BEST_MODEL_FILENAME}
@@ -104,13 +150,17 @@ MULTIMODAL_ABLATION_INDEX = 0
 
 # LiDAR 形态编码器 stem 隐藏通道（model/multimodal.py LidarMorphEncoder）
 LIDAR_PROJ_HIDDEN_CFG = 16
+# stem 之后在 feat_ch 上追加的 3×3 Conv-BN-ReLU 块数（加深 LiDAR 分支）
+LIDAR_EXTRA_BLOCKS_CFG = 0
 # HSI 1D 光谱编码（model/multimodal.py HSICenterSpectralEncoder）：stem 后残差块数、通道宽、SE 比
 # 更深：增大 HSI_RESIDUAL_BLOCKS_CFG（例如 4～6）；加深时可同步略增 HSI_CONV_HIDDEN_CFG。
 # 更宽：再调大 HSI_CONV_HIDDEN_CFG（须 ≥32，代码里 max(32, …)）。
-# 想回到接近旧版容量：设 HSI_RESIDUAL_BLOCKS_CFG = 0，并把 HSI_CONV_HIDDEN_CFG 设回 64。
-HSI_RESIDUAL_BLOCKS_CFG = 5
-HSI_CONV_HIDDEN_CFG = 128
+# 默认与 cls_20260326 轻量对照一致：3×96；D 实验优先改 hsi_agg_mode，容量见 B/C 表。
+HSI_RESIDUAL_BLOCKS_CFG = 3
+HSI_CONV_HIDDEN_CFG = 96
 HSI_SE_RATIO_CFG = 8
+# HSI 3×3 空间聚合：mean | attn_pool（D1 可学习加权）| multi_token（D2 中心/四角/四边 三 token）
+HSI_AGG_MODE_CFG = 'attn_pool'
 
 _EFFECTIVE_ABLATION_AXIS = None
 _EFFECTIVE_ABLATION_INDEX = None
@@ -156,10 +206,8 @@ STUDENT_NUM_TRAIN_TIMESTEPS = 1000
 
 # 与 ../GFDiff/train_distill.py 中 DEFAULT_ALIGN_LAYERS 一致：UNet 子模块名（非整数下标）
 FEAT_SCALES = [
-    'mid_block',
     'down_blocks.1',
-    'down_blocks.2',
-    'up_blocks.0',
+    'mid_block',
     'up_blocks.1',
 ]
 
@@ -167,7 +215,7 @@ def _cls_diffusion_timesteps_from_env():
     """run.sh 可 export MMDIFF_DIFFUSION_TIMESTEPS=50,100,150,200（逗号分隔）覆盖默认。"""
     raw = (os.environ.get('MMDIFF_DIFFUSION_TIMESTEPS') or '').strip()
     if not raw:
-        return [50, 100]
+        return [50]
     ts = [int(x.strip()) for x in raw.split(',') if x.strip()]
     if not ts:
         raise ValueError(
@@ -207,7 +255,7 @@ def build_opt():
         [
             ('name', 'Houston2018'),
             ('dataroot', str(DATA_DIR)),
-            ('modalities', ['hsi', 'lidar']),
+            ('modalities', list(ENABLED_MODALITIES)),
             ('resolution', 3),
             ('batch_size', BATCH_SIZE),
             ('num_workers', 14),
@@ -301,6 +349,8 @@ def build_opt():
             ('supcon_temperature', SUPCON_TEMPERATURE),
             ('supcon_proj_dim', SUPCON_PROJ_DIM),
             ('resume_state', None),
+            ('enabled_modalities', list(ENABLED_MODALITIES)),
+            ('modality_combo', MODALITY_COMBO),
         ]
     )
     path = OrderedDict(
@@ -314,9 +364,11 @@ def build_opt():
     cast3 = OrderedDict(
         [
             ('lidar_hidden', LIDAR_PROJ_HIDDEN_CFG),
+            ('lidar_extra_blocks', LIDAR_EXTRA_BLOCKS_CFG),
             ('hsi_residual_blocks', HSI_RESIDUAL_BLOCKS_CFG),
             ('hsi_conv_hidden', HSI_CONV_HIDDEN_CFG),
             ('hsi_se_ratio', HSI_SE_RATIO_CFG),
+            ('hsi_agg_mode', HSI_AGG_MODE_CFG),
         ]
     )
 
@@ -354,12 +406,7 @@ if CLIP_GRAD_NORM and CLIP_GRAD_NORM > 0:
 opt['train']['optimizer']['weight_decay'] = WEIGHT_DECAY
 
 modal = list(opt['dataset'].get('modalities') or ['hsi', 'lidar'])
-if USE_RGB_PATCHES:
-    if 'rgb' not in modal:
-        modal.append('rgb')
-else:
-    modal = [m for m in modal if m != 'rgb']
-opt['dataset']['modalities'] = modal
+opt['dataset']['modalities'] = list(ENABLED_MODALITIES)
 
 opt['model_cls']['use_center_loss'] = USE_CENTER_LOSS
 opt['model_cls']['loss_weight_global'] = LOSS_WEIGHT_GLOBAL
@@ -375,12 +422,14 @@ def _apply_mmdiff_env_overrides():
     在 build_opt 之后覆盖 loss 与 LiDAR 投影宽度（与 LIDAR_PROJ_HIDDEN_CFG 一致）。
     MMDIFF_LOSS_WEIGHT_GLOBAL / MMDIFF_LOSS_WEIGHT_CENTER
     MMDIFF_LIDAR_HIDDEN → LIDAR_PROJ_HIDDEN_CFG
+    MMDIFF_LIDAR_EXTRA_BLOCKS → LIDAR_EXTRA_BLOCKS_CFG（LiDAR stem 后额外卷积块数）
     MMDIFF_SUPCON_WEIGHT → SUPCON_WEIGHT
     MMDIFF_USE_SUPCON → USE_SUPCON（0/1）
     MMDIFF_NUM_EPOCHS → NUM_EPOCHS 与 opt['train']['n_epoch']
     MMDIFF_HSI_RESIDUAL_BLOCKS → HSI_RESIDUAL_BLOCKS_CFG 与 opt['module_cast3']
     MMDIFF_HSI_CONV_HIDDEN → HSI_CONV_HIDDEN_CFG 与 opt['module_cast3']
     MMDIFF_HSI_SE_RATIO → HSI_SE_RATIO_CFG 与 opt['module_cast3']
+    MMDIFF_HSI_AGG_MODE → HSI_AGG_MODE_CFG 与 opt['module_cast3']（mean | attn_pool | multi_token）
     MMDIFF_RESUME_CHECKPOINT → 覆盖 RESUME_CHECKPOINT
     MMDIFF_SCHEDULER_LR_TOTAL_STEPS → opt['scheduler_lr_total_steps']（续训边界；旧 checkpoint 无该字段时手动设）
     （扩散 t 列表由模块加载时读取 MMDIFF_DIFFUSION_TIMESTEPS，见 _cls_diffusion_timesteps_from_env）
@@ -405,29 +454,46 @@ def _apply_mmdiff_env_overrides():
             return
         g[key] = v.strip().lower() in ('1', 'true', 'yes', 'y')
 
+    def _str_env(name, key):
+        v = os.environ.get(name)
+        if v is None or v.strip() == '':
+            return
+        g[key] = v.strip()
+
     _float('MMDIFF_LOSS_WEIGHT_GLOBAL', 'LOSS_WEIGHT_GLOBAL')
     _float('MMDIFF_LOSS_WEIGHT_CENTER', 'LOSS_WEIGHT_CENTER')
     _float('MMDIFF_SUPCON_WEIGHT', 'SUPCON_WEIGHT')
     _bool_env('MMDIFF_USE_SUPCON', 'USE_SUPCON')
     _int('MMDIFF_LIDAR_HIDDEN', 'LIDAR_PROJ_HIDDEN_CFG')
+    _int('MMDIFF_LIDAR_EXTRA_BLOCKS', 'LIDAR_EXTRA_BLOCKS_CFG')
     _int('MMDIFF_NUM_EPOCHS', 'NUM_EPOCHS')
     _int('MMDIFF_HSI_RESIDUAL_BLOCKS', 'HSI_RESIDUAL_BLOCKS_CFG')
     _int('MMDIFF_HSI_CONV_HIDDEN', 'HSI_CONV_HIDDEN_CFG')
     _int('MMDIFF_HSI_SE_RATIO', 'HSI_SE_RATIO_CFG')
+    _str_env('MMDIFF_HSI_AGG_MODE', 'HSI_AGG_MODE_CFG')
     _int('MMDIFF_SCHEDULER_LR_TOTAL_STEPS', 'SCHEDULER_LR_TOTAL_STEPS')
 
     lh = int(g['LIDAR_PROJ_HIDDEN_CFG'])
     if lh < 1:
         raise ValueError(f'LiDAR 投影 lidar_hidden 须 >= 1，当前 {lh}')
     opt['module_cast3']['lidar_hidden'] = lh
+    leb = max(0, int(g['LIDAR_EXTRA_BLOCKS_CFG']))
+    opt['module_cast3']['lidar_extra_blocks'] = leb
     rb = max(0, int(g['HSI_RESIDUAL_BLOCKS_CFG']))
     hh = int(g['HSI_CONV_HIDDEN_CFG'])
     if hh < 1:
         raise ValueError(f'HSI_CONV_HIDDEN_CFG / MMDIFF_HSI_CONV_HIDDEN 须 >= 1，当前 {hh}')
     sr = max(1, int(g['HSI_SE_RATIO_CFG']))
+    agg = str(g.get('HSI_AGG_MODE_CFG') or 'mean').strip().lower()
+    if agg not in ('mean', 'attn_pool', 'multi_token'):
+        raise ValueError(
+            f'HSI_AGG_MODE_CFG / MMDIFF_HSI_AGG_MODE 须为 mean|attn_pool|multi_token，当前 {agg!r}'
+        )
     opt['module_cast3']['hsi_residual_blocks'] = rb
     opt['module_cast3']['hsi_conv_hidden'] = hh
     opt['module_cast3']['hsi_se_ratio'] = sr
+    opt['module_cast3']['hsi_agg_mode'] = agg
+    g['HSI_AGG_MODE_CFG'] = agg
     opt['model_cls']['loss_weight_global'] = float(g['LOSS_WEIGHT_GLOBAL'])
     opt['model_cls']['loss_weight_center'] = float(g['LOSS_WEIGHT_CENTER'])
     opt['model_cls']['use_supcon'] = bool(g['USE_SUPCON'])
@@ -449,17 +515,16 @@ def _apply_mmdiff_env_overrides():
 _apply_mmdiff_env_overrides()
 
 if USE_SUPCON and not USE_RGB_PATCHES:
-    raise ValueError(
-        'USE_SUPCON=True 需要 RGB 与扩散特征：请准备 train_rgb_patches.npy 并确保 USE_RGB_PATCHES，'
-        '或设 USE_SUPCON=False / MMDIFF_USE_SUPCON=0'
-    )
+    # 多模态分支消融可能会关掉 rgb；此时 SupCon 不再可用，自动关闭以保证实验可运行。
+    USE_SUPCON = False
+    opt['model_cls']['use_supcon'] = USE_SUPCON
 
 MULTIMODAL_ABLATION_LOG_LINE = (
-    f"multimodal_ablation: axis={_EFFECTIVE_ABLATION_AXIS or 'none'} "
+    f"multimodal_ablation: modalities={MODALITY_COMBO} axis={_EFFECTIVE_ABLATION_AXIS or 'none'} "
     f"index={_EFFECTIVE_ABLATION_INDEX if _EFFECTIVE_ABLATION_AXIS else '-'} | "
-    f"lidar_hidden={LIDAR_PROJ_HIDDEN_CFG} "
+    f"lidar_hidden={LIDAR_PROJ_HIDDEN_CFG} lidar_extra_blocks={LIDAR_EXTRA_BLOCKS_CFG} "
     f"hsi_res_blocks={HSI_RESIDUAL_BLOCKS_CFG} hsi_conv_hidden={HSI_CONV_HIDDEN_CFG} "
-    f"hsi_se_ratio={HSI_SE_RATIO_CFG} | "
+    f"hsi_se_ratio={HSI_SE_RATIO_CFG} hsi_agg_mode={HSI_AGG_MODE_CFG} | "
     f"loss_global/center={LOSS_WEIGHT_GLOBAL}/{LOSS_WEIGHT_CENTER} | "
     f"use_supcon={USE_SUPCON} supcon_w={SUPCON_WEIGHT} tau={SUPCON_TEMPERATURE} | "
     f"fusion=cross"

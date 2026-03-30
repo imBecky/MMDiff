@@ -21,11 +21,17 @@ class ClassifierHead(nn.Module):
             nn.Linear(in_channels, hidden_channels),
             nn.ReLU(inplace=True),
             nn.Dropout(p=dropout),
+            
+            nn.Linear(hidden_channels, hidden_channels), 
+            nn.ReLU(inplace=True),
+            nn.Dropout(p=dropout),
+            
             nn.Linear(hidden_channels, num_classes),
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.net(x)
+
 
 
 def _crop_center_3x3(x: torch.Tensor) -> torch.Tensor:
@@ -66,8 +72,15 @@ class _HSISpectralResidualBlock(nn.Module):
 class HSICenterSpectralEncoder(nn.Module):
     """
     中心 3x3：9 个像素各做 1D 光谱卷积（沿波段维），stem 后经若干光谱残差块加深，再全局池化、
-    空间平均、SE 通道门控，投影为 1 个 token。
+    空间聚合、SE 通道门控，投影为 1 或多个 token。
+
+    agg_mode:
+      - mean: 9 位置特征算术平均 -> 1 token（原默认）
+      - attn_pool: 对 9 位置学 softmax 权重再加权求和 -> 1 token（D1）
+      - multi_token: 中心 / 四角均值 / 四边均值 -> 3 token（D2）
     """
+    _AGG_MODES = frozenset({'mean', 'attn_pool', 'multi_token'})
+
     def __init__(
         self,
         in_channels: int,
@@ -75,8 +88,13 @@ class HSICenterSpectralEncoder(nn.Module):
         conv_hidden: int = 64,
         se_ratio: int = 8,
         residual_blocks: int = 2,
+        agg_mode: str = 'mean',
     ):
         super().__init__()
+        mode = str(agg_mode).strip().lower()
+        if mode not in self._AGG_MODES:
+            raise ValueError(f'hsi_agg_mode 须为 {sorted(self._AGG_MODES)}，当前 {agg_mode!r}')
+        self.agg_mode = mode
         c = int(in_channels)
         h = max(32, int(conv_hidden))
         se_mid = max(8, h // max(1, int(se_ratio)))
@@ -101,6 +119,11 @@ class HSICenterSpectralEncoder(nn.Module):
             nn.Sigmoid(),
         )
         self.proj = nn.Linear(h, int(d_model))
+        self.spatial_attn = nn.Linear(h, 1, bias=True) if self.agg_mode == 'attn_pool' else None
+
+    @property
+    def n_output_tokens(self) -> int:
+        return 3 if self.agg_mode == 'multi_token' else 1
 
     def forward(self, hsi: torch.Tensor) -> torch.Tensor:
         patch = _crop_center_3x3(hsi)
@@ -109,14 +132,41 @@ class HSICenterSpectralEncoder(nn.Module):
         feat = self.stem(x)
         feat = self.res_blocks(feat)
         feat = self.pool(feat).squeeze(-1)
-        feat = feat.view(b, 9, -1).mean(dim=1)
+        feat = feat.view(b, 9, -1)
+
+        if self.agg_mode == 'multi_token':
+            # 3x3 下标: 0 1 2 / 3 4 5 / 6 7 8 — 中心、四角、四边
+            center = feat[:, 4]
+            corner = feat[:, [0, 2, 6, 8]].mean(dim=1)
+            edge = feat[:, [1, 3, 5, 7]].mean(dim=1)
+            toks = torch.stack([center, corner, edge], dim=1)
+            bsz, k, hd = toks.shape
+            flat = toks.reshape(bsz * k, hd)
+            flat = flat * self.se(flat)
+            toks = flat.reshape(bsz, k, hd)
+            return self.proj(toks)
+
+        if self.agg_mode == 'attn_pool':
+            assert self.spatial_attn is not None
+            w = F.softmax(self.spatial_attn(feat).squeeze(-1), dim=-1)
+            feat = (feat * w.unsqueeze(-1)).sum(dim=1)
+        else:
+            feat = feat.mean(dim=1)
+
         feat = feat * self.se(feat)
         return self.proj(feat)
 
 
 class LidarMorphEncoder(nn.Module):
     """小 CNN 形态学特征；输出 global token 与 center token。"""
-    def __init__(self, in_ch: int, hidden: int, feat_ch: int, d_model: int):
+    def __init__(
+        self,
+        in_ch: int,
+        hidden: int,
+        feat_ch: int,
+        d_model: int,
+        extra_blocks: int = 0,
+    ):
         super().__init__()
         h = max(8, int(hidden))
         fc = max(16, int(feat_ch))
@@ -131,11 +181,22 @@ class LidarMorphEncoder(nn.Module):
             nn.BatchNorm2d(fc),
             nn.ReLU(inplace=True),
         )
+        eb = max(0, int(extra_blocks))
+        extra_layers = []
+        for _ in range(eb):
+            extra_layers.extend(
+                [
+                    nn.Conv2d(fc, fc, kernel_size=3, padding=1, bias=False),
+                    nn.BatchNorm2d(fc),
+                    nn.ReLU(inplace=True),
+                ]
+            )
+        self.extra = nn.Sequential(*extra_layers) if extra_layers else nn.Identity()
         self.proj_global = nn.Linear(fc, d_model)
         self.proj_center = nn.Linear(fc, d_model)
 
     def forward(self, lidar: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        feat = self.stem(lidar)
+        feat = self.extra(self.stem(lidar))
         g = F.adaptive_avg_pool2d(feat, output_size=1).flatten(1)
         c_patch = _crop_center_3x3(feat)
         c = c_patch.mean(dim=(2, 3))
@@ -177,7 +238,7 @@ def _probe_diffusion_layer_channels(
 
 class MultimodalClassifier(nn.Module):
     """
-    HSI：中心 3x3，1D 光谱卷积 + SE 门控 -> 1 token
+    HSI：中心 3x3，1D 光谱卷积 + SE；空间聚合可为 1 token（mean/attn_pool）或 3 token（multi_token）
     RGB：冻结 UNet，可多时间步 t，每个 t 下多尺度层各 1 token（与 FEAT_SCALES 一致）
     LiDAR：小 CNN -> global + center 共 2 token
     融合：两枚可学习 CLS 为 query，模态 token 为 memory，TransformerDecoder（交叉注意力 + CLS 间自注意力）
@@ -194,6 +255,17 @@ class MultimodalClassifier(nn.Module):
         cls_cfg = opt.get('model_cls', {})
         train_cfg = opt.get('train', {})
         proj_cfg = opt.get('module_cast3') or {}
+
+        enabled_modalities = list(cls_cfg.get('enabled_modalities') or [])
+        if not enabled_modalities:
+            # 兼容旧配置：默认仍开启三模态
+            enabled_modalities = ['hsi', 'rgb', 'lidar']
+        enabled_set = set(enabled_modalities)
+        self.use_hsi = 'hsi' in enabled_set
+        self.use_rgb = 'rgb' in enabled_set
+        self.use_lidar = 'lidar' in enabled_set
+        if not (self.use_hsi or self.use_rgb or self.use_lidar):
+            raise ValueError(f'enabled_modalities 不能为空：{enabled_modalities!r}')
 
         self.num_classes = int(cls_cfg.get('out_channels') or ds_cfg.get('n_cls') or 2)
         self.hsi_channels = int(ds_cfg.get('hsi_channels') or 32)
@@ -226,10 +298,12 @@ class MultimodalClassifier(nn.Module):
         head_hidden = int(cls_cfg.get('head_hidden') or 128)
 
         lidar_hidden = int(proj_cfg.get('lidar_hidden') or 16)
+        lidar_extra_blocks = int(proj_cfg.get('lidar_extra_blocks') or 0)
         lidar_feat_ch = max(32, lidar_hidden * 2)
         hsi_conv_hidden = int(proj_cfg.get('hsi_conv_hidden') or 64)
         hsi_se_ratio = int(proj_cfg.get('hsi_se_ratio') or 8)
         hsi_residual_blocks = int(proj_cfg.get('hsi_residual_blocks') or 2)
+        hsi_agg_mode = str(proj_cfg.get('hsi_agg_mode') or 'mean').strip().lower()
 
         ch_map = _probe_diffusion_layer_channels(
             diffusion, self.feat_layer_names, self.diffusion_t,
@@ -245,13 +319,24 @@ class MultimodalClassifier(nn.Module):
             conv_hidden=hsi_conv_hidden,
             se_ratio=hsi_se_ratio,
             residual_blocks=hsi_residual_blocks,
+            agg_mode=hsi_agg_mode,
         )
         self.lidar_encoder = LidarMorphEncoder(
-            self.lidar_in_ch, lidar_hidden, lidar_feat_ch, d_model,
+            self.lidar_in_ch,
+            lidar_hidden,
+            lidar_feat_ch,
+            d_model,
+            extra_blocks=lidar_extra_blocks,
         )
 
-        n_rgb = len(self.diffusion_ts) * len(self.feat_layer_names)
-        self.mem_len = 1 + n_rgb + 2  # HSI + (每 t × 多尺度) RGB + LiDAR global/center
+        n_hsi = int(self.hsi_encoder.n_output_tokens) if self.use_hsi else 0
+        n_rgb = (
+            len(self.diffusion_ts) * len(self.feat_layer_names)
+            if self.use_rgb
+            else 0
+        )
+        n_lidar = 2 if self.use_lidar else 0
+        self.mem_len = n_hsi + n_rgb + n_lidar  # 启用模态 token 拼接长度
         self.seq_len = 2 + self.mem_len  # 两枚 CLS + memory 长度（日志用）
 
         self.global_cls = nn.Parameter(torch.randn(1, 1, d_model))
@@ -394,37 +479,58 @@ class MultimodalClassifier(nn.Module):
                 nn.init.zeros_(module.bias)
 
     def _forward_tokens(self, data_dict: Dict[str, torch.Tensor]) -> Tuple[torch.Tensor, torch.Tensor]:
-        if 'rgb' not in data_dict:
-            raise KeyError('需要 rgb 模态：请准备 train_rgb_patches.npy / test_rgb_patches.npy 并启用 USE_RGB_PATCHES')
-        hsi = data_dict['hsi']
-        lidar = data_dict['lidar']
-        self.diffusion.feed_data(data_dict)
+        memory_parts: List[torch.Tensor] = []
+        b = None
 
-        hsi_tok = self.hsi_encoder(hsi)
-        lidar_g, lidar_c = self.lidar_encoder(lidar)
+        # 先准备各模态 token（根据 enabled_modalities 动态裁剪）
+        if self.use_hsi:
+            if 'hsi' not in data_dict:
+                raise KeyError('需要 hsi 模态，但 data_dict 中缺少 hsi')
+            hsi = data_dict['hsi']
+            hsi_tok = self.hsi_encoder(hsi)
+            if hsi_tok.dim() == 3:
+                hsi_seq = hsi_tok
+            else:
+                hsi_seq = hsi_tok.unsqueeze(1)
+            memory_parts.append(hsi_seq)
+            b = hsi_seq.shape[0]
 
-        rgb_toks = []
-        for t in self.diffusion_ts:
-            layer_feats = self.diffusion.get_feats(t, training=self.training)
-            if not isinstance(layer_feats, dict):
-                raise RuntimeError('扩散特征应为 dict（多层 hook），请检查 StudentDiffusionWrapper.feat_layers')
-            for name, proj in zip(self.feat_layer_names, self.rgb_projs):
-                rgb_toks.append(proj(layer_feats[name]))
-        rgb_stack = torch.stack(rgb_toks, dim=1)
+        if self.use_rgb:
+            if 'rgb' not in data_dict:
+                raise KeyError('需要 rgb 模态：请准备 train_rgb_patches.npy / test_rgb_patches.npy 并确保 MMDIFF_MODALITY_COMBO 含 rgb')
+            self.diffusion.feed_data(data_dict)
 
-        b = hsi_tok.shape[0]
+            rgb_toks: List[torch.Tensor] = []
+            for t in self.diffusion_ts:
+                layer_feats = self.diffusion.get_feats(t, training=self.training)
+                if not isinstance(layer_feats, dict):
+                    raise RuntimeError(
+                        '扩散特征应为 dict（多层 hook），请检查 StudentDiffusionWrapper.feat_layers'
+                    )
+                for name, proj in zip(self.feat_layer_names, self.rgb_projs):
+                    rgb_toks.append(proj(layer_feats[name]))
+            rgb_stack = torch.stack(rgb_toks, dim=1)
+            memory_parts.append(rgb_stack)
+            b = rgb_stack.shape[0] if b is None else b
+
+        if self.use_lidar:
+            if 'lidar' not in data_dict:
+                raise KeyError('需要 lidar 模态，但 data_dict 中缺少 lidar')
+            lidar = data_dict['lidar']
+            lidar_g, lidar_c = self.lidar_encoder(lidar)
+            memory_parts.append(lidar_g.unsqueeze(1))
+            memory_parts.append(lidar_c.unsqueeze(1))
+            b = lidar_g.shape[0] if b is None else b
+
+        if b is None:
+            raise RuntimeError('未启用任何模态，无法构造 memory')
+        if not memory_parts:
+            raise RuntimeError('memory_parts 为空，无法拼接 token')
+
         g_cls = self.global_cls.expand(b, -1, -1)
         c_cls = self.center_cls.expand(b, -1, -1)
 
-        memory = torch.cat(
-            [
-                hsi_tok.unsqueeze(1),
-                rgb_stack,
-                lidar_g.unsqueeze(1),
-                lidar_c.unsqueeze(1),
-            ],
-            dim=1,
-        )
+        memory = torch.cat(memory_parts, dim=1)
         if memory.shape[1] != self.mem_len:
             raise RuntimeError(f'memory 长度 {memory.shape[1]} 与预期 {self.mem_len} 不一致')
         memory = memory + self.pos_embed_mem

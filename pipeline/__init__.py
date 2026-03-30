@@ -21,8 +21,8 @@ from .data import (
     split_train_val_indices,
     subset_train_indices_balanced,
 )
+from .classification_metrics import accuracies
 from .loop import compute_classification_loss, evaluate, train_one_epoch
-from .metrics import accuracies
 from .runner import TrainingRunOptions, run_training, verify_projection_gradients
 from .student_diffusion import StudentDiffusionWrapper, normalize_student_checkpoint_dir
 

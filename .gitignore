@@ -1,0 +1,53 @@
+# Byte-compiled / cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Distribution / packaging
+*.egg-info/
+.eggs/
+dist/
+build/
+*.egg
+
+# Testing / typing
+.pytest_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Environment & secrets
+.env
+.env.*
+
+# IDE / editor
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# --- 本项目训练产物（体积大、不应进版本库）---
+# TensorBoard / 训练 run 日志（param.TB_LOG_ROOT 等）
+tf-logs/
+**/tf-logs/
+
+# 训练与实验日志目录（TensorBoard 根目录见 param.TB_LOG_ROOT，默认 ../../tf-logs）
+logs/
+compare_logs/
+*.pt
+*.pth
+*.ckpt

@@ -18,6 +18,7 @@ from param import (
     EVAL_INTERVAL_EPOCHS,
     EVAL_MIN_TRAIN_ACC,
     EVAL_VAL_START_EPOCH,
+    HSI_AGG_MODE_CFG,
     HSI_CONV_HIDDEN_CFG,
     HSI_RESIDUAL_BLOCKS_CFG,
     HSI_SE_RATIO_CFG,
@@ -55,6 +56,10 @@ from param import (
     opt,
 )
 from torch.utils.tensorboard import SummaryWriter
+
+
+def _is_compare_run() -> bool:
+    return (os.environ.get('MMDIFF_COMPARE_RUN') or '').strip().lower() in ('1', 'true', 'yes')
 
 
 def prepare_tb_run_dir():
@@ -198,6 +203,7 @@ def log_config(
     def _sh(x):
         return x.shape if x is not None else None
 
+    compare_run = _is_compare_run()
     logger.info('Using device: %s', device)
     logger.info(
         'Data paths | DATA_DIR=%s TRAIN_PATCHES=%s TRAIN_RGB=%s USE_RGB_PATCHES=%s LABEL_SHIFT=%s',
@@ -266,34 +272,54 @@ def log_config(
             f'LOG_PATH: {log_file_path if log_file_path is not None else LOG_PATH}',
         ]),
     )
-    mc3 = opt.get('module_cast3') or {}
-    writer.add_text(
-        'config/hparams',
-        '\n'.join([
-            f'device: {device}',
-            f'batch_size: {BATCH_SIZE}',
-            f'epochs: {NUM_EPOCHS}',
-            f'learning_rate: {LEARNING_RATE}',
-            f'optimizer_betas: {OPTIMIZER_BETAS}',
-            f'weight_decay: {WEIGHT_DECAY}',
-            f'num_classes: {NUM_CLASSES}',
-            f'USE_CENTER_LOSS: {USE_CENTER_LOSS}',
-            f'LOSS_WEIGHT_GLOBAL: {LOSS_WEIGHT_GLOBAL}',
-            f'LOSS_WEIGHT_CENTER: {LOSS_WEIGHT_CENTER}',
-            f'USE_SUPCON: {USE_SUPCON}',
-            f'SUPCON_WEIGHT: {SUPCON_WEIGHT}',
-            f'SUPCON_TEMPERATURE: {SUPCON_TEMPERATURE}',
-            f'EVAL_MIN_TRAIN_ACC: {EVAL_MIN_TRAIN_ACC}',
-            f'EVAL_INTERVAL_EPOCHS: {EVAL_INTERVAL_EPOCHS}',
-            f'EVAL_VAL_START_EPOCH: {EVAL_VAL_START_EPOCH}',
-            f'CHECK_PROJECTION_GRAD: {CHECK_PROJECTION_GRAD}',
-            f"module_cast3 lidar_hidden: {mc3.get('lidar_hidden', '-')}",
-            f"module_cast3 hsi_residual_blocks: {mc3.get('hsi_residual_blocks', '-')}",
-            f"module_cast3 hsi_conv_hidden: {mc3.get('hsi_conv_hidden', '-')}",
-            f"module_cast3 hsi_se_ratio: {mc3.get('hsi_se_ratio', '-')}",
-            MULTIMODAL_ABLATION_LOG_LINE,
-        ]),
-    )
+    if compare_run:
+        writer.add_text(
+            'config/hparams',
+            '\n'.join([
+                f'device: {device}',
+                f'batch_size: {BATCH_SIZE}',
+                f'epochs: {NUM_EPOCHS}',
+                f'learning_rate: {LEARNING_RATE}',
+                f'optimizer_betas: {OPTIMIZER_BETAS}',
+                f'weight_decay: {WEIGHT_DECAY}',
+                f'num_classes: {NUM_CLASSES}',
+                f'compare_model: {os.environ.get("MMDIFF_COMPARE_MODEL", "")}',
+                f'EVAL_MIN_TRAIN_ACC: {EVAL_MIN_TRAIN_ACC}',
+                f'EVAL_INTERVAL_EPOCHS: {EVAL_INTERVAL_EPOCHS}',
+                f'EVAL_VAL_START_EPOCH: {EVAL_VAL_START_EPOCH}',
+                f'CHECK_PROJECTION_GRAD: {CHECK_PROJECTION_GRAD}',
+            ]),
+        )
+    else:
+        mc3 = opt.get('module_cast3') or {}
+        writer.add_text(
+            'config/hparams',
+            '\n'.join([
+                f'device: {device}',
+                f'batch_size: {BATCH_SIZE}',
+                f'epochs: {NUM_EPOCHS}',
+                f'learning_rate: {LEARNING_RATE}',
+                f'optimizer_betas: {OPTIMIZER_BETAS}',
+                f'weight_decay: {WEIGHT_DECAY}',
+                f'num_classes: {NUM_CLASSES}',
+                f'USE_CENTER_LOSS: {USE_CENTER_LOSS}',
+                f'LOSS_WEIGHT_GLOBAL: {LOSS_WEIGHT_GLOBAL}',
+                f'LOSS_WEIGHT_CENTER: {LOSS_WEIGHT_CENTER}',
+                f'USE_SUPCON: {USE_SUPCON}',
+                f'SUPCON_WEIGHT: {SUPCON_WEIGHT}',
+                f'SUPCON_TEMPERATURE: {SUPCON_TEMPERATURE}',
+                f'EVAL_MIN_TRAIN_ACC: {EVAL_MIN_TRAIN_ACC}',
+                f'EVAL_INTERVAL_EPOCHS: {EVAL_INTERVAL_EPOCHS}',
+                f'EVAL_VAL_START_EPOCH: {EVAL_VAL_START_EPOCH}',
+                f'CHECK_PROJECTION_GRAD: {CHECK_PROJECTION_GRAD}',
+                f"module_cast3 lidar_hidden: {mc3.get('lidar_hidden', '-')}",
+                f"module_cast3 hsi_residual_blocks: {mc3.get('hsi_residual_blocks', '-')}",
+                f"module_cast3 hsi_conv_hidden: {mc3.get('hsi_conv_hidden', '-')}",
+                f"module_cast3 hsi_se_ratio: {mc3.get('hsi_se_ratio', '-')}",
+                f"module_cast3 hsi_agg_mode: {mc3.get('hsi_agg_mode', HSI_AGG_MODE_CFG)}",
+                MULTIMODAL_ABLATION_LOG_LINE,
+            ]),
+        )
 
 
 def log_model_and_training_detail(
@@ -309,6 +335,7 @@ def log_model_and_training_detail(
     同时写入 TensorBoard config/model、config/train_extended（若 writer 非空）。
     """
     train_cfg = opt.get('train') or {}
+    compare_run = _is_compare_run()
     optim_cfg = train_cfg.get('optimizer') or {}
     sched_cfg = dict(train_cfg.get('scheduler') or {})
     mc = opt.get('model_cls') or {}
@@ -335,7 +362,7 @@ def log_model_and_training_detail(
         if n:
             logger.info('  submodule %-20s %9d params', name, n)
 
-    if hasattr(model, 'd_model'):
+    if hasattr(model, 'd_model') and not compare_run:
         logger.info(
             'classifier layout | fusion=cross d_model=%s seq_len=%s num_classes=%s diffusion_ts=%s feat_layers=%s',
             getattr(model, 'd_model', '-'),
@@ -381,22 +408,6 @@ def log_model_and_training_detail(
     )
     logger.info('lr_scheduler (opt train.scheduler)=%s', sched_cfg)
     logger.info(
-        'model_cls | fusion=cross token_dim=%s transformer: heads=%s layers=%s ff=%s dropout=%s head_hidden=%s',
-        mc.get('token_dim'),
-        mc.get('transformer_heads'),
-        mc.get('transformer_layers'),
-        mc.get('transformer_ff_dim'),
-        mc.get('transformer_dropout'),
-        mc.get('head_hidden'),
-    )
-    logger.info(
-        'model_cls | init_type=%s scale=%s feat_scales(t)=%s t=%s',
-        mc.get('init_type'),
-        mc.get('scale'),
-        mc.get('feat_scales'),
-        mc.get('t'),
-    )
-    logger.info(
         'dataset (opt) | n_cls=%s hsi_channels=%s lidar_channel=%s modalities=%s resolution=%s',
         ds.get('n_cls'),
         ds.get('hsi_channels'),
@@ -404,20 +415,40 @@ def log_model_and_training_detail(
         ds.get('modalities'),
         ds.get('resolution'),
     )
-    logger.info(
-        'module_cast3 | lidar_hidden=%s hsi_residual_blocks=%s hsi_conv_hidden=%s hsi_se_ratio=%s',
-        mc3.get('lidar_hidden'),
-        mc3.get('hsi_residual_blocks', HSI_RESIDUAL_BLOCKS_CFG),
-        mc3.get('hsi_conv_hidden', HSI_CONV_HIDDEN_CFG),
-        mc3.get('hsi_se_ratio', HSI_SE_RATIO_CFG),
-    )
-    logger.info(
-        'student (param) | STUDENT_CHECKPOINT=%s STUDENT_SIZE=%s DIFFUSION_NOISE_MODE=%s NORMALIZE_INPUT=%s',
-        STUDENT_CHECKPOINT,
-        STUDENT_SIZE,
-        DIFFUSION_NOISE_MODE,
-        DIFFUSION_NORMALIZE_INPUT,
-    )
+    if compare_run:
+        logger.info('compare run | model=%s', os.environ.get('MMDIFF_COMPARE_MODEL', ''))
+    else:
+        logger.info(
+            'model_cls | fusion=cross token_dim=%s transformer: heads=%s layers=%s ff=%s dropout=%s head_hidden=%s',
+            mc.get('token_dim'),
+            mc.get('transformer_heads'),
+            mc.get('transformer_layers'),
+            mc.get('transformer_ff_dim'),
+            mc.get('transformer_dropout'),
+            mc.get('head_hidden'),
+        )
+        logger.info(
+            'model_cls | init_type=%s scale=%s feat_scales(t)=%s t=%s',
+            mc.get('init_type'),
+            mc.get('scale'),
+            mc.get('feat_scales'),
+            mc.get('t'),
+        )
+        logger.info(
+            'module_cast3 | lidar_hidden=%s hsi_residual_blocks=%s hsi_conv_hidden=%s hsi_se_ratio=%s hsi_agg_mode=%s',
+            mc3.get('lidar_hidden'),
+            mc3.get('hsi_residual_blocks', HSI_RESIDUAL_BLOCKS_CFG),
+            mc3.get('hsi_conv_hidden', HSI_CONV_HIDDEN_CFG),
+            mc3.get('hsi_se_ratio', HSI_SE_RATIO_CFG),
+            mc3.get('hsi_agg_mode', HSI_AGG_MODE_CFG),
+        )
+        logger.info(
+            'student (param) | STUDENT_CHECKPOINT=%s STUDENT_SIZE=%s DIFFUSION_NOISE_MODE=%s NORMALIZE_INPUT=%s',
+            STUDENT_CHECKPOINT,
+            STUDENT_SIZE,
+            DIFFUSION_NOISE_MODE,
+            DIFFUSION_NORMALIZE_INPUT,
+        )
     logger.info(
         'checkpoint habit | SAVE_EVERY_EPOCH=%s periodic from epoch>=%d (1-based, last 20%% of NUM_EPOCHS) BEST=%s',
         SAVE_EVERY_EPOCH,
@@ -430,14 +461,15 @@ def log_model_and_training_detail(
         EVAL_MIN_TRAIN_ACC,
         EVAL_INTERVAL_EPOCHS,
     )
-    logger.info('%s', MULTIMODAL_ABLATION_LOG_LINE)
-    if unet_cfg:
+    if not compare_run:
+        logger.info('%s', MULTIMODAL_ABLATION_LOG_LINE)
+    if unet_cfg and not compare_run:
         logger.info('model.unet (condensed) | inner_channel=%s multiplier=%s res_blocks=%s dropout=%s',
                     unet_cfg.get('inner_channel'), unet_cfg.get('channel_multiplier'),
                     unet_cfg.get('res_blocks'), unet_cfg.get('dropout'))
 
 
-    if diffusion is not None:
+    if diffusion is not None and not compare_run:
         logger.info(
             'diffusion wrapper | feat_layers=%s noise_mode=%s normalize_input=%s',
             getattr(diffusion, 'feat_layers', None),
@@ -460,7 +492,7 @@ def log_model_and_training_detail(
             n = sum(p.numel() for p in child.parameters())
             if n:
                 mod_lines.append(f'{name}: {n}')
-    if hasattr(model, 'd_model'):
+    if hasattr(model, 'd_model') and not compare_run:
         mod_lines.extend([
             f'd_model: {getattr(model, "d_model", None)}',
             f'seq_len: {getattr(model, "seq_len", None)}',
@@ -468,26 +500,42 @@ def log_model_and_training_detail(
         ])
     writer.add_text('config/model', '\n'.join(mod_lines))
 
-    ext_lines = [
-        f'RANDOM_SEED: {RANDOM_SEED}',
-        f'VAL_RATIO: {VAL_RATIO}',
-        f'train_rot_augment_factor: {TRAIN_ROT_AUGMENT_FACTOR}',
-        f'num_workers (dataset): {ds.get("num_workers", NUM_WORKERS)}',
-        f'CLIP_GRAD_NORM (param): {CLIP_GRAD_NORM}',
-        f'clip_grad_norm (runner effective): {clip_grad_norm}',
-        f'optimizer: {optim_cfg}',
-        f'lr_scheduler: {sched_cfg}',
-        f'model_cls: {mc}',
-        f'module_cast3: {mc3}',
-        f'dataset: {ds}',
-        f'STUDENT_CHECKPOINT: {STUDENT_CHECKPOINT}',
-        f'STUDENT_SIZE: {STUDENT_SIZE}',
-        f'DIFFUSION_NOISE_MODE: {DIFFUSION_NOISE_MODE}',
-        f'DIFFUSION_NORMALIZE_INPUT: {DIFFUSION_NORMALIZE_INPUT}',
-        f'SAVE_EVERY_EPOCH: {SAVE_EVERY_EPOCH}',
-        f'periodic_ckpt_1based_min_epoch: {max(1, int(NUM_EPOCHS * 0.8) + 1)}',
-        MULTIMODAL_ABLATION_LOG_LINE,
-    ]
-    if diffusion is not None:
-        ext_lines.append(f'diffusion.feat_layers: {getattr(diffusion, "feat_layers", None)}')
+    if compare_run:
+        ext_lines = [
+            f'RANDOM_SEED: {RANDOM_SEED}',
+            f'VAL_RATIO: {VAL_RATIO}',
+            f'train_rot_augment_factor: {TRAIN_ROT_AUGMENT_FACTOR}',
+            f'num_workers (dataset): {ds.get("num_workers", NUM_WORKERS)}',
+            f'CLIP_GRAD_NORM (param): {CLIP_GRAD_NORM}',
+            f'clip_grad_norm (runner effective): {clip_grad_norm}',
+            f'optimizer: {optim_cfg}',
+            f'lr_scheduler: {sched_cfg}',
+            f'dataset: {ds}',
+            f'compare_model: {os.environ.get("MMDIFF_COMPARE_MODEL", "")}',
+            f'SAVE_EVERY_EPOCH: {SAVE_EVERY_EPOCH}',
+            f'periodic_ckpt_1based_min_epoch: {max(1, int(NUM_EPOCHS * 0.8) + 1)}',
+        ]
+    else:
+        ext_lines = [
+            f'RANDOM_SEED: {RANDOM_SEED}',
+            f'VAL_RATIO: {VAL_RATIO}',
+            f'train_rot_augment_factor: {TRAIN_ROT_AUGMENT_FACTOR}',
+            f'num_workers (dataset): {ds.get("num_workers", NUM_WORKERS)}',
+            f'CLIP_GRAD_NORM (param): {CLIP_GRAD_NORM}',
+            f'clip_grad_norm (runner effective): {clip_grad_norm}',
+            f'optimizer: {optim_cfg}',
+            f'lr_scheduler: {sched_cfg}',
+            f'model_cls: {mc}',
+            f'module_cast3: {mc3}',
+            f'dataset: {ds}',
+            f'STUDENT_CHECKPOINT: {STUDENT_CHECKPOINT}',
+            f'STUDENT_SIZE: {STUDENT_SIZE}',
+            f'DIFFUSION_NOISE_MODE: {DIFFUSION_NOISE_MODE}',
+            f'DIFFUSION_NORMALIZE_INPUT: {DIFFUSION_NORMALIZE_INPUT}',
+            f'SAVE_EVERY_EPOCH: {SAVE_EVERY_EPOCH}',
+            f'periodic_ckpt_1based_min_epoch: {max(1, int(NUM_EPOCHS * 0.8) + 1)}',
+            MULTIMODAL_ABLATION_LOG_LINE,
+        ]
+        if diffusion is not None:
+            ext_lines.append(f'diffusion.feat_layers: {getattr(diffusion, "feat_layers", None)}')
     writer.add_text('config/train_extended', '\n'.join(ext_lines))

@@ -4,6 +4,7 @@
   - forward(data_dict)，可选 return_center_logits=True（当 param.USE_CENTER_LOSS）
   - loss_func, optimizer, 可选 exp_lr_scheduler
 """
+import json
 import os
 import sys
 import time
@@ -75,7 +76,7 @@ from .loop import (
     log_projection_gradients,
     train_one_epoch,
 )
-from .metrics import accuracies
+from .classification_metrics import accuracies
 from .student_diffusion import StudentDiffusionWrapper
 
 CreateClassifierFn = Callable[[Any, Any], torch.nn.Module]
@@ -86,6 +87,10 @@ class TrainingRunOptions:
     """训练运行选项（由 main 解析传入）。"""
     no_artifacts: bool = False
     save_conf_detail: bool = True
+
+
+def _is_compare_run() -> bool:
+    return (os.environ.get('MMDIFF_COMPARE_RUN') or '').strip().lower() in ('1', 'true', 'yes')
 
 
 def _normalize_resume_path(resume_checkpoint: str) -> str:
@@ -189,6 +194,7 @@ def run_training(
 
     torch.manual_seed(RANDOM_SEED)
     np.random.seed(RANDOM_SEED)
+    compare_run = _is_compare_run()
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
@@ -242,15 +248,24 @@ def run_training(
                 '续训 LR 边界 scheduler_lr_total_steps=%s（LambdaLR 衰减比例仍按此总步数计算）',
                 opt['scheduler_lr_total_steps'],
             )
-    logger.info(
-        'VAL_RATIO=%s | train_batches=%d val_batches=%s | diffusion_noise=%s normalize_input=%s',
-        VAL_RATIO,
-        len(train_loader),
-        len(val_loader) if val_loader is not None else None,
-        DIFFUSION_NOISE_MODE,
-        DIFFUSION_NORMALIZE_INPUT,
-    )
-    logger.info('%s', MULTIMODAL_ABLATION_LOG_LINE)
+    if compare_run:
+        logger.info(
+            'VAL_RATIO=%s | train_batches=%d val_batches=%s | compare_model=%s',
+            VAL_RATIO,
+            len(train_loader),
+            len(val_loader) if val_loader is not None else None,
+            os.environ.get('MMDIFF_COMPARE_MODEL', ''),
+        )
+    else:
+        logger.info(
+            'VAL_RATIO=%s | train_batches=%d val_batches=%s | diffusion_noise=%s normalize_input=%s',
+            VAL_RATIO,
+            len(train_loader),
+            len(val_loader) if val_loader is not None else None,
+            DIFFUSION_NOISE_MODE,
+            DIFFUSION_NORMALIZE_INPUT,
+        )
+        logger.info('%s', MULTIMODAL_ABLATION_LOG_LINE)
     if CHECK_PROJECTION_GRAD:
         logger.info(
             'CHECK_PROJECTION_GRAD=True，将在 backward 后按间隔记录投影梯度（间隔=%d）',
@@ -291,15 +306,17 @@ def run_training(
         os.path.join(run_ckps_dir_str, BEST_MODEL_FILENAME) if run_ckps_dir_str else None
     )
 
-    diffusion = StudentDiffusionWrapper(
-        STUDENT_CHECKPOINT,
-        STUDENT_NUM_TRAIN_TIMESTEPS,
-        noise_mode=DIFFUSION_NOISE_MODE,
-        noise_seed_base=RANDOM_SEED,
-        normalize_diffusion_input=DIFFUSION_NORMALIZE_INPUT,
-        feat_layers=FEAT_SCALES,
-    )
-    logger.info('Initial Student Diffusion Model Finished (scheduler from checkpoint: %s)', type(diffusion.scheduler).__name__)
+    diffusion = None
+    if not compare_run:
+        diffusion = StudentDiffusionWrapper(
+            STUDENT_CHECKPOINT,
+            STUDENT_NUM_TRAIN_TIMESTEPS,
+            noise_mode=DIFFUSION_NOISE_MODE,
+            noise_seed_base=RANDOM_SEED,
+            normalize_diffusion_input=DIFFUSION_NORMALIZE_INPUT,
+            feat_layers=FEAT_SCALES,
+        )
+        logger.info('Initial Student Diffusion Model Finished (scheduler from checkpoint: %s)', type(diffusion.scheduler).__name__)
     model = create_classifier(opt, diffusion).to(device)
 
     loss_fn = model.loss_func
@@ -357,6 +374,7 @@ def run_training(
     last_eval_sel_acc = float('nan')
     last_kappa = 0.0
     last_s_sqr = 0.0
+    last_aa = 0.0
 
     best_state_dict = None
 
@@ -373,6 +391,7 @@ def run_training(
             ovr_acc = 0.0
             kappa = 0.0
             s_sqr = 0.0
+            aa = 0.0
 
             train_loss, train_acc, global_step = train_one_epoch(
                 model,
@@ -410,19 +429,21 @@ def run_training(
                     split=selection_split,
                     use_center_logits=use_center,
                 )
-                ovr_acc, usr_acc, prod_acc, kappa, s_sqr = accuracies(conf)
+                ovr_acc, usr_acc, prod_acc, kappa, s_sqr, aa = accuracies(conf)
                 last_eval_epoch = epoch
                 last_ovr_acc = ovr_acc
                 last_eval_sel_loss = eval_sel_loss
                 last_eval_sel_acc = eval_sel_acc
                 last_kappa = kappa
                 last_s_sqr = s_sqr
+                last_aa = aa
             elif run_selection:
                 ovr_acc = last_ovr_acc
                 eval_sel_loss = last_eval_sel_loss
                 eval_sel_acc = last_eval_sel_acc
                 kappa = last_kappa
                 s_sqr = last_s_sqr
+                aa = last_aa
             epoch_seconds = time.perf_counter() - epoch_start
 
             if writer is not None:
@@ -430,12 +451,13 @@ def run_training(
                 writer.add_scalar('train/epoch_acc', train_acc, epoch + 1)
                 if should_run_eval:
                     writer.add_scalar(f'{selection_split}/overall_accuracy', ovr_acc, epoch + 1)
+                    writer.add_scalar(f'{selection_split}/average_accuracy', aa, epoch + 1)
                     writer.add_scalar(f'{selection_split}/kappa', kappa, epoch + 1)
                     writer.add_scalar(f'{selection_split}/kappa_variance', s_sqr, epoch + 1)
                 writer.add_scalar('timing/epoch_seconds', epoch_seconds, epoch + 1)
             if run_selection and should_run_eval:
                 logger.info(
-                    'Epoch %03d summary | train_loss=%.4f train_acc=%.4f %s_loss=%.4f %s_acc=%.4f ovr_acc=%.4f kappa=%.4f epoch_seconds=%.2f',
+                    'Epoch %03d summary | train_loss=%.4f train_acc=%.4f %s_loss=%.4f %s_acc=%.4f ovr_acc=%.4f aa=%.4f kappa=%.4f epoch_seconds=%.2f',
                     epoch + 1,
                     train_loss,
                     train_acc,
@@ -444,18 +466,20 @@ def run_training(
                     selection_split,
                     eval_sel_acc,
                     ovr_acc,
+                    aa,
                     kappa,
                     epoch_seconds,
                 )
             elif run_selection:
                 logger.info(
-                    'Epoch %03d summary | train_loss=%.4f train_acc=%.4f (skip %s: 每 %d epoch eval) last_ovr_acc=%.4f epoch_seconds=%.2f',
+                    'Epoch %03d summary | train_loss=%.4f train_acc=%.4f (skip %s: 每 %d epoch eval) last_ovr_acc=%.4f last_aa=%.4f epoch_seconds=%.2f',
                     epoch + 1,
                     train_loss,
                     train_acc,
                     selection_split,
                     EVAL_INTERVAL_EPOCHS,
                     last_ovr_acc,
+                    last_aa,
                     epoch_seconds,
                 )
             elif run_eval:
@@ -497,6 +521,7 @@ def run_training(
                     logger.info('  best 权重: %s', best_path)
                 if writer is not None:
                     writer.add_scalar(f'best/{selection_split}_overall_accuracy', best_acc, epoch + 1)
+                    writer.add_scalar(f'best/{selection_split}_average_accuracy', aa, epoch + 1)
 
             # 仅在已满足验证且 train_acc 过门槛时按间隔保存（与 run_selection 一致）；且仅在总 epoch 后 20%
             if (
@@ -607,7 +632,7 @@ def run_training(
             split='test',
             use_center_logits=use_center_final,
         )
-        ovr_acc_final, usr_acc, prod_acc, kappa, s_sqr = accuracies(conf_final)
+        ovr_acc_final, usr_acc, prod_acc, kappa, s_sqr, aa_final = accuracies(conf_final)
 
         if save_conf_detail and run_log_dir_str:
             conf_log_path = Path(run_log_dir_str) / 'conf_detail.log'
@@ -620,12 +645,14 @@ def run_training(
             writer.add_scalar('final/test_loss', eval_loss_final, best_epoch + 1)
             writer.add_scalar('final/test_acc', eval_acc_final, best_epoch + 1)
             writer.add_scalar('final/overall_accuracy', ovr_acc_final, best_epoch + 1)
+            writer.add_scalar('final/average_accuracy', aa_final, best_epoch + 1)
             writer.add_scalar('final/kappa', kappa, best_epoch + 1)
             writer.add_text(
                 'final/summary',
                 '\n'.join([
                     f'best_epoch: {best_epoch + 1}',
                     f'test_accuracy: {np.round(100 * ovr_acc_final, 2)}%',
+                    f'average_accuracy: {np.round(100 * aa_final, 2)}',
                     f'user_accuracy: {np.round(100 * usr_acc, 2)}',
                     f'producer_accuracy: {np.round(100 * prod_acc, 2)}',
                     f'kappa: {np.round(kappa, 4)}',
@@ -635,10 +662,33 @@ def run_training(
 
         log_and_print(logger, 'Best epoch is', best_epoch + 1)
         log_and_print(logger, 'Test accuracy is', np.round(100 * ovr_acc_final, 2), '%')
+        log_and_print(logger, 'Average accuracy (AA) is', np.round(100 * aa_final, 2), '%')
         log_and_print(logger, 'User accuracy is', np.round(100 * usr_acc, 2))
         log_and_print(logger, 'Producer accuracy is', np.round(100 * prod_acc, 2))
         log_and_print(logger, 'Kappa coefficient is', np.round(kappa, 4))
         log_and_print(logger, 'Kappa variance is', np.round(s_sqr, 6))
+
+        if run_log_dir_str:
+            summary_path = Path(run_log_dir_str) / 'metrics_summary.json'
+            payload = {
+                'experiment_tag': os.environ.get('MMDIFF_EXPERIMENT_TAG', ''),
+                'modality_combo': opt.get('model_cls', {}).get('modality_combo', ''),
+                'enabled_modalities': opt.get('model_cls', {}).get('enabled_modalities', []),
+                'compare_run': (os.environ.get('MMDIFF_COMPARE_RUN') or '').strip().lower() in ('1', 'true', 'yes'),
+                'compare_model': os.environ.get('MMDIFF_COMPARE_MODEL', ''),
+                'best_epoch': int(best_epoch + 1),
+                'oa': float(ovr_acc_final),
+                'aa': float(aa_final),
+                'kappa': float(kappa),
+                'oa_percent': float(np.round(100 * ovr_acc_final, 4)),
+                'aa_percent': float(np.round(100 * aa_final, 4)),
+                'kappa_rounded': float(np.round(kappa, 6)),
+            }
+            summary_path.write_text(
+                json.dumps(payload, indent=2, ensure_ascii=False) + '\n',
+                encoding='utf-8',
+            )
+            logger.info('metrics_summary 已写入 %s', summary_path)
     finally:
         if writer is not None:
             writer.flush()
