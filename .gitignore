@@ -40,10 +40,14 @@ htmlcov/
 .DS_Store
 Thumbs.db
 
+# Windows PowerShell（仓库内不保留 .ps1 脚本）
+*.ps1
+
 # --- 本项目训练产物（体积大、不应进版本库）---
 # TensorBoard / 训练 run 日志（param.TB_LOG_ROOT 等）
 tf-logs/
 **/tf-logs/
+assets/
 
 # 训练与实验日志目录（TensorBoard 根目录见 param.TB_LOG_ROOT，默认 ../../tf-logs）
 logs/

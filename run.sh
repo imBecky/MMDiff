@@ -1,54 +1,57 @@
 #!/usr/bin/env bash
 # =============================================================================
-# HSI 消融：D1 → D2 → A → B → C（单步扩散 t=50，与 param 中 MMDIFF_* 一致）
+# 多模态分支消融批量跑：7 个非空模态组合
+# 组合由 MMDIFF_MODALITY_COMBO 控制（hsi / rgb / lidar / hsi+rgb / ...）
 #
-# D1 attn_pool   : 3×96×8，可学习 9 位置加权聚合
-# D2 multi_token : 3×96×8，中心/四角/四边 三 token
-# A mean（轻量） : 3×96×8，算术平均（原 baseline）
-# B 大容量       : 5×128×8，算术平均
-# C 放宽 SE      : 5×128×4，算术平均
+# 训练与 TensorBoard 的 run 目录由 param.TB_LOG_ROOT 决定（默认 ../../tf-logs）。
+# 本脚本仅把控制台 tee 到同一根目录下的子目录，避免在仓库根目录另建日志目录。
 #
-# 用法（仓库根目录）：
-#   chmod +x run.sh && ./run.sh
+# 用法
+#   chmod +x run_multimodal_modality_ablation.sh
+#   ./run_multimodal_modality_ablation.sh
 #
 # 可选环境变量：
-#   MMDIFF_NUM_EPOCHS              默认 300
-#   MMDIFF_EXPERIMENT_TAG_PREFIX   默认 HSI（run tag: cls_${PREFIX}_...）
+#   MMDIFF_NUM_EPOCHS                 默认 300
+#   MMDIFF_EXPERIMENT_TAG_PREFIX      默认 MODABL
+#   TB_LOG_ROOT                       默认 ../../tf-logs（与 param.py 中 TB_LOG_ROOT 一致）
 # =============================================================================
+
 set -euo pipefail
 cd "$(dirname "$0")"
 
-unset MMDIFF_RESUME_CHECKPOINT 2>/dev/null || true
-
-export MMDIFF_NUM_EPOCHS="${MMDIFF_NUM_EPOCHS:-300}"
 export PYTHONUNBUFFERED="${PYTHONUNBUFFERED:-1}"
+export MMDIFF_NUM_EPOCHS="${MMDIFF_NUM_EPOCHS:-200}"
 
-# 单步扩散，与其它 HSI 对照表一致
-export MMDIFF_DIFFUSION_TIMESTEPS="50"
-export MMDIFF_LIDAR_EXTRA_BLOCKS="${MMDIFF_LIDAR_EXTRA_BLOCKS:-0}"
+if [[ "${MMDIFF_SKIP_CONDA_ACTIVATE:-0}" != "1" ]] && command -v conda >/dev/null 2>&1; then
+  # shellcheck disable=SC1091
+  eval "$(conda shell.bash hook)" 2>/dev/null || true
+  conda activate "${CONDA_ENV_NAME:-hbq}" 2>/dev/null || true
+fi
 
-PREFIX="${MMDIFF_EXPERIMENT_TAG_PREFIX:-HSI}"
+PREFIX="${MMDIFF_EXPERIMENT_TAG_PREFIX:-modality}"
+# 与 param.py: TB_LOG_ROOT = Path('../../tf-logs') 对齐（在仓库根目录执行时）
+TB_LOG_ROOT="${TB_LOG_ROOT:-../../tf-logs}"
 
-run_one() {
-  local tag="$1"
-  export MMDIFF_EXPERIMENT_TAG="${PREFIX}_${tag}"
-  echo "========== ${MMDIFF_EXPERIMENT_TAG} | HSI rb=${MMDIFF_HSI_RESIDUAL_BLOCKS:-?} hidden=${MMDIFF_HSI_CONV_HIDDEN:-?} se=${MMDIFF_HSI_SE_RATIO:-?} agg=${MMDIFF_HSI_AGG_MODE:-?} =========="
-  python main.py
-}
+COMBOS=(
+  "hsi+rgb+lidar"
+  "rgb+lidar"
+  "hsi+lidar"
+  "hsi+rgb"
+  "hsi"
+  "rgb"
+  "lidar"
+)
 
-# ---- D1：可学习空间加权（轻量 3×96×8）----
-export MMDIFF_HSI_RESIDUAL_BLOCKS=3
-export MMDIFF_HSI_CONV_HIDDEN=96
-export MMDIFF_HSI_SE_RATIO=8
-export MMDIFF_HSI_AGG_MODE=attn_pool
-run_one "D1_attn_pool"
+echo "========== 多模态分支消融批量运行 | prefix=$PREFIX | TB_LOG_ROOT=$TB_LOG_ROOT =========="
 
-# ---- D2：三 token（轻量 3×96×8）----
-export MMDIFF_HSI_AGG_MODE=multi_token
-run_one "D2_multi_token"
+for combo in "${COMBOS[@]}"; do
+  safe="${combo//[^a-zA-Z0-9_-]/_}"
+  export MMDIFF_MODALITY_COMBO="$combo"
+  export MMDIFF_EXPERIMENT_TAG="${PREFIX}_${safe}"
+  python main.py 2>&1
+done
 
-unset MMDIFF_RESUME_CHECKPOINT 2>/dev/null || true
-echo "========== 全部 HSI 消融跑完 =========="
+echo "========== 全部消融跑完。单次 run 产物：${TB_LOG_ROOT}/<run_tag>/（model.log、metrics_summary.json 等）=========="
 
 curl "https://sctapi.ftqq.com/SCT313662TGZ7JRPbisBQfDZbabO1Kmmdt.send?title=训练完成&desp=Python脚本已执行完毕channel=9"
 sleep 3

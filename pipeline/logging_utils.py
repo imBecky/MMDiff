@@ -66,11 +66,19 @@ def prepare_tb_run_dir():
     """与 TensorBoard 使用同一 run 目录（TB_LOG_ROOT / run_name）。"""
     TB_LOG_ROOT.mkdir(parents=True, exist_ok=True)
     tag = os.environ.get('MMDIFF_EXPERIMENT_TAG', '').strip()
+    ts = datetime.now().strftime('%Y%m%d-%H%M%S')
+    prefix = (RUN_NAME_PREFIX or '').strip()
     if tag:
         safe = re.sub(r'[^\w\-.]', '_', tag)
-        run_name = f'{RUN_NAME_PREFIX}_{safe}_{datetime.now().strftime("%Y%m%d-%H%M%S")}'
+        if prefix:
+            run_name = f'{prefix}_{safe}_{ts}'
+        else:
+            run_name = f'{safe}_{ts}'
     else:
-        run_name = f'{RUN_NAME_PREFIX}_{datetime.now().strftime("%Y%m%d-%H%M%S")}'
+        if prefix:
+            run_name = f'{prefix}_{ts}'
+        else:
+            run_name = ts
     run_dir = TB_LOG_ROOT / run_name
     run_dir.mkdir(parents=True, exist_ok=True)
     return run_dir

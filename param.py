@@ -82,7 +82,7 @@ if _RGB_ENABLED and not TRAIN_RGB_PATCHES_PATH.is_file():
     )
 USE_RGB_PATCHES = bool(_RGB_ENABLED)
 RGB_CHANNELS = 3
-RUN_NAME_PREFIX = 'cls'
+RUN_NAME_PREFIX = ''
 # 验证集最佳权重保存在本次 run 的断点目录下：{run_ckps_dir}/{BEST_MODEL_FILENAME}
 BEST_MODEL_FILENAME = 'best_model.pt'
 # 仅兼容旧说明；训练流程不再写入此路径
