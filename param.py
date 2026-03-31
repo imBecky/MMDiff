@@ -15,12 +15,12 @@ SCHED_STEP_RATIOS = [0.6, 0.7]
 SCHED_GAMMAS = [0.4, 0.1]
 CLIP_GRAD_NORM = 1.0
 EVAL_VAL_START_EPOCH = 20
-LEARNING_RATE = 3e-4
+LEARNING_RATE = 6e-4
 WEIGHT_DECAY = 1e-4
 NUM_WORKERS = 14
-BATCH_SIZE = 32
+BATCH_SIZE = 64
 CLS_TRANSFORMER_DROPOUT = 0.1
-NUM_EPOCHS = 100
+NUM_EPOCHS = 150
 # 续训时 LambdaLR 衰减边界用：与首次训练一致的总 step 数（通常由 checkpoint 自动写入；旧断点可 export MMDIFF_SCHEDULER_LR_TOTAL_STEPS）
 SCHEDULER_LR_TOTAL_STEPS = 0
 
@@ -132,9 +132,8 @@ EVAL_MIN_TRAIN_ACC = 0
 # 过门槛后每 N 个 epoch 跑一次 eval（test 集大时减少 eval 频率；0 表示每 epoch 都跑）
 EVAL_INTERVAL_EPOCHS = 5
 
-# 早停：仅在「实际跑完验证集评估」时计数；连续 patience 次 OA（与选优一致：confusion 总体精度）
-# 未严格超过该次验证前的历史最优 best_acc 则结束训练。0=关闭。
-# 若 EVAL_INTERVAL_EPOCHS>0，一次计数对应一次验证而非一个 epoch。环境变量：MMDIFF_EARLY_STOPPING_PATIENCE
+# 早停：仅在「实际跑完验证集评估」时计数；连续 patience 次 OA 未严格超过历史最优则结束。0=关闭。
+# 环境变量：MMDIFF_EARLY_STOPPING_PATIENCE
 EARLY_STOPPING_PATIENCE = 0
 
 USE_CENTER_LOSS = True
@@ -157,7 +156,7 @@ MULTIMODAL_ABLATION_INDEX = 0
 LIDAR_PROJ_HIDDEN_CFG = 64
 # stem 之后在 feat_ch 上追加的空间残差块数（见 model/multimodal.py _LidarSpatialResidualBlock）
 # 0=仅 stem；默认 1（略浅于 2～3 块堆叠）
-LIDAR_EXTRA_BLOCKS_CFG = 2
+LIDAR_EXTRA_BLOCKS_CFG = 3
 HSI_RESIDUAL_BLOCKS_CFG = 4
 HSI_CONV_HIDDEN_CFG = 96
 HSI_SE_RATIO_CFG = 8
@@ -431,9 +430,10 @@ def _apply_mmdiff_env_overrides():
     MMDIFF_HSI_CONV_HIDDEN → HSI_CONV_HIDDEN_CFG 与 opt['module_cast3']
     MMDIFF_HSI_SE_RATIO → HSI_SE_RATIO_CFG 与 opt['module_cast3']
     MMDIFF_HSI_AGG_MODE → HSI_AGG_MODE_CFG 与 opt['module_cast3']（mean | attn_pool | multi_token）
+    MMDIFF_BATCH_SIZE → BATCH_SIZE 与 opt['dataset']['batch_size']
+    MMDIFF_EARLY_STOPPING_PATIENCE → EARLY_STOPPING_PATIENCE（0=关闭早停）
     MMDIFF_RESUME_CHECKPOINT → 覆盖 RESUME_CHECKPOINT
     MMDIFF_SCHEDULER_LR_TOTAL_STEPS → opt['scheduler_lr_total_steps']（续训边界；旧 checkpoint 无该字段时手动设）
-    MMDIFF_EARLY_STOPPING_PATIENCE → EARLY_STOPPING_PATIENCE（0=关闭早停）
     （扩散 t 列表由模块加载时读取 MMDIFF_DIFFUSION_TIMESTEPS，见 _cls_diffusion_timesteps_from_env）
     """
     g = globals()
@@ -473,8 +473,9 @@ def _apply_mmdiff_env_overrides():
     _int('MMDIFF_HSI_CONV_HIDDEN', 'HSI_CONV_HIDDEN_CFG')
     _int('MMDIFF_HSI_SE_RATIO', 'HSI_SE_RATIO_CFG')
     _str_env('MMDIFF_HSI_AGG_MODE', 'HSI_AGG_MODE_CFG')
-    _int('MMDIFF_SCHEDULER_LR_TOTAL_STEPS', 'SCHEDULER_LR_TOTAL_STEPS')
+    _int('MMDIFF_BATCH_SIZE', 'BATCH_SIZE')
     _int('MMDIFF_EARLY_STOPPING_PATIENCE', 'EARLY_STOPPING_PATIENCE')
+    _int('MMDIFF_SCHEDULER_LR_TOTAL_STEPS', 'SCHEDULER_LR_TOTAL_STEPS')
 
     lh = int(g['LIDAR_PROJ_HIDDEN_CFG'])
     if lh < 1:
@@ -506,6 +507,11 @@ def _apply_mmdiff_env_overrides():
     if ne < 1:
         raise ValueError(f'NUM_EPOCHS / MMDIFF_NUM_EPOCHS 须 >= 1，当前 {ne}')
     opt['train']['n_epoch'] = ne
+
+    bs = int(g['BATCH_SIZE'])
+    if bs < 1:
+        raise ValueError(f'BATCH_SIZE / MMDIFF_BATCH_SIZE 须 >= 1，当前 {bs}')
+    opt['dataset']['batch_size'] = bs
     slr_steps = int(g.get('SCHEDULER_LR_TOTAL_STEPS') or 0)
     if slr_steps > 0:
         opt['scheduler_lr_total_steps'] = slr_steps
