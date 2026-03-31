@@ -2,8 +2,8 @@
 对比实验入口：与主训练隔离，仅通过环境变量 MMDIFF_COMPARE_RUN=1 关闭 SupCon / 双头 CE。
 
 用法（仓库根目录）：
-  python main_compare.py --model coupled_cnn
-  MMDIFF_EXPERIMENT_TAG=cmp_x python main_compare.py --model macn
+  python utils/main_compare.py --model fgcn
+  MMDIFF_EXPERIMENT_TAG=cmp_x python utils/main_compare.py --model fgcn
 
 环境变量（可选）：
   MMDIFF_COMPARE_MODEL       与 --model 等价（一般无需单独设）
@@ -16,6 +16,13 @@ from __future__ import annotations
 
 import argparse
 import os
+import sys
+from pathlib import Path
+
+# 从 utils/ 子目录运行时，默认 sys.path 不含仓库根，无法 import model
+_ROOT = Path(__file__).resolve().parent.parent
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
 
 
 def _bootstrap_env():

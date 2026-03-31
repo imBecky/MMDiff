@@ -132,6 +132,11 @@ EVAL_MIN_TRAIN_ACC = 0
 # 过门槛后每 N 个 epoch 跑一次 eval（test 集大时减少 eval 频率；0 表示每 epoch 都跑）
 EVAL_INTERVAL_EPOCHS = 5
 
+# 早停：仅在「实际跑完验证集评估」时计数；连续 patience 次 OA（与选优一致：confusion 总体精度）
+# 未严格超过该次验证前的历史最优 best_acc 则结束训练。0=关闭。
+# 若 EVAL_INTERVAL_EPOCHS>0，一次计数对应一次验证而非一个 epoch。环境变量：MMDIFF_EARLY_STOPPING_PATIENCE
+EARLY_STOPPING_PATIENCE = 0
+
 USE_CENTER_LOSS = True
 LOSS_WEIGHT_GLOBAL = 0.2
 LOSS_WEIGHT_CENTER = 0.8
@@ -428,6 +433,7 @@ def _apply_mmdiff_env_overrides():
     MMDIFF_HSI_AGG_MODE → HSI_AGG_MODE_CFG 与 opt['module_cast3']（mean | attn_pool | multi_token）
     MMDIFF_RESUME_CHECKPOINT → 覆盖 RESUME_CHECKPOINT
     MMDIFF_SCHEDULER_LR_TOTAL_STEPS → opt['scheduler_lr_total_steps']（续训边界；旧 checkpoint 无该字段时手动设）
+    MMDIFF_EARLY_STOPPING_PATIENCE → EARLY_STOPPING_PATIENCE（0=关闭早停）
     （扩散 t 列表由模块加载时读取 MMDIFF_DIFFUSION_TIMESTEPS，见 _cls_diffusion_timesteps_from_env）
     """
     g = globals()
@@ -468,6 +474,7 @@ def _apply_mmdiff_env_overrides():
     _int('MMDIFF_HSI_SE_RATIO', 'HSI_SE_RATIO_CFG')
     _str_env('MMDIFF_HSI_AGG_MODE', 'HSI_AGG_MODE_CFG')
     _int('MMDIFF_SCHEDULER_LR_TOTAL_STEPS', 'SCHEDULER_LR_TOTAL_STEPS')
+    _int('MMDIFF_EARLY_STOPPING_PATIENCE', 'EARLY_STOPPING_PATIENCE')
 
     lh = int(g['LIDAR_PROJ_HIDDEN_CFG'])
     if lh < 1:
@@ -509,6 +516,8 @@ def _apply_mmdiff_env_overrides():
 
 
 _apply_mmdiff_env_overrides()
+
+EARLY_STOPPING_PATIENCE = max(0, int(EARLY_STOPPING_PATIENCE))
 
 if USE_SUPCON and not USE_RGB_PATCHES:
     # 多模态分支消融可能会关掉 rgb；此时 SupCon 不再可用，自动关闭以保证实验可运行。

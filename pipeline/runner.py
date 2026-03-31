@@ -24,6 +24,7 @@ from param import (
     CKPS_DIR,
     DIFFUSION_NOISE_MODE,
     DIFFUSION_NORMALIZE_INPUT,
+    EARLY_STOPPING_PATIENCE,
     EVAL_INTERVAL_EPOCHS,
     EVAL_MIN_TRAIN_ACC,
     EVAL_VAL_START_EPOCH,
@@ -248,6 +249,13 @@ def run_training(
                 '续训 LR 边界 scheduler_lr_total_steps=%s（LambdaLR 衰减比例仍按此总步数计算）',
                 opt['scheduler_lr_total_steps'],
             )
+    early_stop_patience = max(0, int(EARLY_STOPPING_PATIENCE))
+    if early_stop_patience > 0:
+        logger.info(
+            'Early stopping: patience=%d（按验证次数计，OA 须严格优于历史最优才重置）',
+            early_stop_patience,
+        )
+
     if compare_run:
         logger.info(
             'VAL_RATIO=%s | train_batches=%d val_batches=%s | compare_model=%s',
@@ -382,9 +390,12 @@ def run_training(
     periodic_ckpt_min_epoch = max(0, int(NUM_EPOCHS * 0.8))
 
     epoch_bar = tqdm(range(start_epoch, NUM_EPOCHS), desc='Epochs')
+    last_epoch_0based = start_epoch - 1
+    early_stop_evals_without_gain = 0
 
     try:
         for epoch in epoch_bar:
+            last_epoch_0based = epoch
             epoch_start = time.perf_counter()
             eval_sel_loss = float('nan')
             eval_sel_acc = float('nan')
@@ -416,6 +427,7 @@ def run_training(
             )
 
             if should_run_eval:
+                prev_best_acc = best_acc
                 use_center = bool(USE_CENTER_LOSS)
                 _, _, conf, eval_sel_loss, eval_sel_acc = evaluate(
                     model,
@@ -523,6 +535,28 @@ def run_training(
                     writer.add_scalar(f'best/{selection_split}_overall_accuracy', best_acc, epoch + 1)
                     writer.add_scalar(f'best/{selection_split}_average_accuracy', aa, epoch + 1)
 
+            if should_run_eval and early_stop_patience > 0:
+                if ovr_acc > prev_best_acc + 1e-12:
+                    early_stop_evals_without_gain = 0
+                else:
+                    early_stop_evals_without_gain += 1
+                    logger.info(
+                        'Early stopping: %d/%d 次验证 OA 未严格提升（当前 oa=%.6f，本轮验证前 best=%.6f）',
+                        early_stop_evals_without_gain,
+                        early_stop_patience,
+                        ovr_acc,
+                        prev_best_acc,
+                    )
+                    if early_stop_evals_without_gain >= early_stop_patience:
+                        logger.info(
+                            'Early stopping: 已达 patience=%d，结束训练（最后完成 epoch=%d）',
+                            early_stop_patience,
+                            epoch + 1,
+                        )
+                        if writer is not None:
+                            writer.add_scalar('train/early_stopped', 1.0, epoch + 1)
+                        break
+
             # 仅在已满足验证且 train_acc 过门槛时按间隔保存（与 run_selection 一致）；且仅在总 epoch 后 20%
             if (
                 run_selection
@@ -562,9 +596,13 @@ def run_training(
                 best_epoch=best_epoch + 1,
             )
 
+        final_next_epoch = last_epoch_0based + 1
+        if final_next_epoch < start_epoch:
+            final_next_epoch = start_epoch
+
         if run_ckps_dir_str and best_path and not os.path.isfile(best_path):
             torch.save(model.state_dict(), best_path)
-            best_epoch = NUM_EPOCHS - 1
+            best_epoch = last_epoch_0based
             logger.warning(
                 '训练过程中未出现新的 best 记录，已将最后一轮权重写入 %s',
                 best_path,
@@ -576,7 +614,7 @@ def run_training(
                 model,
                 optimizer,
                 lr_scheduler,
-                NUM_EPOCHS,
+                final_next_epoch,
                 global_step,
                 best_acc,
                 best_epoch,
@@ -585,8 +623,9 @@ def run_training(
                 run_ckps_dir_str,
             )
             logger.info(
-                '训练结束，最终断点已保存至 %s（含 classifier.pt 与 training_state.pt）',
+                '训练结束，最终断点已保存至 %s（next_epoch=%d，含 classifier.pt 与 training_state.pt）',
                 final_dir,
+                final_next_epoch,
             )
 
         best_model = create_classifier(opt, diffusion).to(device)
