@@ -52,9 +52,10 @@ assets/
 # 训练与实验日志目录（TensorBoard 根目录见 param.TB_LOG_ROOT，默认 ../../tf-logs）
 logs/
 compare_logs/
+对比试验.md
 *.pt
 *.pth
 *.ckpt
 
-# 多 Agent 协作上下文（仅本机、不提交）
+# 多 Agent 协作上下文
 agent-collab/

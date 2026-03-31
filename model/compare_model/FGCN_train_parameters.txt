@@ -1,0 +1,66 @@
+================================================================================
+F-GCN: Fuzzy Graph Convolutional Network for Hyperspectral Image Classification
+论文: EAAI (Engineering Applications of Artificial Intelligence)
+代码: https://github.com/liziyilzy/F-GCN
+================================================================================
+
+【训练参数 (来自原始 train.py)】
+--------------------------------------
+learning_rate       = 0.0005
+optimizer           = Adam
+epochs              = 8000
+hidden_dim (h)      = 100
+num_classes         = 9          (UP 数据集)
+random_seed         = 123
+
+【模型结构参数 (来自原始 GCN.py / GCNLayer.py)】
+--------------------------------------
+GCN 层数 (每尺度)     = 2
+  Layer-1 激活函数     = softplus
+  Layer-1 输出维度     = hidden_dim (100)
+  Layer-2 激活函数     = identity (无激活)
+  Layer-2 输出维度     = num_classes
+  bias               = True
+多尺度数             = len(sp_A)    (由超像素分割的尺度数决定)
+多尺度融合方式        = 逐元素相加 (element-wise sum)
+权重初始化           = Uniform[-0.05, 0.05]
+
+【模糊平滑参数 (来自原始 fuzzy_learn.py)】
+--------------------------------------
+fuzzy_k (近邻数)     = 5
+fuzzy_std (高斯核标准差) = 4.0
+模糊平滑公式:
+  对每个节点 i，取 k=5 个最近邻 j_1..j_5:
+    h_m = exp(-||coord_i - coord_{j_m}||^2 / (2 * std^2))
+    h = h / sum(h)
+    Z[i] = sum(features[j_m] * h_m)
+
+【Support 矩阵归一化 (来自原始 CalSupport)】
+--------------------------------------
+A_hat = A + I                       (自环)
+D     = diag(rowsum(A_hat))
+support = D^{-1/2} @ A_hat @ D^{-1/2}
+
+【损失函数】
+--------------------------------------
+loss = masked_softmax_cross_entropy
+  即: 仅对有标签 (mask=True) 的节点计算交叉熵
+
+【整体前向流程】
+--------------------------------------
+1. 输入: 节点特征 X ∈ R^{N × C}，多尺度邻接矩阵列表 [A_1, ..., A_S]
+2. FuzzySmoothing(X) → X_fuzzy        (空间模糊平滑)
+3. 对每个尺度 s = 1..S:
+     H_s = softplus(support_s @ X_fuzzy @ W1_s + b1_s)    (第一层 GCN)
+     O_s = support_s @ H_s @ W2_s + b2_s                  (第二层 GCN, 无激活)
+4. output = O_1 + O_2 + ... + O_S                          (多尺度求和)
+5. loss = cross_entropy(output[masked], labels[masked])
+6. 反向传播更新 {W1_s, b1_s, W2_s, b2_s}
+
+【PyTorch 移植适配说明】
+--------------------------------------
+- 原始实现为 TensorFlow 1.x 静态图
+- 原始输入为超像素级特征，移植后适配为 patch 级像素节点
+- HSI 与 LiDAR 特征沿通道维拼接作为节点特征
+- 多尺度通过不同 k-NN 连接度 (k=4, 8, 12) 构建空间图模拟
+- 取 patch 中心像素节点的 logits 作为分类输出

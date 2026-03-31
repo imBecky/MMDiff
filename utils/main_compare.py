@@ -29,7 +29,7 @@ def main():
         '--model',
         type=str,
         required=True,
-        help='模型注册名，如 coupled_cnn fusatnet macn hct exvit ss_mae msfmamba dcmnet',
+        help='模型注册名，如 fgcn',
     )
     parser.add_argument(
         '--verify-projection-grad',

@@ -1,4 +1,4 @@
-"""对比模型注册表：名称 -> 类。仅包含有公开官方实现的方法之 PyTorch 对照。"""
+"""对比模型注册表：名称 -> 类。"""
 from __future__ import annotations
 
 import os
@@ -6,29 +6,13 @@ from typing import Any, Callable, Dict, Type
 
 import torch.nn as nn
 
-from .architectures import (
-    CoupledCNNClassifier,
-    DCMNetClassifier,
-    ExViTClassifier,
-    FusAtNetClassifier,
-    HCTClassifier,
-    MACNClassifier,
-    MSFMambaClassifier,
-    SSMAEClassifier,
-)
+from .architectures import FGCNClassifier
 
 CompareFactory = Callable[[Any, Any], nn.Module]
 
 REGISTRY: Dict[str, Type[nn.Module]] = {
-    'coupled_cnn': CoupledCNNClassifier,
-    'fusatnet': FusAtNetClassifier,
-    'macn': MACNClassifier,
-    'hct': HCTClassifier,
-    'exvit': ExViTClassifier,
-    'ss_mae': SSMAEClassifier,
-    'ss-mae': SSMAEClassifier,
-    'msfmamba': MSFMambaClassifier,
-    'dcmnet': DCMNetClassifier,
+    'fgcn': FGCNClassifier,
+    'f_gcn': FGCNClassifier,
 }
 
 
