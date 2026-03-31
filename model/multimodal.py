@@ -157,8 +157,25 @@ class HSICenterSpectralEncoder(nn.Module):
         return self.proj(feat)
 
 
+class _LidarSpatialResidualBlock(nn.Module):
+    """空间 2D 卷积残差块：Conv-BN-ReLU-Conv-BN + 恒等映射（与 HSI 光谱残差块对称）。"""
+    def __init__(self, channels: int):
+        super().__init__()
+        ch = int(channels)
+        self.conv1 = nn.Conv2d(ch, ch, kernel_size=3, padding=1, bias=False)
+        self.bn1 = nn.BatchNorm2d(ch)
+        self.conv2 = nn.Conv2d(ch, ch, kernel_size=3, padding=1, bias=False)
+        self.bn2 = nn.BatchNorm2d(ch)
+        self.relu = nn.ReLU(inplace=True)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        out = self.relu(self.bn1(self.conv1(x)))
+        out = self.bn2(self.conv2(out))
+        return self.relu(out + x)
+
+
 class LidarMorphEncoder(nn.Module):
-    """小 CNN 形态学特征；输出 global token 与 center token。"""
+    """小 CNN 形态学特征；stem 后可选若干空间残差块加深；输出 global token 与 center token。"""
     def __init__(
         self,
         in_ch: int,
@@ -182,16 +199,11 @@ class LidarMorphEncoder(nn.Module):
             nn.ReLU(inplace=True),
         )
         eb = max(0, int(extra_blocks))
-        extra_layers = []
-        for _ in range(eb):
-            extra_layers.extend(
-                [
-                    nn.Conv2d(fc, fc, kernel_size=3, padding=1, bias=False),
-                    nn.BatchNorm2d(fc),
-                    nn.ReLU(inplace=True),
-                ]
-            )
-        self.extra = nn.Sequential(*extra_layers) if extra_layers else nn.Identity()
+        self.extra = (
+            nn.Sequential(*[_LidarSpatialResidualBlock(fc) for _ in range(eb)])
+            if eb > 0
+            else nn.Identity()
+        )
         self.proj_global = nn.Linear(fc, d_model)
         self.proj_center = nn.Linear(fc, d_model)
 
@@ -240,7 +252,7 @@ class MultimodalClassifier(nn.Module):
     """
     HSI：中心 3x3，1D 光谱卷积 + SE；空间聚合可为 1 token（mean/attn_pool）或 3 token（multi_token）
     RGB：冻结 UNet，可多时间步 t，每个 t 下多尺度层各 1 token（与 FEAT_SCALES 一致）
-    LiDAR：小 CNN -> global + center 共 2 token
+    LiDAR：小 CNN（stem + 可选空间残差块）-> global + center 共 2 token
     融合：两枚可学习 CLS 为 query，模态 token 为 memory，TransformerDecoder（交叉注意力 + CLS 间自注意力）
     双头：global_head(cls[0])，center_head(cls[1])
     """

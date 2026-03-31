@@ -12,7 +12,7 @@ import utils.logger as Logger
 # 与 300epoch 参考对齐：约 79% 总步数 ×0.1；第二段 gamma=1.0 等价单次衰减；1.5e-3 补偿更少总步数。
 # run.sh 深度对照时固定本段；HSI 结构通过 MMDIFF_HSI_* 覆盖 module_cast3。
 SCHED_STEP_RATIOS = [0.6, 0.7]
-SCHED_GAMMAS = [0.4, 0.08]
+SCHED_GAMMAS = [0.4, 0.1]
 CLIP_GRAD_NORM = 1.0
 EVAL_VAL_START_EPOCH = 20
 LEARNING_RATE = 5e-4
@@ -149,14 +149,11 @@ MULTIMODAL_ABLATION_AXIS = None  # None | 'center_global'
 MULTIMODAL_ABLATION_INDEX = 0
 
 # LiDAR 形态编码器 stem 隐藏通道（model/multimodal.py LidarMorphEncoder）
-LIDAR_PROJ_HIDDEN_CFG = 16
-# stem 之后在 feat_ch 上追加的 3×3 Conv-BN-ReLU 块数（加深 LiDAR 分支）
-LIDAR_EXTRA_BLOCKS_CFG = 0
-# HSI 1D 光谱编码（model/multimodal.py HSICenterSpectralEncoder）：stem 后残差块数、通道宽、SE 比
-# 更深：增大 HSI_RESIDUAL_BLOCKS_CFG（例如 4～6）；加深时可同步略增 HSI_CONV_HIDDEN_CFG。
-# 更宽：再调大 HSI_CONV_HIDDEN_CFG（须 ≥32，代码里 max(32, …)）。
-# 默认与 cls_20260326 轻量对照一致：3×96；D 实验优先改 hsi_agg_mode，容量见 B/C 表。
-HSI_RESIDUAL_BLOCKS_CFG = 3
+LIDAR_PROJ_HIDDEN_CFG = 64
+# stem 之后在 feat_ch 上追加的空间残差块数（见 model/multimodal.py _LidarSpatialResidualBlock）
+# 0=仅 stem；默认 1（略浅于 2～3 块堆叠）
+LIDAR_EXTRA_BLOCKS_CFG = 2
+HSI_RESIDUAL_BLOCKS_CFG = 4
 HSI_CONV_HIDDEN_CFG = 96
 HSI_SE_RATIO_CFG = 8
 # HSI 3×3 空间聚合：mean | attn_pool（D1 可学习加权）| multi_token（D2 中心/四角/四边 三 token）
@@ -422,7 +419,7 @@ def _apply_mmdiff_env_overrides():
     在 build_opt 之后覆盖 loss 与 LiDAR 投影宽度（与 LIDAR_PROJ_HIDDEN_CFG 一致）。
     MMDIFF_LOSS_WEIGHT_GLOBAL / MMDIFF_LOSS_WEIGHT_CENTER
     MMDIFF_LIDAR_HIDDEN → LIDAR_PROJ_HIDDEN_CFG
-    MMDIFF_LIDAR_EXTRA_BLOCKS → LIDAR_EXTRA_BLOCKS_CFG（LiDAR stem 后额外卷积块数）
+    MMDIFF_LIDAR_EXTRA_BLOCKS → LIDAR_EXTRA_BLOCKS_CFG（LiDAR stem 后空间残差块数）
     MMDIFF_SUPCON_WEIGHT → SUPCON_WEIGHT
     MMDIFF_USE_SUPCON → USE_SUPCON（0/1）
     MMDIFF_NUM_EPOCHS → NUM_EPOCHS 与 opt['train']['n_epoch']

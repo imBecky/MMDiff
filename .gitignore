@@ -55,3 +55,6 @@ compare_logs/
 *.pt
 *.pth
 *.ckpt
+
+# 多 Agent 协作上下文（仅本机、不提交）
+agent-collab/
