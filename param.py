@@ -20,7 +20,7 @@ WEIGHT_DECAY = 1e-4
 NUM_WORKERS = 14
 BATCH_SIZE = 64
 CLS_TRANSFORMER_DROPOUT = 0.1
-NUM_EPOCHS = 150
+NUM_EPOCHS = 200
 # 续训时 LambdaLR 衰减边界用：与首次训练一致的总 step 数（通常由 checkpoint 自动写入；旧断点可 export MMDIFF_SCHEDULER_LR_TOTAL_STEPS）
 SCHEDULER_LR_TOTAL_STEPS = 0
 
@@ -257,6 +257,7 @@ def build_opt():
             ('dataroot', str(DATA_DIR)),
             ('modalities', list(ENABLED_MODALITIES)),
             ('resolution', 3),
+            ('patch_size', PATCH_WINDOW_SIZE),
             ('batch_size', BATCH_SIZE),
             ('num_workers', 14),
             ('use_shuffle', True),
@@ -431,6 +432,8 @@ def _apply_mmdiff_env_overrides():
     MMDIFF_HSI_SE_RATIO → HSI_SE_RATIO_CFG 与 opt['module_cast3']
     MMDIFF_HSI_AGG_MODE → HSI_AGG_MODE_CFG 与 opt['module_cast3']（mean | attn_pool | multi_token）
     MMDIFF_BATCH_SIZE → BATCH_SIZE 与 opt['dataset']['batch_size']
+    MMDIFF_LEARNING_RATE → LEARNING_RATE 与 opt['train']['optimizer']['lr']
+    MMDIFF_WEIGHT_DECAY → WEIGHT_DECAY 与 opt['train']['optimizer']['weight_decay']
     MMDIFF_EARLY_STOPPING_PATIENCE → EARLY_STOPPING_PATIENCE（0=关闭早停）
     MMDIFF_RESUME_CHECKPOINT → 覆盖 RESUME_CHECKPOINT
     MMDIFF_SCHEDULER_LR_TOTAL_STEPS → opt['scheduler_lr_total_steps']（续训边界；旧 checkpoint 无该字段时手动设）
@@ -465,6 +468,8 @@ def _apply_mmdiff_env_overrides():
     _float('MMDIFF_LOSS_WEIGHT_GLOBAL', 'LOSS_WEIGHT_GLOBAL')
     _float('MMDIFF_LOSS_WEIGHT_CENTER', 'LOSS_WEIGHT_CENTER')
     _float('MMDIFF_SUPCON_WEIGHT', 'SUPCON_WEIGHT')
+    _float('MMDIFF_LEARNING_RATE', 'LEARNING_RATE')
+    _float('MMDIFF_WEIGHT_DECAY', 'WEIGHT_DECAY')
     _bool_env('MMDIFF_USE_SUPCON', 'USE_SUPCON')
     _int('MMDIFF_LIDAR_HIDDEN', 'LIDAR_PROJ_HIDDEN_CFG')
     _int('MMDIFF_LIDAR_EXTRA_BLOCKS', 'LIDAR_EXTRA_BLOCKS_CFG')
@@ -515,6 +520,9 @@ def _apply_mmdiff_env_overrides():
     slr_steps = int(g.get('SCHEDULER_LR_TOTAL_STEPS') or 0)
     if slr_steps > 0:
         opt['scheduler_lr_total_steps'] = slr_steps
+
+    opt['train']['optimizer']['lr'] = float(g['LEARNING_RATE'])
+    opt['train']['optimizer']['weight_decay'] = float(g['WEIGHT_DECAY'])
 
     resume_p = (os.environ.get('MMDIFF_RESUME_CHECKPOINT') or '').strip()
     if resume_p:

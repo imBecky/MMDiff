@@ -2,8 +2,8 @@
 对比实验入口：与主训练隔离，仅通过环境变量 MMDIFF_COMPARE_RUN=1 关闭 SupCon / 双头 CE。
 
 用法（仓库根目录）：
-  python utils/main_compare.py --model fgcn
-  MMDIFF_EXPERIMENT_TAG=cmp_x python utils/main_compare.py --model fgcn
+  python utils/main_compare.py --model fgcnn
+  MMDIFF_EXPERIMENT_TAG=cmp_x python utils/main_compare.py --model fgcnn
 
 环境变量（可选）：
   MMDIFF_COMPARE_MODEL       与 --model 等价（一般无需单独设）
@@ -36,7 +36,7 @@ def main():
         '--model',
         type=str,
         required=True,
-        help='模型注册名，如 fgcn',
+        help='模型注册名，如 fgcnn fusatnet exvit（fgcn 为兼容旧名；exvit/mvit 为 ExViT）',
     )
     parser.add_argument(
         '--verify-projection-grad',

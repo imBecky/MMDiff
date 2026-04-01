@@ -6,13 +6,21 @@ from typing import Any, Callable, Dict, Type
 
 import torch.nn as nn
 
-from .architectures import FGCNClassifier
+from .architectures import ExViTClassifier, FGCNNClassifier, FusAtNetClassifier
 
 CompareFactory = Callable[[Any, Any], nn.Module]
 
 REGISTRY: Dict[str, Type[nn.Module]] = {
-    'fgcn': FGCNClassifier,
-    'f_gcn': FGCNClassifier,
+    'fgcnn': FGCNNClassifier,
+    'f_gcnn': FGCNNClassifier,
+    # 旧名兼容
+    'fgcn': FGCNNClassifier,
+    'f_gcn': FGCNNClassifier,
+    'fusatnet': FusAtNetClassifier,
+    'fus_at_net': FusAtNetClassifier,
+    'exvit': ExViTClassifier,
+    'mvit': ExViTClassifier,
+    'ex_vit': ExViTClassifier,
 }
 
 

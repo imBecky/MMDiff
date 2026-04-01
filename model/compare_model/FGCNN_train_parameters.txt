@@ -1,5 +1,6 @@
 ================================================================================
-F-GCN: Fuzzy Graph Convolutional Network for Hyperspectral Image Classification
+FGCNN: Fuzzy Graph CNN for Hyperspectral Image Classification
+（论文与对比文献中常用名 FGCNN；原 GitHub 仓库目录名为 F-GCN）
 论文: EAAI (Engineering Applications of Artificial Intelligence)
 代码: https://github.com/liziyilzy/F-GCN
 ================================================================================
@@ -64,3 +65,7 @@ loss = masked_softmax_cross_entropy
 - HSI 与 LiDAR 特征沿通道维拼接作为节点特征
 - 多尺度通过不同 k-NN 连接度 (k=4, 8, 12) 构建空间图模拟
 - 取 patch 中心像素节点的 logits 作为分类输出
+
+【本仓库注册名】
+--------------------------------------
+MMDIFF_COMPARE_MODEL=fgcnn（推荐）或 f_gcnn；兼容旧名 fgcn / f_gcn

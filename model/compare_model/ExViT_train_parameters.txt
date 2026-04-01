@@ -1,0 +1,21 @@
+================================================================================
+ExViT / MViT — Extended Vision Transformer (TGRS 2023)
+论文与代码: https://github.com/jingyao16/ExViT
+================================================================================
+
+【本仓库移植】
+- 实现: model/compare_model/exvit_core.py（MViTBackbone）
+- 封装: model/compare_model/architectures.py（ExViTClassifier）
+- 注册名: MMDIFF_COMPARE_MODEL=exvit（或 mvit、ex_vit）
+
+【与原版 demo 对齐的默认超参】（MViT_demo_h2013.py / MViT 构造）
+- dim=64, depth=6, heads=4, mlp_dim=32, dim_head=16
+- dropout=0.1, emb_dropout=0.1
+- 优化器与调度仍走 param.train（CompareClassifierBase），非原版 Adam+StepLR
+
+【数据】
+- 双输入 x1=HSI、x2=LiDAR，通道数来自 opt.dataset.hsi_channels / lidar_channel
+- patch 边长: opt.dataset.patch_size（param 已写入 PATCH_WINDOW_SIZE）
+
+【引用】
+Jing Yao et al., IEEE TGRS 2023, doi: 10.1109/TGRS.2023.3284671

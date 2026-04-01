@@ -62,6 +62,19 @@ def _is_compare_run() -> bool:
     return (os.environ.get('MMDIFF_COMPARE_RUN') or '').strip().lower() in ('1', 'true', 'yes')
 
 
+def _compare_run_name_without_timestamp() -> str:
+    """对比实验未设 MMDIFF_EXPERIMENT_TAG 时：方法名 + 模态 + 当前 param 结构/batch 摘要。"""
+    model = (os.environ.get('MMDIFF_COMPARE_MODEL') or 'compare').strip().lower()
+    model = re.sub(r'[^\w\-.]', '_', model)
+    combo = (os.environ.get('MMDIFF_MODALITY_COMBO') or '').strip()
+    if combo:
+        combo_safe = re.sub(r'[^\w\-.]', '_', combo.replace('+', '-'))
+    else:
+        combo_safe = 'default'
+    cfg = f'B{HSI_RESIDUAL_BLOCKS_CFG}_H{HSI_CONV_HIDDEN_CFG}_SE{HSI_SE_RATIO_CFG}_bs{BATCH_SIZE}'
+    return f'{model}_{combo_safe}_{cfg}'
+
+
 def prepare_tb_run_dir():
     """与 TensorBoard 使用同一 run 目录（TB_LOG_ROOT / run_name）。"""
     TB_LOG_ROOT.mkdir(parents=True, exist_ok=True)
@@ -75,7 +88,13 @@ def prepare_tb_run_dir():
         else:
             run_name = f'{safe}_{ts}'
     else:
-        if prefix:
+        if _is_compare_run():
+            body = _compare_run_name_without_timestamp()
+            if prefix:
+                run_name = f'{prefix}_{body}_{ts}'
+            else:
+                run_name = f'cmp_{body}_{ts}'
+        elif prefix:
             run_name = f'{prefix}_{ts}'
         else:
             run_name = ts

@@ -30,13 +30,21 @@ def accuracies(cm):
         for j in range(num_class):
             theta4 = theta4 + P[i, j] * (p_plus_j[i] + p_i_plus[j]) ** 2
 
-    kappa = (theta1 - theta2) / (1 - theta2)
+    # theta2=1 时 1-theta2=0：仅当「随机期望完全一致」时发生（常见：混淆矩阵只在单一类有非零，即预测与真值都只有一类）。
+    # 此时 Po=Pe=1，Cohen's kappa 在形式上为 0/0；按惯例记为 1.0（完全一致），并避免 Kappa 方差公式除零。
+    den_k = 1.0 - theta2
+    eps = 1e-12
+    if den_k <= eps:
+        kappa = 1.0 if abs(theta1 - theta2) <= eps else 0.0
+        s_sqr = 0.0
+    else:
+        kappa = (theta1 - theta2) / den_k
 
-    t1 = theta1 * (1 - theta1) / (1 - theta2) ** 2
-    t2 = 2 * (1 - theta1) * (2 * theta1 * theta2 - theta3) / (1 - theta2) ** 3
-    t3 = ((1 - theta1) ** 2) * (theta4 - 4 * theta2 ** 2) / (1 - theta2) ** 4
+        t1 = theta1 * (1 - theta1) / den_k**2
+        t2 = 2 * (1 - theta1) * (2 * theta1 * theta2 - theta3) / den_k**3
+        t3 = ((1 - theta1) ** 2) * (theta4 - 4 * theta2**2) / den_k**4
 
-    s_sqr = (t1 + t2 + t3) / n
+        s_sqr = (t1 + t2 + t3) / n
 
     return ovr_acc, usr_acc, prod_acc, kappa, s_sqr, aa
 

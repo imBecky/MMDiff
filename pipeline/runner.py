@@ -659,7 +659,7 @@ def run_training(
             test_loader = build_test_loader(
                 feats_vol, rgb_vol, ti, BATCH_SIZE
             )
-        _, _, conf_final, eval_loss_final, eval_acc_final = evaluate(
+        preds_final, targets_final, conf_final, eval_loss_final, eval_acc_final = evaluate(
             best_model,
             test_loader,
             loss_fn,
@@ -672,6 +672,33 @@ def run_training(
             use_center_logits=use_center_final,
         )
         ovr_acc_final, usr_acc, prod_acc, kappa, s_sqr, aa_final = accuracies(conf_final)
+
+        n_test = int(len(targets_final))
+        uniq_true = np.unique(targets_final)
+        uniq_pred = np.unique(preds_final)
+        row_sum = conf_final.sum(axis=1)
+        n_classes_present = int(np.sum(row_sum > 0))
+        logger.info(
+            'Final test 诊断 | 样本数=%d | 真值类别数=%d unique=%s | 预测类别数=%d unique=%s',
+            n_test,
+            n_classes_present,
+            uniq_true.tolist(),
+            len(uniq_pred),
+            uniq_pred.tolist(),
+        )
+        if n_classes_present < 2:
+            logger.warning(
+                '测试集真值仅覆盖 %d 个类别，整体准确率 OA=%.4f 不能说明泛化；'
+                '若仅单类真值，模型恒预测该类即可 OA=100%%。请核对 test_labels.npy、'
+                'label_shift 与 data_prepare。',
+                n_classes_present,
+                ovr_acc_final,
+            )
+        elif n_test < 50:
+            logger.warning(
+                '测试样本数较少（n=%d），指标波动大，建议以完整 test 集为准。',
+                n_test,
+            )
 
         if save_conf_detail and run_log_dir_str:
             conf_log_path = Path(run_log_dir_str) / 'conf_detail.log'

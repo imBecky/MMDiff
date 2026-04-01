@@ -1,7 +1,7 @@
 """对比实验模型：与当前 Houston patch 数据管线一致（HSI+LiDAR）。"""
 from __future__ import annotations
 
-from typing import Dict
+from typing import Any, Dict
 
 import numpy as np
 import torch
@@ -9,11 +9,104 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from .base import CompareClassifierBase
+from .exvit_core import MViTBackbone
+from .fusatnet_core import FusAtNetBackbone
 
 
 # ---------------------------------------------------------------------------
-# F-GCN: Fuzzy Graph Convolutional Network (EAAI)
-# 参考: https://github.com/liziyilzy/F-GCN
+# FusAtNet（与 ../FusAtNet/model2.py 一致）
+# ---------------------------------------------------------------------------
+
+
+class FusAtNetClassifier(CompareClassifierBase):
+    """FusAtNet：光谱/空间注意力 + 模态注意力；优化器与原版一致为 NAdam（lr/wd 仍读 param.train.optimizer）。"""
+
+    def __init__(self, opt, diffusion=None):
+        super().__init__(opt, diffusion)
+        self.net = FusAtNetBackbone(
+            num_hsi_bands=self.hsi_channels,
+            num_lidar_bands=self.lidar_channels,
+            num_classes=self.num_classes,
+        )
+        self.projections = nn.ModuleDict({'hs': self.net.hs, 'mask_spat': self.net.mask_spat})
+        self._init_optimizer_and_scheduler()
+
+    def _build_optimizer(self, train_cfg: Dict[str, Any]) -> torch.optim.Optimizer:
+        optim_cfg = train_cfg.get('optimizer', {})
+        lr = float(optim_cfg.get('lr') or 2e-5)
+        weight_decay = float(optim_cfg.get('weight_decay') or 0.01)
+        betas = tuple(optim_cfg.get('betas') or (0.9, 0.999))
+        params = [p for p in self.parameters() if p.requires_grad]
+        if not params:
+            raise ValueError('FusAtNetClassifier 无可训练参数')
+        return torch.optim.NAdam(params, lr=lr, betas=betas, weight_decay=weight_decay)
+
+    def forward(
+        self,
+        data_dict: Dict[str, torch.Tensor],
+        return_center_logits: bool = False,
+        return_supcon_proj: bool = False,
+    ):
+        hsi, lidar = self._hsi_lidar(data_dict)
+        logits = self.net(hsi, lidar)
+        if return_center_logits:
+            return logits, logits
+        if return_supcon_proj:
+            raise RuntimeError('对比模型未启用 SupCon')
+        return logits
+
+
+# ---------------------------------------------------------------------------
+# ExViT / MViT（TGRS 2023 — jingyao16/ExViT）
+# ---------------------------------------------------------------------------
+
+
+class ExViTClassifier(CompareClassifierBase):
+    """ExViT（MViT）：双支深度可分离 CNN + 模态内 ViT + 融合 ViT + token 加权池化。
+
+    与原版 MViT_demo 默认超参一致：dim=64, depth=6, heads=4, mlp_dim=32, dropout=0.1。
+    """
+
+    def __init__(self, opt, diffusion=None):
+        super().__init__(opt, diffusion)
+        patch_size = int(self.opt.get('dataset', {}).get('patch_size') or 11)
+        self.net = MViTBackbone(
+            patch_size=patch_size,
+            num_patches=(self.hsi_channels, self.lidar_channels),
+            num_classes=self.num_classes,
+            dim=64,
+            depth=6,
+            heads=4,
+            mlp_dim=32,
+            dropout=0.1,
+            emb_dropout=0.1,
+            dim_head=16,
+            mode='MViT',
+        )
+        self.projections = nn.ModuleDict({
+            'separable1': self.net.separable1,
+            'separable2': self.net.separable2,
+        })
+        self._init_optimizer_and_scheduler()
+
+    def forward(
+        self,
+        data_dict: Dict[str, torch.Tensor],
+        return_center_logits: bool = False,
+        return_supcon_proj: bool = False,
+    ):
+        hsi, lidar = self._hsi_lidar(data_dict)
+        logits = self.net(hsi, lidar)
+        if return_center_logits:
+            return logits, logits
+        if return_supcon_proj:
+            raise RuntimeError('对比模型未启用 SupCon')
+        return logits
+
+
+# ---------------------------------------------------------------------------
+# FGCNN（Fuzzy Graph CNN / Fuzzy Graph Convolutional Network, EAAI）
+# 原仓库目录名为 F-GCN: https://github.com/liziyilzy/F-GCN
 # ---------------------------------------------------------------------------
 
 
@@ -79,8 +172,8 @@ class _GraphConvolution(nn.Module):
         return output
 
 
-class FGCNClassifier(CompareClassifierBase):
-    """F-GCN: Fuzzy Graph Convolutional Network for Hyperspectral Image Classification.
+class FGCNNClassifier(CompareClassifierBase):
+    """FGCNN: Fuzzy Graph CNN for Hyperspectral Image Classification（论文常用名 FGCNN）。
 
     核心结构（严格对应原始 GCN.py / GCNLayer.py / fuzzy_learn.py）：
       1. FuzzySmoothing — 基于 k 近邻高斯核的空间模糊平滑 (k=5, std=4)

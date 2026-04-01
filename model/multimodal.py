@@ -71,8 +71,8 @@ class _HSISpectralResidualBlock(nn.Module):
 
 class HSICenterSpectralEncoder(nn.Module):
     """
-    中心 3x3：9 个像素各做 1D 光谱卷积（沿波段维），stem 后经若干光谱残差块加深，再全局池化、
-    空间聚合、SE 通道门控，投影为 1 或多个 token。
+    中心 3x3：9 个像素各做 1D 光谱卷积（沿波段维），stem 后经若干光谱残差块加深，
+    SE 通道门控（在光谱特征图上做 squeeze-excite），再全局池化、空间聚合，投影为 1 或多个 token。
 
     agg_mode:
       - mean: 9 位置特征算术平均 -> 1 token（原默认）
@@ -131,19 +131,18 @@ class HSICenterSpectralEncoder(nn.Module):
         x = patch.permute(0, 2, 3, 1).contiguous().view(b * 9, c).unsqueeze(1)
         feat = self.stem(x)
         feat = self.res_blocks(feat)
+
+        gate = self.se(feat.mean(dim=2))
+        feat = feat * gate.unsqueeze(2)
+
         feat = self.pool(feat).squeeze(-1)
         feat = feat.view(b, 9, -1)
 
         if self.agg_mode == 'multi_token':
-            # 3x3 下标: 0 1 2 / 3 4 5 / 6 7 8 — 中心、四角、四边
             center = feat[:, 4]
             corner = feat[:, [0, 2, 6, 8]].mean(dim=1)
             edge = feat[:, [1, 3, 5, 7]].mean(dim=1)
             toks = torch.stack([center, corner, edge], dim=1)
-            bsz, k, hd = toks.shape
-            flat = toks.reshape(bsz * k, hd)
-            flat = flat * self.se(flat)
-            toks = flat.reshape(bsz, k, hd)
             return self.proj(toks)
 
         if self.agg_mode == 'attn_pool':
@@ -153,7 +152,6 @@ class HSICenterSpectralEncoder(nn.Module):
         else:
             feat = feat.mean(dim=1)
 
-        feat = feat * self.se(feat)
         return self.proj(feat)
 
 
