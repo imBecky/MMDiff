@@ -6,6 +6,8 @@ from typing import Any, Dict, Optional, Tuple, Union
 import torch
 import torch.nn as nn
 
+from pipeline.train_scheduler import build_lr_scheduler
+
 
 class CompareClassifierBase(nn.Module):
     """
@@ -54,47 +56,9 @@ class CompareClassifierBase(nn.Module):
         if not sched_cfg:
             self._scheduler_lr_total_steps = 0
             return None
-        total_epochs = int(train_cfg.get('n_epoch') or 1)
-        steps_per_epoch = int(self.opt.get('len_train_dataloader') or 1)
-        total_steps = max(1, total_epochs * steps_per_epoch)
-        bound_override = int(self.opt.get('scheduler_lr_total_steps') or 0)
-        if bound_override > 0:
-            total_steps = bound_override
-        self._scheduler_lr_total_steps = int(total_steps)
-        step_ratios = sched_cfg.get('step_ratios')
-        gammas_multi = sched_cfg.get('gammas')
-
-        if isinstance(step_ratios, (list, tuple)) and len(step_ratios) >= 2:
-            ratios = sorted(float(x) for x in step_ratios[:2])
-            r0, r1 = max(0.0, min(1.0, ratios[0])), max(0.0, min(1.0, ratios[1]))
-            if r1 <= r0:
-                raise ValueError(f'scheduler.step_ratios 需为升序，当前 {step_ratios!r}')
-            g = gammas_multi if isinstance(gammas_multi, (list, tuple)) else ()
-            if len(g) < 2:
-                raise ValueError('scheduler.gammas 需为长度≥2')
-            g1, g2 = float(g[0]), float(g[1])
-            b1 = int(total_steps * r0)
-            b2 = int(total_steps * r1)
-            b2 = max(b1 + 1, b2)
-
-            def lr_lambda(step: int) -> float:
-                m = 1.0
-                if step >= b1:
-                    m *= g1
-                if step >= b2:
-                    m *= g2
-                return m
-
-            return torch.optim.lr_scheduler.LambdaLR(self.optimizer, lr_lambda=lr_lambda)
-
-        constant_ratio = float(sched_cfg.get('constant_ratio') or 0.8)
-        gamma = float(sched_cfg.get('gamma') or 0.1)
-        step_boundary = int(total_steps * constant_ratio)
-
-        def lr_lambda_legacy(step: int) -> float:
-            return 1.0 if step < step_boundary else gamma
-
-        return torch.optim.lr_scheduler.LambdaLR(self.optimizer, lr_lambda=lr_lambda_legacy)
+        sch, ts = build_lr_scheduler(self.optimizer, train_cfg, self.opt)
+        self._scheduler_lr_total_steps = int(ts)
+        return sch
 
     def _hsi_lidar(self, data_dict: Dict[str, torch.Tensor]) -> Tuple[torch.Tensor, torch.Tensor]:
         return data_dict['hsi'], data_dict['lidar']

@@ -8,11 +8,46 @@ import utils.logger as Logger
 # ---------------------------------------------------------------------------
 # 数据与训练（常用修改处）
 # ---------------------------------------------------------------------------
-# LR 两阶衰减（相对总 optimizer step = epoch × len(train_loader)）：
-# 与 300epoch 参考对齐：约 79% 总步数 ×0.1；第二段 gamma=1.0 等价单次衰减；1.5e-3 补偿更少总步数。
-# run.sh 深度对照时固定本段；HSI 结构通过 MMDIFF_HSI_* 覆盖 module_cast3。
+# 默认对齐 best_model.log（BS64，OA~92.6%）：piecewise_two_step + 两阶乘子
 SCHED_STEP_RATIOS = [0.6, 0.7]
 SCHED_GAMMAS = [0.4, 0.1]
+SCHEDULER_NAME = 'piecewise_two_step'
+# 仅 MMDIFF_SCHEDULER_NAME=cosine 时生效
+SCHEDULER_COSINE_ETA_MIN_RATIO = 0.01
+SCHEDULER_COSINE_WARMUP_RATIO = 0.0
+SCHEDULER_COSINE_WARMUP_STEPS = 0
+
+
+def _apply_scheduler_env():
+    global SCHED_STEP_RATIOS, SCHED_GAMMAS, SCHEDULER_NAME
+    global SCHEDULER_COSINE_ETA_MIN_RATIO, SCHEDULER_COSINE_WARMUP_RATIO, SCHEDULER_COSINE_WARMUP_STEPS
+
+    def _parse_csv_floats(name: str):
+        raw = (os.environ.get(name) or '').strip()
+        if not raw:
+            return None
+        return [float(x.strip()) for x in raw.split(',') if x.strip()]
+
+    sr = _parse_csv_floats('MMDIFF_SCHED_STEP_RATIOS')
+    if sr is not None and len(sr) >= 2:
+        SCHED_STEP_RATIOS = sr
+    sg = _parse_csv_floats('MMDIFF_SCHED_GAMMAS')
+    if sg is not None and len(sg) >= 2:
+        SCHED_GAMMAS = sg
+    s = (os.environ.get('MMDIFF_SCHEDULER_NAME') or '').strip()
+    if s:
+        SCHEDULER_NAME = s
+    for env_k, gk, cast in (
+        ('MMDIFF_SCHED_COSINE_ETA_MIN_RATIO', 'SCHEDULER_COSINE_ETA_MIN_RATIO', float),
+        ('MMDIFF_SCHED_COSINE_WARMUP_RATIO', 'SCHEDULER_COSINE_WARMUP_RATIO', float),
+        ('MMDIFF_SCHED_COSINE_WARMUP_STEPS', 'SCHEDULER_COSINE_WARMUP_STEPS', int),
+    ):
+        v = (os.environ.get(env_k) or '').strip()
+        if v:
+            globals()[gk] = cast(v)
+
+
+_apply_scheduler_env()
 CLIP_GRAD_NORM = 1.0
 EVAL_VAL_START_EPOCH = 20
 LEARNING_RATE = 6e-4
@@ -237,12 +272,18 @@ CLS_TRANSFORMER_FF_DIM = 512
 CLS_HEAD_HIDDEN = 128
 
 
-def build_opt():
-    """完整训练配置 """
-    inner = STUDENT_CHANNELS[0]
-    mult = [c // inner for c in STUDENT_CHANNELS]
-    # 两阶分段衰减，见 SCHED_STEP_RATIOS / SCHED_GAMMAS；仍支持仅 constant_ratio+gamma 的旧 dict
-    sched = OrderedDict(
+def _train_scheduler_dict():
+    """按 SCHEDULER_NAME 只写入当前形态所需字段，避免 opt 里一堆无关键。"""
+    if SCHEDULER_NAME.lower() in ('cosine', 'cosine_annealing'):
+        return OrderedDict(
+            [
+                ('name', 'cosine'),
+                ('eta_min_ratio', SCHEDULER_COSINE_ETA_MIN_RATIO),
+                ('warmup_ratio', SCHEDULER_COSINE_WARMUP_RATIO),
+                ('warmup_steps', SCHEDULER_COSINE_WARMUP_STEPS),
+            ]
+        )
+    return OrderedDict(
         [
             ('name', 'piecewise_two_step'),
             ('step_ratios', list(SCHED_STEP_RATIOS)),
@@ -251,6 +292,13 @@ def build_opt():
             ('gamma', 0.1),
         ]
     )
+
+
+def build_opt():
+    """完整训练配置 """
+    inner = STUDENT_CHANNELS[0]
+    mult = [c // inner for c in STUDENT_CHANNELS]
+    sched = _train_scheduler_dict()
     ds = OrderedDict(
         [
             ('name', 'Houston2018'),
@@ -437,6 +485,7 @@ def _apply_mmdiff_env_overrides():
     MMDIFF_EARLY_STOPPING_PATIENCE → EARLY_STOPPING_PATIENCE（0=关闭早停）
     MMDIFF_RESUME_CHECKPOINT → 覆盖 RESUME_CHECKPOINT
     MMDIFF_SCHEDULER_LR_TOTAL_STEPS → opt['scheduler_lr_total_steps']（续训边界；旧 checkpoint 无该字段时手动设）
+    MMDIFF_SCHEDULER_NAME / MMDIFF_SCHED_STEP_RATIOS / MMDIFF_SCHED_GAMMAS / MMDIFF_SCHED_COSINE_* → 见文件头 SCHEDULER_*
     （扩散 t 列表由模块加载时读取 MMDIFF_DIFFUSION_TIMESTEPS，见 _cls_diffusion_timesteps_from_env）
     """
     g = globals()

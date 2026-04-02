@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# 用法见文末「run.sh help」；无参数 = 旧版行为（主训练 + 关机）。
+# 用法见文末「run.sh help」；无参数 = 主训练（BS64 / SupCon / gate_before_pool）+ 关机。
+# TB/checkpoint 目录默认短名：{时间戳}_e{NN}_lr{标签}（见 logging_utils.prepare_tb_run_dir）；长目录名：MMDIFF_TB_LONG_TAG=1
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 cd "$ROOT"
@@ -22,17 +23,16 @@ usage() {
   cat <<'EOF'
 用法: bash run.sh [子命令]
 
-  无参数     主训练（BS64 / SupCon / gate_before_pool），结束后执行关机（与旧版一致）
-  baseline   同上主训练，不关机
-  exp1       关 SupCon，BS64
-  exp2       BS512 + weight_decay=2e-4
-  exp3       BS512 + wd=2e-4 + 线性 LR=4.8e-3
-  sanity     HSI 分支自检（秒级）；可传参，如: bash run.sh sanity --batch 4
-  all        串行 sanity → baseline → exp1 → exp2 → exp3；失败不中断；终端+日志双写
+  无参数     主训练 exp1（BS64 / SupCon / gate_before_pool），结束后关机（与旧版一致）
+  exp1       BS64 + SupCon（与无参数相同，不关机）
+  exp2       BS512 + wd=2e-4 + lr=1e-4（调度同 param 默认 piecewise）
+  exp3       BS512 + wd=2e-4 + lr=2e-3（高 lr 对照）
+  sanity     HSI 分支自检（秒级，需时手动跑）；可传参，如: bash run.sh sanity --batch 4
+  all        串行 exp1 → exp2 → exp3（不含 sanity）；失败不中断；终端+日志双写
   help       本说明
 
-  可选环境变量: MMDIFF_*（见 param.py）、MMDIFF_OVERNIGHT_LOG（汇总日志路径）、
-  MMDIFF_SHUTDOWN_AT_END=1（仅 bash run.sh all 全部结束后关机）
+  可选环境变量: MMDIFF_*（见 param.py）、MMDIFF_OVERNIGHT_LOG、MMDIFF_SHUTDOWN_AT_END=1（all 结束后关机）
+  余弦调度: MMDIFF_SCHEDULER_NAME=cosine（默认 piecewise，与 best_model.log 一致）
 
 示例:
   bash run.sh all
@@ -69,19 +69,25 @@ do_shutdown() {
   done
 }
 
+# 单次训练：统一时间戳（便于 overnight 流水线对齐）；日志目录见 prepare_tb_run_dir
+_export_run_tag_exp1() {
+  export MMDIFF_USE_SUPCON="${MMDIFF_USE_SUPCON:-1}"
+  export MMDIFF_BATCH_SIZE=64
+  export MMDIFF_EXPERIMENT_NUM=1
+  export MMDIFF_LR_TAG=6e-4
+  export MMDIFF_EXPERIMENT_TAG="${PREFIX}_${SC}_B6_H96_SE16_BS64_gate_before_pool"
+}
+
 # ---------------------------------------------------------------------------
-# 无参数：旧版 = 主训练 + 关机
+# 无参数：旧版 = exp1 + 关机
 # ---------------------------------------------------------------------------
 if [ $# -eq 0 ]; then
   setup_common
-  export MMDIFF_USE_SUPCON="${MMDIFF_USE_SUPCON:-1}"
-  export MMDIFF_BATCH_SIZE=64
-  export MMDIFF_EXPERIMENT_TAG="${PREFIX}_${SC}_B6_H96_SE16_BS64_gate_before_pool"
-  echo "run: ${MMDIFF_EXPERIMENT_TAG}"
+  export MMDIFF_RUN_TIMESTAMP="${MMDIFF_RUN_TIMESTAMP:-$(date +%Y%m%d-%H%M%S)}"
+  _export_run_tag_exp1
+  echo "run: ${MMDIFF_EXPERIMENT_TAG} | exp=${MMDIFF_EXPERIMENT_NUM} lr=${MMDIFF_LR_TAG}"
   python main.py
-  # curl "https://sctapi.ftqq.com/SCT313662TGZ7JRPbisBQfDZbabO1Kmmdt.send?title=训练完成&desp=Python脚本已执行完毕channel=9"
   do_shutdown
-  # curl "https://sctapi.ftqq.com/SCT313662TGZ7JRPbisBQfDZbabO1Kmmdt.send?title=服务器关闭失败&desp=服务器关闭失败channel=9"
   exit 0
 fi
 
@@ -89,20 +95,11 @@ case "$1" in
   help|-h|--help)
     usage
     ;;
-  baseline)
-    setup_common
-    export MMDIFF_USE_SUPCON=1
-    export MMDIFF_BATCH_SIZE=64
-    export MMDIFF_EXPERIMENT_TAG="${PREFIX}_${SC}_B6_H96_SE16_BS64_gate_before_pool"
-    echo "=== ${MMDIFF_EXPERIMENT_TAG} ==="
-    python main.py
-    ;;
   exp1)
     setup_common
-    export MMDIFF_USE_SUPCON=0
-    export MMDIFF_BATCH_SIZE=64
-    export MMDIFF_EXPERIMENT_TAG="${PREFIX}_${SC}_B6_H96_SE16_BS64_gate_before_pool_nosupcon"
-    echo "=== ${MMDIFF_EXPERIMENT_TAG} ==="
+    export MMDIFF_RUN_TIMESTAMP="${MMDIFF_RUN_TIMESTAMP:-$(date +%Y%m%d-%H%M%S)}"
+    _export_run_tag_exp1
+    echo "=== ${MMDIFF_EXPERIMENT_TAG} | exp=${MMDIFF_EXPERIMENT_NUM} lr=${MMDIFF_LR_TAG} ==="
     python main.py
     ;;
   exp2)
@@ -110,8 +107,12 @@ case "$1" in
     export MMDIFF_USE_SUPCON=1
     export MMDIFF_BATCH_SIZE=512
     export MMDIFF_WEIGHT_DECAY=2e-4
+    export MMDIFF_LEARNING_RATE=1e-4
+    export MMDIFF_EXPERIMENT_NUM=2
+    export MMDIFF_LR_TAG=1e-4
     export MMDIFF_EXPERIMENT_TAG="${PREFIX}_${SC}_B6_H96_SE16_BS512_wd2e4_gate_before_pool"
-    echo "=== ${MMDIFF_EXPERIMENT_TAG} ==="
+    export MMDIFF_RUN_TIMESTAMP="${MMDIFF_RUN_TIMESTAMP:-$(date +%Y%m%d-%H%M%S)}"
+    echo "=== ${MMDIFF_EXPERIMENT_TAG} | exp=${MMDIFF_EXPERIMENT_NUM} lr=${MMDIFF_LR_TAG} ==="
     python main.py
     ;;
   exp3)
@@ -119,9 +120,12 @@ case "$1" in
     export MMDIFF_USE_SUPCON=1
     export MMDIFF_BATCH_SIZE=512
     export MMDIFF_WEIGHT_DECAY=2e-4
-    export MMDIFF_LEARNING_RATE=4.8e-3
-    export MMDIFF_EXPERIMENT_TAG="${PREFIX}_${SC}_B6_H96_SE16_BS512_wd2e4_lr4p8e3_gate_before_pool"
-    echo "=== ${MMDIFF_EXPERIMENT_TAG} ==="
+    export MMDIFF_LEARNING_RATE=2e-3
+    export MMDIFF_EXPERIMENT_NUM=3
+    export MMDIFF_LR_TAG=2e-3
+    export MMDIFF_EXPERIMENT_TAG="${PREFIX}_${SC}_B6_H96_SE16_BS512_wd2e4_gate_before_pool"
+    export MMDIFF_RUN_TIMESTAMP="${MMDIFF_RUN_TIMESTAMP:-$(date +%Y%m%d-%H%M%S)}"
+    echo "=== ${MMDIFF_EXPERIMENT_TAG} | exp=${MMDIFF_EXPERIMENT_NUM} lr=${MMDIFF_LR_TAG} ==="
     python main.py
     ;;
   sanity)
@@ -130,15 +134,14 @@ case "$1" in
     ;;
   all)
     LOG="${MMDIFF_OVERNIGHT_LOG:-$ROOT/overnight_$(date +%Y%m%d_%H%M%S).log}"
+    PIPE_TS="$(date +%Y%m%d-%H%M%S)"
     (
       set +e
-      log "pipeline | log: $LOG"
+      log "pipeline | log: $LOG | PIPE_TS=$PIPE_TS (export MMDIFF_RUN_TIMESTAMP=$PIPE_TS for each step for aligned dirs)"
       FAILED=0
-      run_step sanity bash "$ROOT/run.sh" sanity || FAILED=$((FAILED + 1))
-      run_step baseline bash "$ROOT/run.sh" baseline || FAILED=$((FAILED + 1))
-      run_step exp1 bash "$ROOT/run.sh" exp1 || FAILED=$((FAILED + 1))
-      run_step exp2 bash "$ROOT/run.sh" exp2 || FAILED=$((FAILED + 1))
-      run_step exp3 bash "$ROOT/run.sh" exp3 || FAILED=$((FAILED + 1))
+      MMDIFF_RUN_TIMESTAMP="$PIPE_TS" run_step exp1 bash "$ROOT/run.sh" exp1 || FAILED=$((FAILED + 1))
+      MMDIFF_RUN_TIMESTAMP="$PIPE_TS" run_step exp2 bash "$ROOT/run.sh" exp2 || FAILED=$((FAILED + 1))
+      MMDIFF_RUN_TIMESTAMP="$PIPE_TS" run_step exp3 bash "$ROOT/run.sh" exp3 || FAILED=$((FAILED + 1))
       log "pipeline finished | failed_steps=$FAILED (0=all ok)"
       if [ "${MMDIFF_SHUTDOWN_AT_END:-0}" = "1" ]; then
         log "MMDIFF_SHUTDOWN_AT_END=1 -> shutdown"

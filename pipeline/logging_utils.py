@@ -7,6 +7,8 @@ from pathlib import Path
 import numpy as np
 import torch.nn as nn
 
+import math
+
 from param import (
     BEST_MODEL_FILENAME,
     BATCH_SIZE,
@@ -75,18 +77,72 @@ def _compare_run_name_without_timestamp() -> str:
     return f'{model}_{combo_safe}_{cfg}'
 
 
+def _lr_slug_for_run_dir() -> str:
+    """目录名用短 lr 字符串；优先 MMDIFF_LR_TAG，否则由 LEARNING_RATE 生成。"""
+    raw = (os.environ.get('MMDIFF_LR_TAG') or '').strip()
+    if raw:
+        return re.sub(r'[^\w\-.]', '_', raw)
+    lr = float(LEARNING_RATE)
+    if lr == 0.0:
+        return '0'
+    exp = int(math.floor(math.log10(abs(lr))))
+    mant = lr / (10**exp)
+    # 常见 1e-4、6e-4、4.8e-3 等用紧凑科学计数
+    if abs(mant - 1.0) < 1e-12:
+        return f'1e{exp}'
+    if abs(mant - 6.0) < 1e-12 and exp == -4:
+        return '6e-4'
+    if abs(mant - 4.8) < 1e-12 and exp == -3:
+        return '4p8e-3'
+    return re.sub(r'[^\w\-.]', '_', f'{lr:g}')
+
+
+def _compact_tb_tag(tag: str, max_len: int = 40) -> str:
+    """去掉冗长前缀，截断，便于 TensorBoard 侧栏显示。"""
+    safe = re.sub(r'[^\w\-.]', '_', tag.strip())
+    for prefix in ('multimodal_hsi_rgb_lidar_', 'multimodal_'):
+        if safe.startswith(prefix):
+            safe = safe[len(prefix) :]
+            break
+    if len(safe) > max_len:
+        safe = safe[:max_len]
+    return safe or 'run'
+
+
 def prepare_tb_run_dir():
-    """与 TensorBoard 使用同一 run 目录（TB_LOG_ROOT / run_name）。"""
+    """与 TensorBoard 使用同一 run 目录（TB_LOG_ROOT / run_name）。
+
+    默认短名（便于 TB 看图）：``{ts}_e{NN}_lr{slug}`` 或 ``{ts}_{紧凑tag}``。
+    完整实验描述仍在环境变量 MMDIFF_EXPERIMENT_TAG / metrics_summary 中。
+    长目录名：``MMDIFF_TB_LONG_TAG=1`` 时在 e+lr 后再拼完整 EXPERIMENT_TAG。
+    """
     TB_LOG_ROOT.mkdir(parents=True, exist_ok=True)
     tag = os.environ.get('MMDIFF_EXPERIMENT_TAG', '').strip()
-    ts = datetime.now().strftime('%Y%m%d-%H%M%S')
+    ts = (os.environ.get('MMDIFF_RUN_TIMESTAMP') or '').strip() or datetime.now().strftime('%Y%m%d-%H%M%S')
     prefix = (RUN_NAME_PREFIX or '').strip()
-    if tag:
-        safe = re.sub(r'[^\w\-.]', '_', tag)
-        if prefix:
-            run_name = f'{prefix}_{safe}_{ts}'
+    exp_raw = (os.environ.get('MMDIFF_EXPERIMENT_NUM') or '').strip()
+    want_long = (os.environ.get('MMDIFF_TB_LONG_TAG') or '').strip().lower() in ('1', 'true', 'yes', 'y')
+
+    if exp_raw:
+        try:
+            exp_n = int(exp_raw)
+            exp_part = f'e{exp_n:02d}'
+        except ValueError:
+            exp_part = 'eXX'
+        lr_slug = _lr_slug_for_run_dir()
+        run_name = f'{ts}_{exp_part}_lr{lr_slug}'
+        if want_long and tag:
+            safe = re.sub(r'[^\w\-.]', '_', tag)
+            run_name = f'{run_name}_{safe}'
+    elif tag:
+        if want_long:
+            safe = re.sub(r'[^\w\-.]', '_', tag)
         else:
-            run_name = f'{safe}_{ts}'
+            safe = _compact_tb_tag(tag)
+        if prefix:
+            run_name = f'{prefix}_{ts}_{safe}'
+        else:
+            run_name = f'{ts}_{safe}'
     else:
         if _is_compare_run():
             body = _compare_run_name_without_timestamp()
