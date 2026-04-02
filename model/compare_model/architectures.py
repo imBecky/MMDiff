@@ -11,6 +11,7 @@ import torch.nn.functional as F
 from .base import CompareClassifierBase
 from .exvit_core import MViTBackbone
 from .fusatnet_core import FusAtNetBackbone
+from .two_branch_cnn_core import TwoBranchCNNBackbone
 
 
 # ---------------------------------------------------------------------------
@@ -87,6 +88,42 @@ class ExViTClassifier(CompareClassifierBase):
             'separable1': self.net.separable1,
             'separable2': self.net.separable2,
         })
+        self._init_optimizer_and_scheduler()
+
+    def forward(
+        self,
+        data_dict: Dict[str, torch.Tensor],
+        return_center_logits: bool = False,
+        return_supcon_proj: bool = False,
+    ):
+        hsi, lidar = self._hsi_lidar(data_dict)
+        logits = self.net(hsi, lidar)
+        if return_center_logits:
+            return logits, logits
+        if return_supcon_proj:
+            raise RuntimeError('对比模型未启用 SupCon')
+        return logits
+
+
+# ---------------------------------------------------------------------------
+# Two-branch CNN（Xu et al. TGRS 2017 — BUCT Keras 仓库的 PyTorch 版）
+# https://github.com/BUCT-Vision/Two-branch-CNN-Multisource-RS-classification
+# ---------------------------------------------------------------------------
+
+
+class TwoBranchCNNClassifier(CompareClassifierBase):
+    """双分支 CNN：HSI 空间 CNN + 中心光谱 1D CNN + LiDAR cascade，融合后分类。"""
+
+    def __init__(self, opt, diffusion=None):
+        super().__init__(opt, diffusion)
+        patch_size = int(self.opt.get('dataset', {}).get('patch_size') or 11)
+        self.net = TwoBranchCNNBackbone(
+            patch_size=patch_size,
+            hsi_channels=self.hsi_channels,
+            lidar_channels=self.lidar_channels,
+            num_classes=self.num_classes,
+        )
+        self.projections = nn.ModuleDict()
         self._init_optimizer_and_scheduler()
 
     def forward(

@@ -6,7 +6,12 @@ from typing import Any, Callable, Dict, Type
 
 import torch.nn as nn
 
-from .architectures import ExViTClassifier, FGCNNClassifier, FusAtNetClassifier
+from .architectures import (
+    ExViTClassifier,
+    FGCNNClassifier,
+    FusAtNetClassifier,
+    TwoBranchCNNClassifier,
+)
 
 CompareFactory = Callable[[Any, Any], nn.Module]
 
@@ -21,6 +26,11 @@ REGISTRY: Dict[str, Type[nn.Module]] = {
     'exvit': ExViTClassifier,
     'mvit': ExViTClassifier,
     'ex_vit': ExViTClassifier,
+    # Xu et al. 2017 双分支 CNN（BUCT Keras 仓库 PyTorch 复现）
+    'two_branch_cnn': TwoBranchCNNClassifier,
+    'two_branch': TwoBranchCNNClassifier,
+    'twobranch_cnn': TwoBranchCNNClassifier,
+    'xu2017_ms': TwoBranchCNNClassifier,
 }
 
 
