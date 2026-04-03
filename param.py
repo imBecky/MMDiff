@@ -8,13 +8,14 @@ import utils.logger as Logger
 # ---------------------------------------------------------------------------
 # 数据与训练（常用修改处）
 # ---------------------------------------------------------------------------
-# 默认对齐 best_model.log（BS64，OA~92.6%）：piecewise_two_step + 两阶乘子
+# 直接 python main.py（无 MMDIFF_*）：piecewise_two_step + 两阶乘子；曾对齐 best_model.log（BS64）
+# run.sh exp1 默认通过环境变量改为 cosine + lr=1e-3 + warmup 5%（见 run.sh setup_common）
 SCHED_STEP_RATIOS = [0.6, 0.7]
 SCHED_GAMMAS = [0.4, 0.1]
 SCHEDULER_NAME = 'piecewise_two_step'
-# 仅 MMDIFF_SCHEDULER_NAME=cosine 时生效
+# 仅 MMDIFF_SCHEDULER_NAME=cosine 时生效；warmup_ratio 为总 optimizer step 的占比（每 epoch 步数固定时等价于总轮数的相同比例）
 SCHEDULER_COSINE_ETA_MIN_RATIO = 0.01
-SCHEDULER_COSINE_WARMUP_RATIO = 0.0
+SCHEDULER_COSINE_WARMUP_RATIO = 0.05
 SCHEDULER_COSINE_WARMUP_STEPS = 0
 
 
@@ -169,7 +170,7 @@ EVAL_INTERVAL_EPOCHS = 5
 
 # 早停：仅在「实际跑完验证集评估」时计数；连续 patience 次 OA 未严格超过历史最优则结束。0=关闭。
 # 环境变量：MMDIFF_EARLY_STOPPING_PATIENCE
-EARLY_STOPPING_PATIENCE = 0
+EARLY_STOPPING_PATIENCE = 15
 
 USE_CENTER_LOSS = True
 LOSS_WEIGHT_GLOBAL = 0.2
@@ -246,6 +247,14 @@ FEAT_SCALES = [
     'mid_block',
     'up_blocks.1',
 ]
+
+# RGB 分支：diffusion=在线冻结学生 UNet；student=轻量 CNN；cached_teacher=离线 token（需 batch 注入 rgb_teacher_tokens）
+RGB_SOURCE = (os.environ.get('MMDIFF_RGB_SOURCE') or 'diffusion').strip().lower()
+RGB_TEACHER_TOKEN_CACHE_TRAIN = DATA_DIR / 'rgb_teacher_tokens_train.npy'
+RGB_TEACHER_TOKEN_META_TRAIN = DATA_DIR / 'rgb_teacher_tokens_train.meta.json'
+RGB_TEACHER_TOKEN_CACHE_TEST = DATA_DIR / 'rgb_teacher_tokens_test.npy'
+RGB_TEACHER_TOKEN_META_TEST = DATA_DIR / 'rgb_teacher_tokens_test.meta.json'
+RGB_STUDENT_CHECKPOINT = (os.environ.get('MMDIFF_RGB_STUDENT_CHECKPOINT') or '').strip()
 
 def _cls_diffusion_timesteps_from_env():
     """run.sh 可 export MMDIFF_DIFFUSION_TIMESTEPS=50,100,150,200（逗号分隔）覆盖默认。"""
@@ -400,6 +409,8 @@ def build_opt():
             ('resume_state', None),
             ('enabled_modalities', list(ENABLED_MODALITIES)),
             ('modality_combo', MODALITY_COMBO),
+            ('rgb_source', (os.environ.get('MMDIFF_RGB_SOURCE') or 'diffusion').strip().lower()),
+            ('rgb_student_checkpoint', RGB_STUDENT_CHECKPOINT or None),
         ]
     )
     path = OrderedDict(
@@ -487,6 +498,7 @@ def _apply_mmdiff_env_overrides():
     MMDIFF_SCHEDULER_LR_TOTAL_STEPS → opt['scheduler_lr_total_steps']（续训边界；旧 checkpoint 无该字段时手动设）
     MMDIFF_SCHEDULER_NAME / MMDIFF_SCHED_STEP_RATIOS / MMDIFF_SCHED_GAMMAS / MMDIFF_SCHED_COSINE_* → 见文件头 SCHEDULER_*
     （扩散 t 列表由模块加载时读取 MMDIFF_DIFFUSION_TIMESTEPS，见 _cls_diffusion_timesteps_from_env）
+    MMDIFF_FREEZE_RGB_STUDENT=1 → rgb_source=student 时冻结轻量 RGB 编码器并重建优化器（续训 resume 时不走该分支）
     """
     g = globals()
 
@@ -572,6 +584,19 @@ def _apply_mmdiff_env_overrides():
 
     opt['train']['optimizer']['lr'] = float(g['LEARNING_RATE'])
     opt['train']['optimizer']['weight_decay'] = float(g['WEIGHT_DECAY'])
+
+    rs = (os.environ.get('MMDIFF_RGB_SOURCE') or '').strip().lower()
+    if rs:
+        if rs not in ('diffusion', 'student', 'cached_teacher'):
+            raise ValueError(
+                f'MMDIFF_RGB_SOURCE 须为 diffusion|student|cached_teacher，当前 {rs!r}'
+            )
+        g['RGB_SOURCE'] = rs
+        opt['model_cls']['rgb_source'] = rs
+    rsc = (os.environ.get('MMDIFF_RGB_STUDENT_CHECKPOINT') or '').strip()
+    if rsc:
+        g['RGB_STUDENT_CHECKPOINT'] = rsc
+        opt['model_cls']['rgb_student_checkpoint'] = rsc
 
     resume_p = (os.environ.get('MMDIFF_RESUME_CHECKPOINT') or '').strip()
     if resume_p:

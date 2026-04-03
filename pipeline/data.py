@@ -107,14 +107,16 @@ def _tensorize_view_from_crops(
     if rgb_hwc is not None:
         rp = _apply_rot_k(rgb_hwc, rk)
         rgb = _patch_array_to_float32(np.transpose(rp, (2, 0, 1)))
-        return torch.from_numpy(hsi), torch.from_numpy(lidar), torch.from_numpy(rgb)
-    return torch.from_numpy(hsi), torch.from_numpy(lidar)
+        return torch.from_numpy(hsi), torch.from_numpy(lidar), torch.from_numpy(rgb), int(rk)
+    return torch.from_numpy(hsi), torch.from_numpy(lidar), int(rk)
 
 
 class PatchDataset(torch.utils.data.Dataset):
     """
     feats: (H,W,C) HSI+LiDAR；rgb: (H,W,3) 或 None。
     indices: (N,3) [label, row, col]，label 已为 0..NUM_CLASSES-1。
+    global_row_indices: 与 indices 等长，第 i 条样本在对应 labels 表中的行号（train_labels.npy 或 test_labels.npy），
+用于 teacher 特征缓存与可复现噪声；若省略则沿用 __getitem__ 的局部 index（兼容旧行为）。
     """
 
     def __init__(
@@ -127,6 +129,7 @@ class PatchDataset(torch.utils.data.Dataset):
         training: bool,
         rot_factor: int = 1,
         supcon_dual_view: bool = False,
+        global_row_indices: Optional[np.ndarray] = None,
     ):
         super().__init__()
         self.feats = feats_vol
@@ -136,6 +139,15 @@ class PatchDataset(torch.utils.data.Dataset):
         self.training = training
         self.rot_factor = int(rot_factor)
         self.supcon_dual_view = bool(supcon_dual_view)
+        if global_row_indices is not None:
+            gr = np.asarray(global_row_indices, dtype=np.int64).reshape(-1)
+            if gr.shape[0] != len(self.indices):
+                raise ValueError(
+                    f'global_row_indices 长度 {gr.shape[0]} 与 indices 行数 {len(self.indices)} 不一致'
+                )
+            self.global_row_indices = gr
+        else:
+            self.global_row_indices = None
 
     def __len__(self):
         return len(self.indices)
@@ -146,26 +158,31 @@ class PatchDataset(torch.utils.data.Dataset):
         col = int(self.indices[index, 2])
         w = self.window_size
         fp = _crop_patch_hwc(self.feats, row, col, w)
-        idx = torch.tensor(index, dtype=torch.long)
+        global_row = int(self.global_row_indices[index]) if self.global_row_indices is not None else int(index)
         lab_t = torch.tensor(lab, dtype=torch.long)
+        gr_t = torch.tensor(global_row, dtype=torch.long)
 
         if self.training and self.supcon_dual_view:
             if self.rgb is not None:
                 rp = _crop_patch_hwc(self.rgb, row, col, w)
-                h1, l1, r1 = _tensorize_view_from_crops(
+                h1, l1, r1, rk1 = _tensorize_view_from_crops(
                     fp, rp, rot_factor=self.rot_factor, training=self.training,
                 )
-                h2, l2, r2 = _tensorize_view_from_crops(
+                h2, l2, r2, rk2 = _tensorize_view_from_crops(
                     fp, rp, rot_factor=self.rot_factor, training=self.training,
                 )
-                return h1, l1, r1, h2, l2, r2, lab_t, idx
-            h1, l1 = _tensorize_view_from_crops(
+                rk1_t = torch.tensor(rk1, dtype=torch.long)
+                rk2_t = torch.tensor(rk2, dtype=torch.long)
+                return h1, l1, r1, h2, l2, r2, lab_t, gr_t, rk1_t, rk2_t
+            h1, l1, rk1 = _tensorize_view_from_crops(
                 fp, None, rot_factor=self.rot_factor, training=self.training,
             )
-            h2, l2 = _tensorize_view_from_crops(
+            h2, l2, rk2 = _tensorize_view_from_crops(
                 fp, None, rot_factor=self.rot_factor, training=self.training,
             )
-            return h1, l1, h2, l2, lab_t, idx
+            rk1_t = torch.tensor(rk1, dtype=torch.long)
+            rk2_t = torch.tensor(rk2, dtype=torch.long)
+            return h1, l1, h2, l2, lab_t, gr_t, rk1_t, rk2_t
 
         rk = _random_rot_k(self.rot_factor) if self.training and self.rot_factor > 1 else 0
         fp = _apply_rot_k(fp, rk)
@@ -173,6 +190,7 @@ class PatchDataset(torch.utils.data.Dataset):
         lidar = _patch_array_to_float32(
             np.transpose(fp[:, :, HSI_CHANNELS : HSI_CHANNELS + LIDAR_CHANNELS], (2, 0, 1))
         )
+        rk_t = torch.tensor(int(rk), dtype=torch.long)
         if self.rgb is not None:
             rp = _crop_patch_hwc(self.rgb, row, col, w)
             rp = _apply_rot_k(rp, rk)
@@ -182,13 +200,15 @@ class PatchDataset(torch.utils.data.Dataset):
                 torch.from_numpy(lidar),
                 torch.from_numpy(rgb),
                 lab_t,
-                idx,
+                gr_t,
+                rk_t,
             )
         return (
             torch.from_numpy(hsi),
             torch.from_numpy(lidar),
             lab_t,
-            idx,
+            gr_t,
+            rk_t,
         )
 
 
@@ -249,18 +269,24 @@ def split_train_val_indices(
     train_indices: np.ndarray,
     val_ratio: float,
     seed: int,
-) -> Tuple[np.ndarray, Optional[np.ndarray]]:
+) -> Tuple[np.ndarray, Optional[np.ndarray], np.ndarray, Optional[np.ndarray]]:
+    """
+    返回 (train_rows, val_rows, train_positions, val_positions)。
+    train_positions[i] / val_positions[j] 为样本在原始 train_indices（即 train_labels.npy 行序）中的行号，用于 teacher 缓存与稳定噪声。
+    """
+    n = len(train_indices)
+    all_pos = np.arange(n, dtype=np.int64)
     if val_ratio <= 0 or val_ratio >= 1.0:
-        return train_indices, None
+        return train_indices, None, all_pos, None
     labels = train_indices[:, 0]
-    idx = np.arange(len(train_indices))
+    idx = np.arange(n)
     train_idx, val_idx = train_test_split(
         idx,
         test_size=val_ratio,
         random_state=seed,
         stratify=labels,
     )
-    return train_indices[train_idx], train_indices[val_idx]
+    return train_indices[train_idx], train_indices[val_idx], train_idx.astype(np.int64), val_idx.astype(np.int64)
 
 
 def build_test_loader(
@@ -268,7 +294,11 @@ def build_test_loader(
     rgb_vol: Optional[np.ndarray],
     test_indices: np.ndarray,
     batch_size: int,
+    *,
+    global_row_indices: Optional[np.ndarray] = None,
 ) -> DataLoader:
+    if global_row_indices is None:
+        global_row_indices = np.arange(len(test_indices), dtype=np.int64)
     ds = PatchDataset(
         feats_vol,
         rgb_vol,
@@ -277,6 +307,7 @@ def build_test_loader(
         training=False,
         rot_factor=1,
         supcon_dual_view=False,
+        global_row_indices=global_row_indices,
     )
     pin_memory = torch.cuda.is_available()
     return DataLoader(
@@ -297,6 +328,9 @@ def build_dataloaders(
     batch_size: int,
     *,
     defer_test: bool,
+    train_global_rows: Optional[np.ndarray] = None,
+    val_global_rows: Optional[np.ndarray] = None,
+    test_global_rows: Optional[np.ndarray] = None,
 ):
     pin_memory = torch.cuda.is_available()
     rot = int(TRAIN_ROT_AUGMENT_FACTOR)
@@ -311,6 +345,7 @@ def build_dataloaders(
         training=True,
         rot_factor=rot,
         supcon_dual_view=USE_SUPCON,
+        global_row_indices=train_global_rows,
     )
     train_loader = DataLoader(
         train_ds,
@@ -330,6 +365,7 @@ def build_dataloaders(
             training=False,
             rot_factor=1,
             supcon_dual_view=False,
+            global_row_indices=val_global_rows,
         )
         val_loader = DataLoader(
             val_ds,
@@ -341,42 +377,84 @@ def build_dataloaders(
 
     test_loader = None
     if not defer_test and test_idx is not None and len(test_idx) > 0:
-        test_loader = build_test_loader(feats_vol, rgb_vol, test_idx, batch_size)
+        tgr = test_global_rows
+        if tgr is None:
+            tgr = np.arange(len(test_idx), dtype=np.int64)
+        test_loader = build_test_loader(
+            feats_vol, rgb_vol, test_idx, batch_size, global_row_indices=tgr,
+        )
 
     return train_loader, val_loader, test_loader
 
 
 def batch_to_dict(batch, device, use_rgb_patches: bool, use_supcon: bool = False):
+    """将 DataLoader batch 转为模型输入 dict；sample_indices 使用全局行号（与 train_labels/test_labels 对齐）。"""
     if use_supcon:
         if use_rgb_patches:
-            hsi1, lidar1, rgb1, hsi2, lidar2, rgb2, labels, sample_indices = batch
+            hsi1, lidar1, rgb1, hsi2, lidar2, rgb2, labels, gr, rk1, rk2 = batch
             hsi = torch.cat([hsi1, hsi2], dim=0).to(device=device, dtype=torch.float32)
             lidar = torch.cat([lidar1, lidar2], dim=0).to(device=device, dtype=torch.float32)
             rgb = torch.cat([rgb1, rgb2], dim=0).to(device=device, dtype=torch.float32)
             labels = labels.to(device).long()
             labels = torch.cat([labels, labels], dim=0)
-            sample_indices = sample_indices.to(device=device, dtype=torch.long)
-            sample_indices = torch.cat([sample_indices, sample_indices], dim=0)
-            return {'hsi': hsi, 'lidar': lidar, 'rgb': rgb, 'sample_indices': sample_indices}, labels
-        hsi1, lidar1, hsi2, lidar2, labels, sample_indices = batch
+            gr = gr.to(device=device, dtype=torch.long)
+            gr = torch.cat([gr, gr], dim=0)
+            rk = torch.cat(
+                [rk1.to(device=device, dtype=torch.long), rk2.to(device=device, dtype=torch.long)],
+                dim=0,
+            )
+            return {
+                'hsi': hsi,
+                'lidar': lidar,
+                'rgb': rgb,
+                'sample_indices': gr,
+                'global_row': gr,
+                'rot_k': rk,
+            }, labels
+        hsi1, lidar1, hsi2, lidar2, labels, gr, rk1, rk2 = batch
         hsi = torch.cat([hsi1, hsi2], dim=0).to(device=device, dtype=torch.float32)
         lidar = torch.cat([lidar1, lidar2], dim=0).to(device=device, dtype=torch.float32)
         labels = labels.to(device).long()
         labels = torch.cat([labels, labels], dim=0)
-        sample_indices = sample_indices.to(device=device, dtype=torch.long)
-        sample_indices = torch.cat([sample_indices, sample_indices], dim=0)
-        return {'hsi': hsi, 'lidar': lidar, 'sample_indices': sample_indices}, labels
+        gr = gr.to(device=device, dtype=torch.long)
+        gr = torch.cat([gr, gr], dim=0)
+        rk = torch.cat(
+            [rk1.to(device=device, dtype=torch.long), rk2.to(device=device, dtype=torch.long)],
+            dim=0,
+        )
+        return {
+            'hsi': hsi,
+            'lidar': lidar,
+            'sample_indices': gr,
+            'global_row': gr,
+            'rot_k': rk,
+        }, labels
     if use_rgb_patches:
-        hsi, lidar, rgb, labels, sample_indices = batch
+        hsi, lidar, rgb, labels, gr, rk = batch
         hsi = hsi.to(device=device, dtype=torch.float32)
         lidar = lidar.to(device=device, dtype=torch.float32)
         rgb = rgb.to(device=device, dtype=torch.float32)
         labels = labels.to(device).long()
-        sample_indices = sample_indices.to(device=device, dtype=torch.long)
-        return {'hsi': hsi, 'lidar': lidar, 'rgb': rgb, 'sample_indices': sample_indices}, labels
-    hsi, lidar, labels, sample_indices = batch
+        gr = gr.to(device=device, dtype=torch.long)
+        rk = rk.to(device=device, dtype=torch.long)
+        return {
+            'hsi': hsi,
+            'lidar': lidar,
+            'rgb': rgb,
+            'sample_indices': gr,
+            'global_row': gr,
+            'rot_k': rk,
+        }, labels
+    hsi, lidar, labels, gr, rk = batch
     hsi = hsi.to(device=device, dtype=torch.float32)
     lidar = lidar.to(device=device, dtype=torch.float32)
     labels = labels.to(device).long()
-    sample_indices = sample_indices.to(device=device, dtype=torch.long)
-    return {'hsi': hsi, 'lidar': lidar, 'sample_indices': sample_indices}, labels
+    gr = gr.to(device=device, dtype=torch.long)
+    rk = rk.to(device=device, dtype=torch.long)
+    return {
+        'hsi': hsi,
+        'lidar': lidar,
+        'sample_indices': gr,
+        'global_row': gr,
+        'rot_k': rk,
+    }, labels

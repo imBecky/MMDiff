@@ -6,8 +6,11 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from param import STUDENT_SIZE
 from pipeline.train_scheduler import build_lr_scheduler
 from utils.unet_hw import unet_sample_hw
+
+from model.rgb_student import LightweightRgbEncoder
 
 
 def _unet_input_hw(diffusion) -> Tuple[int, int]:
@@ -250,17 +253,14 @@ def _probe_diffusion_layer_channels(
 class MultimodalClassifier(nn.Module):
     """
     HSI：中心 3x3，1D 光谱卷积 + SE；空间聚合可为 1 token（mean/attn_pool）或 3 token（multi_token）
-    RGB：冻结 UNet，可多时间步 t，每个 t 下多尺度层各 1 token（与 FEAT_SCALES 一致）
+    RGB：默认冻结 UNet（rgb_source=diffusion）；可选轻量 student（rgb_source=student）或离线 teacher token（cached_teacher）
     LiDAR：小 CNN（stem + 可选空间残差块）-> global + center 共 2 token
     融合：两枚可学习 CLS 为 query，模态 token 为 memory，TransformerDecoder（交叉注意力 + CLS 间自注意力）
     双头：global_head(cls[0])，center_head(cls[1])
     """
     def __init__(self, opt, diffusion=None):
         super().__init__()
-        if diffusion is None:
-            raise ValueError('MultimodalClassifier 需要注入 diffusion（StudentDiffusionWrapper）')
         self.opt = opt
-        self.diffusion = diffusion
 
         ds_cfg = opt.get('dataset', {})
         cls_cfg = opt.get('model_cls', {})
@@ -278,6 +278,15 @@ class MultimodalClassifier(nn.Module):
         if not (self.use_hsi or self.use_rgb or self.use_lidar):
             raise ValueError(f'enabled_modalities 不能为空：{enabled_modalities!r}')
 
+        self.rgb_source = str(cls_cfg.get('rgb_source') or 'diffusion').strip().lower()
+        if self.rgb_source not in ('diffusion', 'student', 'cached_teacher'):
+            raise ValueError(
+                f'model_cls.rgb_source 须为 diffusion|student|cached_teacher，当前 {self.rgb_source!r}'
+            )
+        if self.use_rgb and self.rgb_source == 'diffusion' and diffusion is None:
+            raise ValueError('启用 RGB 且 rgb_source=diffusion 时必须注入 diffusion（StudentDiffusionWrapper）')
+        self.diffusion = diffusion if (self.use_rgb and self.rgb_source == 'diffusion') else None
+
         self.num_classes = int(cls_cfg.get('out_channels') or ds_cfg.get('n_cls') or 2)
         self.hsi_channels = int(ds_cfg.get('hsi_channels') or 32)
         self.lidar_in_ch = int(ds_cfg.get('lidar_channel') or 1)
@@ -294,7 +303,11 @@ class MultimodalClassifier(nn.Module):
         if not self.feat_layer_names:
             raise ValueError('model_cls.feat_scales 不能为空')
 
-        self._unet_input_hw = _unet_input_hw(diffusion)
+        if self.use_rgb and self.rgb_source == 'diffusion':
+            assert diffusion is not None
+            self._unet_input_hw = _unet_input_hw(diffusion)
+        else:
+            self._unet_input_hw = (max(8, int(STUDENT_SIZE)), max(8, int(STUDENT_SIZE)))
 
         d_model = int(cls_cfg.get('token_dim') or 256)
         self.d_model = d_model
@@ -316,13 +329,30 @@ class MultimodalClassifier(nn.Module):
         hsi_residual_blocks = int(proj_cfg.get('hsi_residual_blocks') or 2)
         hsi_agg_mode = str(proj_cfg.get('hsi_agg_mode') or 'mean').strip().lower()
 
-        ch_map = _probe_diffusion_layer_channels(
-            diffusion, self.feat_layer_names, self.diffusion_t,
-        )
-        # ModuleDict 的 key 不能含 "."（与 down_blocks.1 等 UNet 子模块名冲突），用 ModuleList 与 feat_layer_names 顺序对齐
-        self.rgb_projs = nn.ModuleList(
-            [RGBLayerToToken(ch_map[name], d_model) for name in self.feat_layer_names]
-        )
+        patch_h = int(ds_cfg.get('patch_size') or 11)
+        patch_w = patch_h
+
+        self.rgb_projs = None
+        self.rgb_student: Optional[LightweightRgbEncoder] = None
+        if self.use_rgb and self.rgb_source == 'diffusion':
+            ch_map = _probe_diffusion_layer_channels(
+                diffusion, self.feat_layer_names, self.diffusion_t,
+            )
+            self.rgb_projs = nn.ModuleList(
+                [RGBLayerToToken(ch_map[name], d_model) for name in self.feat_layer_names]
+            )
+        elif self.use_rgb and self.rgb_source == 'student':
+            n_rgb_tok = len(self.diffusion_ts) * len(self.feat_layer_names)
+            self.rgb_student = LightweightRgbEncoder(
+                in_ch=3,
+                patch_h=patch_h,
+                patch_w=patch_w,
+                d_model=d_model,
+                num_tokens=n_rgb_tok,
+            )
+        elif self.use_rgb and self.rgb_source == 'cached_teacher':
+            # 无 RGB 可训练子模块，占位供 projections / 梯度检查
+            self._rgb_proj_placeholder = nn.Identity()
 
         self.hsi_encoder = HSICenterSpectralEncoder(
             self.hsi_channels,
@@ -383,8 +413,14 @@ class MultimodalClassifier(nn.Module):
         proj_dict = {
             'hsi': self.hsi_encoder,
             'lidar': self.lidar_encoder,
-            'rgb': self.rgb_projs,
         }
+        if self.use_rgb:
+            if self.rgb_source == 'diffusion':
+                proj_dict['rgb'] = self.rgb_projs
+            elif self.rgb_source == 'student':
+                proj_dict['rgb'] = self.rgb_student
+            else:
+                proj_dict['rgb'] = self._rgb_proj_placeholder
         if self.use_supcon and self.supcon_proj is not None:
             proj_dict['supcon'] = self.supcon_proj
         self.projections = nn.ModuleDict(proj_dict)
@@ -399,6 +435,12 @@ class MultimodalClassifier(nn.Module):
         nn.init.normal_(self.pos_embed_tgt, std=0.02)
 
         self.loss_func = self._build_loss(cls_cfg)
+        self.optimizer = self._build_optimizer(train_cfg)
+        self.exp_lr_scheduler = self._build_scheduler(train_cfg)
+
+    def refresh_optimizer_after_param_freeze(self) -> None:
+        """在 load_state_dict 之后将某子模块设为 requires_grad=False 时调用，仅优化仍可训练参数。"""
+        train_cfg = self.opt['train']
         self.optimizer = self._build_optimizer(train_cfg)
         self.exp_lr_scheduler = self._build_scheduler(train_cfg)
 
@@ -458,20 +500,36 @@ class MultimodalClassifier(nn.Module):
             b = hsi_seq.shape[0]
 
         if self.use_rgb:
-            if 'rgb' not in data_dict:
-                raise KeyError('需要 rgb 模态：请准备 train_rgb_patches.npy / test_rgb_patches.npy 并确保 MMDIFF_MODALITY_COMBO 含 rgb')
-            self.diffusion.feed_data(data_dict)
-
-            rgb_toks: List[torch.Tensor] = []
-            for t in self.diffusion_ts:
-                layer_feats = self.diffusion.get_feats(t, training=self.training)
-                if not isinstance(layer_feats, dict):
-                    raise RuntimeError(
-                        '扩散特征应为 dict（多层 hook），请检查 StudentDiffusionWrapper.feat_layers'
+            if self.rgb_source == 'cached_teacher':
+                if 'rgb_teacher_tokens' not in data_dict:
+                    raise KeyError(
+                        'rgb_source=cached_teacher 需要 data_dict["rgb_teacher_tokens"]，形状 (B, num_tokens, d_model)'
                     )
-                for name, proj in zip(self.feat_layer_names, self.rgb_projs):
-                    rgb_toks.append(proj(layer_feats[name]))
-            rgb_stack = torch.stack(rgb_toks, dim=1)
+                rgb_stack = data_dict['rgb_teacher_tokens']
+                if rgb_stack.dim() == 2:
+                    rgb_stack = rgb_stack.unsqueeze(1)
+            elif self.rgb_source == 'student':
+                if 'rgb' not in data_dict:
+                    raise KeyError('需要 rgb 模态 tensor')
+                rgb_stack = self.rgb_student(data_dict['rgb'])
+            else:
+                if 'rgb' not in data_dict:
+                    raise KeyError(
+                        '需要 rgb 模态：请准备 train_rgb_patches.npy / test_rgb_patches.npy 并确保 MMDIFF_MODALITY_COMBO 含 rgb'
+                    )
+                assert self.diffusion is not None and self.rgb_projs is not None
+                self.diffusion.feed_data(data_dict)
+
+                rgb_toks: List[torch.Tensor] = []
+                for t in self.diffusion_ts:
+                    layer_feats = self.diffusion.get_feats(t, training=self.training)
+                    if not isinstance(layer_feats, dict):
+                        raise RuntimeError(
+                            '扩散特征应为 dict（多层 hook），请检查 StudentDiffusionWrapper.feat_layers'
+                        )
+                    for name, proj in zip(self.feat_layer_names, self.rgb_projs):
+                        rgb_toks.append(proj(layer_feats[name]))
+                rgb_stack = torch.stack(rgb_toks, dim=1)
             memory_parts.append(rgb_stack)
             b = rgb_stack.shape[0] if b is None else b
 

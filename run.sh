@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# 用法见文末「run.sh help」；无参数 = 主训练（BS64 / SupCon / lr=1e-3 / 余弦+warmup5% / gate_before_pool）+ 关机。
-# TB/checkpoint 目录默认短名：{时间戳}_e{NN}_lr{标签}（见 logging_utils.prepare_tb_run_dir）；长目录名：MMDIFF_TB_LONG_TAG=1
+# 轻量 RGB 消融：随机初始化 / 蒸馏权重+冻结 / 蒸馏权重+微调
+# 无参数 = all：precompute → ablate_all（内含 distill + 三种主训练，仅终端输出）
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 cd "$ROOT"
@@ -10,45 +10,85 @@ _safe_combo() {
   echo "${s//[^a-zA-Z0-9_-]/_}"
 }
 
+PREFIX="${MMDIFF_EXPERIMENT_TAG_PREFIX:-multimodal}"
+COMBO="${MMDIFF_MODALITY_COMBO:-hsi+rgb+lidar}"
+SC="$(_safe_combo "$COMBO")"
+
+RGB_STUDENT_CKPT="${MMDIFF_RGB_STUDENT_CHECKPOINT:-$ROOT/rgb_student_distill.pt}"
+
 setup_common() {
   export PYTHONUNBUFFERED="${PYTHONUNBUFFERED:-1}"
   export MMDIFF_NUM_EPOCHS="${MMDIFF_NUM_EPOCHS:-200}"
   export MMDIFF_MODALITY_COMBO="${MMDIFF_MODALITY_COMBO:-hsi+rgb+lidar}"
-  export MMDIFF_HSI_RESIDUAL_BLOCKS=6
-  export MMDIFF_HSI_CONV_HIDDEN=96
-  export MMDIFF_HSI_SE_RATIO=16
-  # 主实验（exp1 / 无参）：lr_max=1e-3，余弦退火，warmup=总步数 5%（≈总轮数 5%）；exp5 在子命令内改为 piecewise
+  export MMDIFF_HSI_RESIDUAL_BLOCKS="${MMDIFF_HSI_RESIDUAL_BLOCKS:-6}"
+  export MMDIFF_HSI_CONV_HIDDEN="${MMDIFF_HSI_CONV_HIDDEN:-96}"
+  export MMDIFF_HSI_SE_RATIO="${MMDIFF_HSI_SE_RATIO:-16}"
   export MMDIFF_SCHEDULER_NAME="${MMDIFF_SCHEDULER_NAME:-cosine}"
   export MMDIFF_LEARNING_RATE="${MMDIFF_LEARNING_RATE:-1e-3}"
   export MMDIFF_SCHED_COSINE_WARMUP_RATIO="${MMDIFF_SCHED_COSINE_WARMUP_RATIO:-0.05}"
+  export MMDIFF_BATCH_SIZE="${MMDIFF_BATCH_SIZE:-64}"
+  export MMDIFF_WEIGHT_DECAY="${MMDIFF_WEIGHT_DECAY:-1e-4}"
+  export MMDIFF_USE_SUPCON="${MMDIFF_USE_SUPCON:-0}"
+}
+
+# 主训练：RGB_SOURCE=student；ablate 为 random | freeze | finetune
+setup_rgb_ablate() {
+  local a="${1:?}"
+  setup_common
+  export MMDIFF_RGB_SOURCE=student
+  export MMDIFF_EXPERIMENT_NUM="${MMDIFF_EXPERIMENT_NUM:-1}"
+  export MMDIFF_LR_TAG="${MMDIFF_LR_TAG:-$MMDIFF_LEARNING_RATE}"
+  case "$a" in
+    random)
+      export MMDIFF_RGB_STUDENT_CHECKPOINT=""
+      export MMDIFF_FREEZE_RGB_STUDENT=0
+      export MMDIFF_EXPERIMENT_TAG="${MMDIFF_EXPERIMENT_TAG:-${PREFIX}_rgb_student_${SC}_rand}"
+      ;;
+    freeze)
+      export MMDIFF_RGB_STUDENT_CHECKPOINT="$RGB_STUDENT_CKPT"
+      export MMDIFF_FREEZE_RGB_STUDENT=1
+      export MMDIFF_EXPERIMENT_TAG="${MMDIFF_EXPERIMENT_TAG:-${PREFIX}_rgb_student_${SC}_freeze}"
+      ;;
+    finetune|ft)
+      export MMDIFF_RGB_STUDENT_CHECKPOINT="$RGB_STUDENT_CKPT"
+      export MMDIFF_FREEZE_RGB_STUDENT=0
+      export MMDIFF_EXPERIMENT_TAG="${MMDIFF_EXPERIMENT_TAG:-${PREFIX}_rgb_student_${SC}_ft}"
+      ;;
+    *)
+      echo "内部错误: setup_rgb_ablate $a" >&2
+      exit 1
+      ;;
+  esac
 }
 
 usage() {
   cat <<'EOF'
 用法: bash run.sh [子命令]
 
-  无参数     主训练 exp1（BS64 / SupCon / lr=1e-3 / cosine+warmup5% / gate_before_pool），结束后关机
-  exp1       同上，不关机
-  exp2       BS64 + cosine+warmup5% + lr=1e-3 + wd=1e-4 + SupCon=OFF（与 exp1 对照 SupCon）
-  exp3       BS512 + cosine+warmup5% + lr=4e-3 + wd=5e-4 + SupCon=OFF（大 batch + 较高 WD）
-  exp4       BS512 + cosine+warmup5% + lr=4e-3 + wd=2e-4 + SupCon=OFF（与 exp3 仅 WD 不同）
-  exp5       BS64 + piecewise + lr=6e-4 + wd=1e-4 + SupCon=OFF（贴近 best_model.log，无 SupCon）
-  sanity     HSI 分支自检（秒级，需时手动跑）；可传参，如: bash run.sh sanity --batch 4
-  all        串行 exp1 → exp2 → exp3 → exp4 → exp5（不含 sanity）；失败不中断；终端+日志双写
-  help       本说明
+  无参数 | all   串行：precompute →（distill + 三种主训练），其中 ablate_all 会先 distill 再消融；默认结束后关机（MMDIFF_SHUTDOWN_AT_END=0 则不关机）
+  precompute     离线预计算 RGB teacher token（train + test）
+  distill        蒸馏 student：默认最多 100 epoch、早停 15；TensorBoard 见 train_rgb_distill 输出路径
+  ablate_all     先 distill（重新蒸馏）再串行 random → freeze → finetune
+  train_random   消融：RGB student 随机初始化（不加载 MMDIFF_RGB_STUDENT_CHECKPOINT）
+  train_freeze   消融：加载蒸馏权重 + 冻结 rgb_student（MMDIFF_FREEZE_RGB_STUDENT=1）
+  train_finetune|train|main  消融：加载蒸馏权重 + 微调 rgb_student（默认）
+  sanity         HSI 分支自检；额外参数: bash run.sh sanity --batch 4
+  help           本说明
 
-  可选环境变量: MMDIFF_*（见 param.py）、MMDIFF_OVERNIGHT_LOG、MMDIFF_SHUTDOWN_AT_END=1（all 结束后关机）
-  exp1 默认: MMDIFF_SCHEDULER_NAME=cosine, MMDIFF_LEARNING_RATE=1e-3, MMDIFF_SCHED_COSINE_WARMUP_RATIO=0.05
+环境变量（节选）:
+  MMDIFF_RGB_STUDENT_CHECKPOINT   蒸馏 student 路径，默认 <仓库根>/rgb_student_distill.pt
+  MMDIFF_FREEZE_RGB_STUDENT       1/true 冻结 rgb_student（runner 内重建优化器）
+  MMDIFF_PRECOMPUTE_BATCH / MMDIFF_DISTILL_BATCH
+  MMDIFF_DISTILL_EPOCHS  蒸馏最大 epoch，默认 100
+  MMDIFF_DISTILL_EARLY_STOP  验证 loss 早停 patience，默认 15（0=关闭）
+  MMDIFF_SHUTDOWN_AT_END=0 取消关机
 
 示例:
+  bash run.sh ablate_all
   bash run.sh all
-  MMDIFF_OVERNIGHT_LOG=./my.log bash run.sh all
+  bash run.sh train_finetune
 EOF
 }
-
-PREFIX="${MMDIFF_EXPERIMENT_TAG_PREFIX:-multimodal}"
-COMBO="${MMDIFF_MODALITY_COMBO:-hsi+rgb+lidar}"
-SC="$(_safe_combo "$COMBO")"
 
 log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*"; }
 
@@ -69,124 +109,100 @@ run_step() {
 do_shutdown() {
   sleep 3
   local _i
+  curl "https://sctapi.ftqq.com/SCT313662TGZ7JRPbisBQfDZbabO1Kmmdt.send?title=训练完成&desp=Python脚本已执行完毕channel=9"
   for _i in 1 2 3 4 5 6 7 8 9; do
     /usr/bin/shutdown 2>/dev/null || true
     sleep 3
   done
+  curl "https://sctapi.ftqq.com/SCT313662TGZ7JRPbisBQfDZbabO1Kmmdt.send?title=服务器关闭失败&desp=服务器关闭失败channel=9"
 }
 
-# 单次训练：统一时间戳（便于 overnight 流水线对齐）；日志目录见 prepare_tb_run_dir
-_export_run_tag_exp1() {
-  export MMDIFF_USE_SUPCON="${MMDIFF_USE_SUPCON:-1}"
-  export MMDIFF_BATCH_SIZE=64
-  export MMDIFF_EXPERIMENT_NUM=1
-  export MMDIFF_LR_TAG=1e-3
-  export MMDIFF_EXPERIMENT_TAG="${PREFIX}_${SC}_B6_H96_SE16_BS64_gate_before_pool_cos1e3_w5"
-}
-
-# ---------------------------------------------------------------------------
-# 无参数：旧版 = exp1 + 关机
-# ---------------------------------------------------------------------------
-if [ $# -eq 0 ]; then
-  setup_common
-  export MMDIFF_RUN_TIMESTAMP="${MMDIFF_RUN_TIMESTAMP:-$(date +%Y%m%d-%H%M%S)}"
-  _export_run_tag_exp1
-  echo "run: ${MMDIFF_EXPERIMENT_TAG} | exp=${MMDIFF_EXPERIMENT_NUM} lr=${MMDIFF_LR_TAG}"
+_run_train_ablate() {
+  local tag="$1"
+  echo "=== ${tag} | MMDIFF_EXPERIMENT_TAG=${MMDIFF_EXPERIMENT_TAG} | FREEZE=${MMDIFF_FREEZE_RGB_STUDENT:-0} | ckpt=${MMDIFF_RGB_STUDENT_CHECKPOINT:-<empty>} ==="
   python main.py
-  do_shutdown
-  exit 0
+}
+
+if [ $# -eq 0 ]; then
+  set -- all
 fi
 
 case "$1" in
   help|-h|--help)
     usage
     ;;
-  exp1)
-    setup_common
+  precompute)
+    _pcb="${MMDIFF_PRECOMPUTE_BATCH:-32}"
+    echo "=== precompute train (batch=$_pcb) ==="
+    python utils/precompute_rgb_teacher_tokens.py --split train --batch-size "$_pcb"
+    echo "=== precompute test (batch=$_pcb) ==="
+    python utils/precompute_rgb_teacher_tokens.py --split test --batch-size "$_pcb"
+    ;;
+  distill)
+    _de="${MMDIFF_DISTILL_EPOCHS:-100}"
+    _db="${MMDIFF_DISTILL_BATCH:-0}"
+    _esp="${MMDIFF_DISTILL_EARLY_STOP:-15}"
+    echo "=== distill student -> $RGB_STUDENT_CKPT (max_epochs=$_de early_stop_patience=$_esp TB under param.TB_LOG_ROOT) ==="
+    python utils/train_rgb_distill.py --epochs "$_de" --batch-size "$_db" --early-stopping-patience "$_esp" --out "$RGB_STUDENT_CKPT"
+    ;;
+  train_random)
+    setup_rgb_ablate random
     export MMDIFF_RUN_TIMESTAMP="${MMDIFF_RUN_TIMESTAMP:-$(date +%Y%m%d-%H%M%S)}"
-    _export_run_tag_exp1
-    echo "=== ${MMDIFF_EXPERIMENT_TAG} | exp=${MMDIFF_EXPERIMENT_NUM} lr=${MMDIFF_LR_TAG} ==="
-    python main.py
+    _run_train_ablate train_random
     ;;
-  exp2)
-    setup_common
-    export MMDIFF_USE_SUPCON=0
-    export MMDIFF_BATCH_SIZE=64
-    export MMDIFF_WEIGHT_DECAY=1e-4
-    export MMDIFF_LEARNING_RATE=1e-3
-    export MMDIFF_EXPERIMENT_NUM=2
-    export MMDIFF_LR_TAG=1e-3
-    export MMDIFF_EXPERIMENT_TAG="${PREFIX}_${SC}_B6_H96_SE16_BS64_gate_before_pool_cos1e3_w5_nosupcon"
+  train_freeze)
+    setup_rgb_ablate freeze
     export MMDIFF_RUN_TIMESTAMP="${MMDIFF_RUN_TIMESTAMP:-$(date +%Y%m%d-%H%M%S)}"
-    echo "=== ${MMDIFF_EXPERIMENT_TAG} | exp=${MMDIFF_EXPERIMENT_NUM} lr=${MMDIFF_LR_TAG} ==="
-    python main.py
+    _run_train_ablate train_freeze
     ;;
-  exp3)
-    setup_common
-    export MMDIFF_USE_SUPCON=0
-    export MMDIFF_BATCH_SIZE=512
-    export MMDIFF_WEIGHT_DECAY=5e-4
-    export MMDIFF_LEARNING_RATE=4e-3
-    export MMDIFF_EXPERIMENT_NUM=3
-    export MMDIFF_LR_TAG=4e-3
-    export MMDIFF_EXPERIMENT_TAG="${PREFIX}_${SC}_B6_H96_SE16_BS512_wd5e4_cos4e3_w5_nosupcon"
+  train_finetune|train|main)
+    setup_rgb_ablate finetune
     export MMDIFF_RUN_TIMESTAMP="${MMDIFF_RUN_TIMESTAMP:-$(date +%Y%m%d-%H%M%S)}"
-    echo "=== ${MMDIFF_EXPERIMENT_TAG} | exp=${MMDIFF_EXPERIMENT_NUM} lr=${MMDIFF_LR_TAG} ==="
-    python main.py
+    _run_train_ablate train_finetune
     ;;
-  exp4)
-    setup_common
-    export MMDIFF_USE_SUPCON=0
-    export MMDIFF_BATCH_SIZE=512
-    export MMDIFF_WEIGHT_DECAY=2e-4
-    export MMDIFF_LEARNING_RATE=4e-3
-    export MMDIFF_EXPERIMENT_NUM=4
-    export MMDIFF_LR_TAG=4e-3
-    export MMDIFF_EXPERIMENT_TAG="${PREFIX}_${SC}_B6_H96_SE16_BS512_wd2e4_cos4e3_w5_nosupcon"
-    export MMDIFF_RUN_TIMESTAMP="${MMDIFF_RUN_TIMESTAMP:-$(date +%Y%m%d-%H%M%S)}"
-    echo "=== ${MMDIFF_EXPERIMENT_TAG} | exp=${MMDIFF_EXPERIMENT_NUM} lr=${MMDIFF_LR_TAG} ==="
-    python main.py
-    ;;
-  exp5)
-    setup_common
-    export MMDIFF_SCHEDULER_NAME=piecewise_two_step
-    export MMDIFF_USE_SUPCON=0
-    export MMDIFF_BATCH_SIZE=64
-    export MMDIFF_WEIGHT_DECAY=1e-4
-    export MMDIFF_LEARNING_RATE=6e-4
-    export MMDIFF_EXPERIMENT_NUM=5
-    export MMDIFF_LR_TAG=6e-4
-    export MMDIFF_EXPERIMENT_TAG="${PREFIX}_${SC}_B6_H96_SE16_BS64_gate_before_pool_pw6e4_nosupcon"
-    export MMDIFF_RUN_TIMESTAMP="${MMDIFF_RUN_TIMESTAMP:-$(date +%Y%m%d-%H%M%S)}"
-    echo "=== ${MMDIFF_EXPERIMENT_TAG} | exp=${MMDIFF_EXPERIMENT_NUM} lr=${MMDIFF_LR_TAG} ==="
-    python main.py
-    ;;
-  sanity)
-    echo "=== utils/hsi_branch_sanity.py ==="
-    python utils/hsi_branch_sanity.py "${@:2}"
-    ;;
-  all)
-    LOG="${MMDIFF_OVERNIGHT_LOG:-$ROOT/overnight_$(date +%Y%m%d_%H%M%S).log}"
+  ablate_all)
     PIPE_TS="$(date +%Y%m%d-%H%M%S)"
     (
       set +e
-      log "pipeline | log: $LOG | PIPE_TS=$PIPE_TS (export MMDIFF_RUN_TIMESTAMP=$PIPE_TS for each step for aligned dirs)"
+      log "ablate_all | PIPE_TS=$PIPE_TS（先 distill 再三种主训练）"
       FAILED=0
-      MMDIFF_RUN_TIMESTAMP="$PIPE_TS" run_step exp1 bash "$ROOT/run.sh" exp1 || FAILED=$((FAILED + 1))
-      MMDIFF_RUN_TIMESTAMP="$PIPE_TS" run_step exp2 bash "$ROOT/run.sh" exp2 || FAILED=$((FAILED + 1))
-      MMDIFF_RUN_TIMESTAMP="$PIPE_TS" run_step exp3 bash "$ROOT/run.sh" exp3 || FAILED=$((FAILED + 1))
-      MMDIFF_RUN_TIMESTAMP="$PIPE_TS" run_step exp4 bash "$ROOT/run.sh" exp4 || FAILED=$((FAILED + 1))
-      MMDIFF_RUN_TIMESTAMP="$PIPE_TS" run_step exp5 bash "$ROOT/run.sh" exp5 || FAILED=$((FAILED + 1))
-      log "pipeline finished | failed_steps=$FAILED (0=all ok)"
-      if [ "${MMDIFF_SHUTDOWN_AT_END:-0}" = "1" ]; then
-        log "MMDIFF_SHUTDOWN_AT_END=1 -> shutdown"
+      MMDIFF_RUN_TIMESTAMP="$PIPE_TS" run_step distill bash "$ROOT/run.sh" distill || FAILED=$((FAILED + 1))
+      MMDIFF_RUN_TIMESTAMP="$PIPE_TS" RGB_STUDENT_CKPT="$RGB_STUDENT_CKPT" run_step train_random bash "$ROOT/run.sh" train_random || FAILED=$((FAILED + 1))
+      MMDIFF_RUN_TIMESTAMP="$PIPE_TS" RGB_STUDENT_CKPT="$RGB_STUDENT_CKPT" run_step train_freeze bash "$ROOT/run.sh" train_freeze || FAILED=$((FAILED + 1))
+      MMDIFF_RUN_TIMESTAMP="$PIPE_TS" RGB_STUDENT_CKPT="$RGB_STUDENT_CKPT" run_step train_finetune bash "$ROOT/run.sh" train_finetune || FAILED=$((FAILED + 1))
+      log "ablate_all finished | failed_steps=$FAILED (0=all ok)"
+      if [ "${MMDIFF_SHUTDOWN_AT_END:-1}" != "0" ]; then
+        log "MMDIFF_SHUTDOWN_AT_END default/on -> shutdown (set MMDIFF_SHUTDOWN_AT_END=0 to skip)"
         do_shutdown
       fi
       if [ "$FAILED" -gt 0 ]; then
         exit 1
       fi
       exit 0
-    ) 2>&1 | tee "$LOG"
+    )
+    ;;
+  all)
+    PIPE_TS="$(date +%Y%m%d-%H%M%S)"
+    (
+      set +e
+      log "all | PIPE_TS=$PIPE_TS（precompute → ablate_all 内含 distill+消融）"
+      FAILED=0
+      MMDIFF_RUN_TIMESTAMP="$PIPE_TS" run_step precompute bash "$ROOT/run.sh" precompute || FAILED=$((FAILED + 1))
+      MMDIFF_RUN_TIMESTAMP="$PIPE_TS" RGB_STUDENT_CKPT="$RGB_STUDENT_CKPT" run_step ablate_all bash "$ROOT/run.sh" ablate_all || FAILED=$((FAILED + 1))
+      log "all finished | failed_steps=$FAILED (0=all ok)"
+      if [ "${MMDIFF_SHUTDOWN_AT_END:-1}" != "0" ]; then
+        log "MMDIFF_SHUTDOWN_AT_END default/on -> shutdown (set MMDIFF_SHUTDOWN_AT_END=0 to skip)"
+        do_shutdown
+      fi
+      if [ "$FAILED" -gt 0 ]; then
+        exit 1
+      fi
+      exit 0
+    )
+    ;;
+  sanity)
+    echo "=== utils/hsi_branch_sanity.py ==="
+    python utils/hsi_branch_sanity.py "${@:2}"
     ;;
   *)
     echo "未知子命令: $1" >&2

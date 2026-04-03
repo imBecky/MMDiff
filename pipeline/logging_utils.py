@@ -36,6 +36,7 @@ from param import (
     OPTIMIZER_BETAS,
     PATCH_WINDOW_SIZE,
     RANDOM_SEED,
+    RGB_STUDENT_CHECKPOINT,
     RUN_NAME_PREFIX,
     SAVE_EVERY_EPOCH,
     STUDENT_CHECKPOINT,
@@ -511,11 +512,17 @@ def log_model_and_training_detail(
             mc.get('head_hidden'),
         )
         logger.info(
-            'model_cls | init_type=%s scale=%s feat_scales(t)=%s t=%s',
+            'model_cls | rgb_source=%s init_type=%s scale=%s feat_scales(t)=%s t=%s',
+            mc.get('rgb_source', 'diffusion'),
             mc.get('init_type'),
             mc.get('scale'),
             mc.get('feat_scales'),
             mc.get('t'),
+        )
+        logger.info(
+            'rgb student | MMDIFF_RGB_STUDENT_CHECKPOINT=%s MMDIFF_FREEZE_RGB_STUDENT=%s',
+            RGB_STUDENT_CHECKPOINT or '(empty=random init)',
+            (os.environ.get('MMDIFF_FREEZE_RGB_STUDENT') or '').strip() or '0',
         )
         logger.info(
             'module_cast3 | lidar_hidden=%s hsi_residual_blocks=%s hsi_conv_hidden=%s hsi_se_ratio=%s hsi_agg_mode=%s',

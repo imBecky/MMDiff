@@ -4,6 +4,7 @@
 
 | 最近更新 | 主题 | 一句话结果 | 详情 |
 |---------|------|------------|------|
+| 2026-04-03 | **run.sh 续训 exp3/4/5** | `exp3r`/`exp4r`/`exp5r` 从 `final` 续训；`resume345` 串行；`MMDIFF_RESUME_EXP*`/`RESUME_RUN_TS` 可覆盖；**exp5=piecewise** 对齐 best、非 cosine；runner 续训后 lr×0.5 | [logs/2026-04-03-runsh-resume-exp345-and-exp5-scheduler.md](./logs/2026-04-03-runsh-resume-exp345-and-exp5-scheduler.md) |
 | 2026-04-02 | **run.sh 主模型五组实验网格** | exp1=cosine+SupCon；exp2 关 SupCon；exp3/4=BS512 仅 WD 5e-4 vs 2e-4；exp5=piecewise 6e-4 无 SupCon；`all` 串行 1→5 | [logs/2026-04-02-runsh-exp-grid-five.md](./logs/2026-04-02-runsh-exp-grid-five.md) |
 | 2026-04-02 | **对比模型可复现 / 学术诚信（强制）** | 除统一数据+epoch/lr 等基础项外，对比须对齐**原论文方法**；Two-branch 三阶段；**DFINet**（联合损失+SGD，`dfinet_protocol`）与 **MACN**（Focal+Adam+无调度）已接；本机跑 Python 先 **`conda activate hbq`**（见 [`README`](./README.md)） | [logs/2026-04-02-compare-models-repro-integrity.md](./logs/2026-04-02-compare-models-repro-integrity.md) |
 | 2026-04-02 | 双分支 CNN 对比模型（BUCT Xu 2017） | PyTorch 接入；**已纠偏为三阶段协议**；旧日志中「端到端」表述过时，以 repro-integrity + `two_branch_protocol` 为准 | [logs/2026-04-02-two-branch-cnn-compare.md](./logs/2026-04-02-two-branch-cnn-compare.md) |

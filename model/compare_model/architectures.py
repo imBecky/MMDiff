@@ -12,6 +12,8 @@ from .base import CompareClassifierBase
 from .exvit_core import MViTBackbone
 from .fusatnet_core import FusAtNetBackbone
 from .two_branch_cnn_core import TwoBranchCNNBackbone
+from .dfinet_core import DFINetBackbone
+from .macn_core import MACNBackbone
 
 
 # ---------------------------------------------------------------------------
@@ -112,7 +114,11 @@ class ExViTClassifier(CompareClassifierBase):
 
 
 class TwoBranchCNNClassifier(CompareClassifierBase):
-    """双分支 CNN：HSI 空间 CNN + 中心光谱 1D CNN + LiDAR cascade，融合后分类。"""
+    """双分支 CNN（BUCT Xu 2017 结构）。
+
+    对比实验默认走三阶段训练（HSI → LiDAR → 加载权重并冻结支路后 Finetune），见 pipeline/two_branch_protocol.py。
+    仅当 MMDIFF_TWO_BRANCH_END2END=1 时由 runner 走单阶段端到端（调试/非论文协议）。
+    """
 
     def __init__(self, opt, diffusion=None):
         super().__init__(opt, diffusion)
@@ -125,6 +131,106 @@ class TwoBranchCNNClassifier(CompareClassifierBase):
         )
         self.projections = nn.ModuleDict()
         self._init_optimizer_and_scheduler()
+
+    def forward(
+        self,
+        data_dict: Dict[str, torch.Tensor],
+        return_center_logits: bool = False,
+        return_supcon_proj: bool = False,
+    ):
+        hsi, lidar = self._hsi_lidar(data_dict)
+        logits = self.net(hsi, lidar)
+        if return_center_logits:
+            return logits, logits
+        if return_supcon_proj:
+            raise RuntimeError('对比模型未启用 SupCon')
+        return logits
+
+
+# ---------------------------------------------------------------------------
+# DFINet（Gao et al. TGRS 2022 — formango/HSI_MSI_Multisource_Classification）
+# https://github.com/formango/HSI_MSI_Multisource_Classification
+# ---------------------------------------------------------------------------
+
+
+class DFINetClassifier(CompareClassifierBase):
+    """DFINet：HSINet + MSINet（LiDAR）+ CAM + depthwise 互相关 + 全连接分类。
+
+    对比实验默认由 `pipeline/dfinet_protocol.py` 按论文联合损失 + SGD 训练；
+    `return_aux=True` 时返回 (feat_hsi, feat_msi, h_flat, l_flat, logits) 供 calc_loss。
+    """
+
+    def __init__(self, opt, diffusion=None):
+        super().__init__(opt, diffusion)
+        patch_size = int(self.opt.get('dataset', {}).get('patch_size') or 11)
+        self.net = DFINetBackbone(
+            patch_size=patch_size,
+            channel_hsi=self.hsi_channels,
+            channel_msi=self.lidar_channels,
+            class_num=self.num_classes,
+        )
+        self.projections = nn.ModuleDict({'hsi_stem': self.net.featnet1.conv1, 'msi_stem': self.net.featnet2.conv1})
+        self._init_optimizer_and_scheduler()
+
+    def forward(
+        self,
+        data_dict: Dict[str, torch.Tensor],
+        return_center_logits: bool = False,
+        return_supcon_proj: bool = False,
+        return_aux: bool = False,
+    ):
+        hsi, lidar = self._hsi_lidar(data_dict)
+        if return_aux:
+            return self.net(hsi, lidar, return_aux=True)
+        logits = self.net(hsi, lidar)
+        if return_center_logits:
+            return logits, logits
+        if return_supcon_proj:
+            raise RuntimeError('对比模型未启用 SupCon')
+        return logits
+
+
+# ---------------------------------------------------------------------------
+# MACN（Li et al. TGRS 2023 — like413/MACN）
+# https://github.com/like413/MACN
+# ---------------------------------------------------------------------------
+
+
+class MACNClassifier(CompareClassifierBase):
+    """MACN：Conv3D+Conv2D 双支特征 + MACT + token + MCGF 交叉融合。
+
+    与 like413/MACN trentoTrain.py 一致：FocalLoss（α=0.25, γ=2）+ Adam（lr 读 param，默认 1e-3）；
+    不使用 piecewise 学习率调度（原文训练循环无 Lambda 调度）。
+    """
+
+    def __init__(self, opt, diffusion=None):
+        super().__init__(opt, diffusion)
+        self.net = MACNBackbone(
+            hsi_channels=self.hsi_channels,
+            lidar_channels=self.lidar_channels,
+            num_classes=self.num_classes,
+        )
+        self.projections = nn.ModuleDict({'mact': self.net.mact})
+        from .macn_focal_loss import MACNFocalLoss
+
+        self.loss_func = MACNFocalLoss(self.num_classes, alpha=0.25, gamma=2.0)
+        self.optimizer = None
+        self.exp_lr_scheduler = None
+        self._init_optimizer_and_scheduler()
+
+    def _build_optimizer(self, train_cfg: Dict[str, Any]) -> torch.optim.Optimizer:
+        optim_cfg = train_cfg.get('optimizer', {})
+        lr = float(optim_cfg.get('lr') or 1e-3)
+        betas = tuple(optim_cfg.get('betas') or (0.9, 0.999))
+        weight_decay = float(optim_cfg.get('weight_decay') or 0.0)
+        params = [p for p in self.parameters() if p.requires_grad]
+        if not params:
+            raise ValueError('MACNClassifier 无可训练参数')
+        return torch.optim.Adam(params, lr=lr, betas=betas, weight_decay=weight_decay)
+
+    def _build_scheduler(self, train_cfg: Dict[str, Any]):
+        self._scheduler_lr_total_steps = 0
+        return None
 
     def forward(
         self,

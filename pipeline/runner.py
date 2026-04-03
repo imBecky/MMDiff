@@ -35,6 +35,8 @@ from param import (
     NUM_EPOCHS,
     RANDOM_SEED,
     RESUME_CHECKPOINT,
+    RGB_SOURCE,
+    RGB_STUDENT_CHECKPOINT,
     SAVE_EVERY_EPOCH,
     STUDENT_CHECKPOINT,
     STUDENT_NUM_TRAIN_TIMESTEPS,
@@ -214,7 +216,7 @@ def run_training(
             len(train_indices),
             TRAIN_QUICK_VERIFY_SAMPLES_PER_CLASS,
         )
-    tr_idx, va_idx = split_train_val_indices(train_indices, VAL_RATIO, RANDOM_SEED)
+    tr_idx, va_idx, tr_pos, va_pos = split_train_val_indices(train_indices, VAL_RATIO, RANDOM_SEED)
     defer_test_load = 0 < VAL_RATIO < 1.0
     test_idx = None
     if not defer_test_load:
@@ -232,6 +234,8 @@ def run_training(
         test_idx,
         BATCH_SIZE,
         defer_test=defer_test_load,
+        train_global_rows=tr_pos,
+        val_global_rows=va_pos,
     )
     opt['len_train_dataloader'] = len(train_loader)
     # 续训：用首次训练时的总 step 数计算 LambdaLR 边界，避免仅因增大 NUM_EPOCHS 而重算 b1/b2 导致 LR 跳变
@@ -314,17 +318,76 @@ def run_training(
         os.path.join(run_ckps_dir_str, BEST_MODEL_FILENAME) if run_ckps_dir_str else None
     )
 
+    if compare_run:
+        from .two_branch_protocol import run_two_branch_protocol_if_needed
+
+        if run_two_branch_protocol_if_needed(
+            create_classifier=create_classifier,
+            compare_run=compare_run,
+            device=device,
+            train_loader=train_loader,
+            val_loader=val_loader,
+            test_loader=test_loader,
+            feats_vol=feats_vol,
+            rgb_vol=rgb_vol,
+            label_shift=label_shift,
+            defer_test_load=defer_test_load,
+            logger=logger,
+            writer=writer,
+            run_ckps_dir_str=run_ckps_dir_str or '',
+            best_path=best_path,
+            no_artifacts=no_artifacts,
+            save_conf_detail=save_conf_detail,
+            run_log_dir_str=run_log_dir_str,
+        ):
+            return
+
+        from .dfinet_protocol import run_dfinet_protocol_if_needed
+
+        if run_dfinet_protocol_if_needed(
+            create_classifier=create_classifier,
+            compare_run=compare_run,
+            device=device,
+            train_loader=train_loader,
+            val_loader=val_loader,
+            test_loader=test_loader,
+            feats_vol=feats_vol,
+            rgb_vol=rgb_vol,
+            label_shift=label_shift,
+            defer_test_load=defer_test_load,
+            logger=logger,
+            writer=writer,
+            run_ckps_dir_str=run_ckps_dir_str or '',
+            best_path=best_path,
+            no_artifacts=no_artifacts,
+            save_conf_detail=save_conf_detail,
+            run_log_dir_str=run_log_dir_str,
+        ):
+            return
+
     diffusion = None
     if not compare_run:
-        diffusion = StudentDiffusionWrapper(
-            STUDENT_CHECKPOINT,
-            STUDENT_NUM_TRAIN_TIMESTEPS,
-            noise_mode=DIFFUSION_NOISE_MODE,
-            noise_seed_base=RANDOM_SEED,
-            normalize_diffusion_input=DIFFUSION_NORMALIZE_INPUT,
-            feat_layers=FEAT_SCALES,
-        )
-        logger.info('Initial Student Diffusion Model Finished (scheduler from checkpoint: %s)', type(diffusion.scheduler).__name__)
+        rgb_src = (RGB_SOURCE or 'diffusion').strip().lower()
+        if rgb_src not in ('diffusion', 'student', 'cached_teacher'):
+            raise ValueError(f'RGB_SOURCE / MMDIFF_RGB_SOURCE 无效: {rgb_src!r}')
+        if rgb_src == 'diffusion':
+            diffusion = StudentDiffusionWrapper(
+                STUDENT_CHECKPOINT,
+                STUDENT_NUM_TRAIN_TIMESTEPS,
+                noise_mode=DIFFUSION_NOISE_MODE,
+                noise_seed_base=RANDOM_SEED,
+                normalize_diffusion_input=DIFFUSION_NORMALIZE_INPUT,
+                feat_layers=FEAT_SCALES,
+            )
+            logger.info(
+                'Initial Student Diffusion Model Finished (scheduler from checkpoint: %s)',
+                type(diffusion.scheduler).__name__,
+            )
+        else:
+            logger.info(
+                '跳过 StudentDiffusionWrapper（RGB_SOURCE=%s）；分类器使用轻量 RGB 或离线 teacher token',
+                rgb_src,
+            )
     model = create_classifier(opt, diffusion).to(device)
 
     loss_fn = model.loss_func
@@ -363,6 +426,35 @@ def run_training(
             '续训学习率缩放 ×0.5 | 当前 param_group lr=%s',
             [float(g['lr']) for g in optimizer.param_groups],
         )
+    elif not compare_run and (RGB_SOURCE or 'diffusion').strip().lower() == 'student':
+        ck = (RGB_STUDENT_CHECKPOINT or '').strip()
+        if ck:
+            ck_path = Path(ck)
+            if ck_path.is_file():
+                sd = torch.load(str(ck_path), map_location=device)
+                model.load_state_dict(sd, strict=False)
+                logger.info('已加载 RGB student 权重: %s', ck_path)
+            else:
+                logger.warning('MMDIFF_RGB_STUDENT_CHECKPOINT 不存在: %s', ck_path)
+        else:
+            logger.info('MMDIFF_RGB_STUDENT_CHECKPOINT 未设置：RGB student 保持随机初始化（消融 random）')
+
+    if (
+        not compare_run
+        and not resume_ckpt
+        and (RGB_SOURCE or 'diffusion').strip().lower() == 'student'
+        and (os.environ.get('MMDIFF_FREEZE_RGB_STUDENT') or '').strip().lower()
+        in ('1', 'true', 'yes', 'on')
+    ):
+        rs = getattr(model, 'rgb_student', None)
+        if rs is not None:
+            rs.requires_grad_(False)
+            model.refresh_optimizer_after_param_freeze()
+            optimizer = model.optimizer
+            lr_scheduler = getattr(model, 'exp_lr_scheduler', None)
+            logger.info('RGB student 已冻结（MMDIFF_FREEZE_RGB_STUDENT=1），优化器已重建（不含 rgb_student）')
+        else:
+            logger.warning('MMDIFF_FREEZE_RGB_STUDENT=1 但模型无 rgb_student，忽略')
 
     log_model_and_training_detail(logger, writer, model, opt, clip_grad, diffusion)
 
@@ -769,7 +861,7 @@ def verify_projection_gradients(create_classifier: CreateClassifierFn) -> None:
     logger.info('[verify_projection_grad] %s', MULTIMODAL_ABLATION_LOG_LINE)
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     fv, rv, tr_ind, ls = load_train_bundle()
-    tr_i, va_i = split_train_val_indices(tr_ind, VAL_RATIO, RANDOM_SEED)
+    tr_i, va_i, tr_p, va_p = split_train_val_indices(tr_ind, VAL_RATIO, RANDOM_SEED)
     defer = 0 < VAL_RATIO < 1.0
     te_i = None if defer else load_test_indices_shifted(ls)
     train_loader, _, _ = build_dataloaders(
@@ -780,16 +872,21 @@ def verify_projection_gradients(create_classifier: CreateClassifierFn) -> None:
         te_i,
         BATCH_SIZE,
         defer_test=defer,
+        train_global_rows=tr_p,
+        val_global_rows=va_p,
     )
     opt['len_train_dataloader'] = len(train_loader)
-    diffusion = StudentDiffusionWrapper(
-        STUDENT_CHECKPOINT,
-        STUDENT_NUM_TRAIN_TIMESTEPS,
-        noise_mode=DIFFUSION_NOISE_MODE,
-        noise_seed_base=RANDOM_SEED,
-        normalize_diffusion_input=DIFFUSION_NORMALIZE_INPUT,
-        feat_layers=FEAT_SCALES,
-    )
+    diffusion = None
+    rgb_src = (RGB_SOURCE or 'diffusion').strip().lower()
+    if rgb_src == 'diffusion':
+        diffusion = StudentDiffusionWrapper(
+            STUDENT_CHECKPOINT,
+            STUDENT_NUM_TRAIN_TIMESTEPS,
+            noise_mode=DIFFUSION_NOISE_MODE,
+            noise_seed_base=RANDOM_SEED,
+            normalize_diffusion_input=DIFFUSION_NORMALIZE_INPUT,
+            feat_layers=FEAT_SCALES,
+        )
     model = create_classifier(opt, diffusion).to(device)
     loss_fn = model.loss_func
     optimizer = model.optimizer

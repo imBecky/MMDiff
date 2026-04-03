@@ -36,7 +36,7 @@ def main():
         '--model',
         type=str,
         required=True,
-        help='模型注册名，如 fgcnn fusatnet exvit two_branch_cnn（fgcn 为兼容旧名；exvit/mvit 为 ExViT）',
+        help='模型注册名，如 fgcnn fusatnet exvit two_branch_cnn dfinet macn（fgcn 为兼容旧名；exvit/mvit 为 ExViT）',
     )
     parser.add_argument(
         '--verify-projection-grad',

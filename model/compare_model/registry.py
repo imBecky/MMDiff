@@ -7,9 +7,11 @@ from typing import Any, Callable, Dict, Type
 import torch.nn as nn
 
 from .architectures import (
+    DFINetClassifier,
     ExViTClassifier,
     FGCNNClassifier,
     FusAtNetClassifier,
+    MACNClassifier,
     TwoBranchCNNClassifier,
 )
 
@@ -31,6 +33,12 @@ REGISTRY: Dict[str, Type[nn.Module]] = {
     'two_branch': TwoBranchCNNClassifier,
     'twobranch_cnn': TwoBranchCNNClassifier,
     'xu2017_ms': TwoBranchCNNClassifier,
+    # Gao et al. 2022 DFINet（HSI+MSI；MSI 支路接 LiDAR patch）
+    'dfinet': DFINetClassifier,
+    'dfi_net': DFINetClassifier,
+    'dfi': DFINetClassifier,
+    # Li et al. 2023 MACN（like413/MACN）
+    'macn': MACNClassifier,
 }
 
 
