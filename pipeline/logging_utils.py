@@ -36,10 +36,10 @@ from param import (
     OPTIMIZER_BETAS,
     PATCH_WINDOW_SIZE,
     RANDOM_SEED,
+    RGB_DIFFUSION_TEACHER_CHECKPOINT,
     RGB_STUDENT_CHECKPOINT,
     RUN_NAME_PREFIX,
     SAVE_EVERY_EPOCH,
-    STUDENT_CHECKPOINT,
     STUDENT_SIZE,
     SUPCON_TEMPERATURE,
     SUPCON_WEIGHT,
@@ -114,8 +114,9 @@ def prepare_tb_run_dir():
     """与 TensorBoard 使用同一 run 目录（TB_LOG_ROOT / run_name）。
 
     默认短名（便于 TB 看图）：``{ts}_e{NN}_lr{slug}`` 或 ``{ts}_{紧凑tag}``。
-    完整实验描述仍在环境变量 MMDIFF_EXPERIMENT_TAG / metrics_summary 中。
-    长目录名：``MMDIFF_TB_LONG_TAG=1`` 时在 e+lr 后再拼完整 EXPERIMENT_TAG。
+    若同时设置了 ``MMDIFF_EXPERIMENT_NUM`` 与 ``MMDIFF_EXPERIMENT_TAG``，短名会在 e+lr 后
+    **追加紧凑 tag**（避免串行多组消融共用同一时间戳时写入同一目录）。
+    长目录名：``MMDIFF_TB_LONG_TAG=1`` 时在 e+lr 后再拼**完整** EXPERIMENT_TAG（替代紧凑后缀）。
     """
     TB_LOG_ROOT.mkdir(parents=True, exist_ok=True)
     tag = os.environ.get('MMDIFF_EXPERIMENT_TAG', '').strip()
@@ -135,6 +136,8 @@ def prepare_tb_run_dir():
         if want_long and tag:
             safe = re.sub(r'[^\w\-.]', '_', tag)
             run_name = f'{run_name}_{safe}'
+        elif tag:
+            run_name = f'{run_name}_{_compact_tb_tag(tag)}'
     elif tag:
         if want_long:
             safe = re.sub(r'[^\w\-.]', '_', tag)
@@ -513,7 +516,7 @@ def log_model_and_training_detail(
         )
         logger.info(
             'model_cls | rgb_source=%s init_type=%s scale=%s feat_scales(t)=%s t=%s',
-            mc.get('rgb_source', 'diffusion'),
+            mc.get('rgb_source', 'student'),
             mc.get('init_type'),
             mc.get('scale'),
             mc.get('feat_scales'),
@@ -533,8 +536,8 @@ def log_model_and_training_detail(
             mc3.get('hsi_agg_mode', HSI_AGG_MODE_CFG),
         )
         logger.info(
-            'student (param) | STUDENT_CHECKPOINT=%s STUDENT_SIZE=%s DIFFUSION_NOISE_MODE=%s NORMALIZE_INPUT=%s',
-            STUDENT_CHECKPOINT,
+            'diffusion_teacher (param) | RGB_DIFFUSION_TEACHER_CHECKPOINT=%s STUDENT_SIZE=%s DIFFUSION_NOISE_MODE=%s NORMALIZE_INPUT=%s',
+            RGB_DIFFUSION_TEACHER_CHECKPOINT,
             STUDENT_SIZE,
             DIFFUSION_NOISE_MODE,
             DIFFUSION_NORMALIZE_INPUT,
@@ -618,7 +621,7 @@ def log_model_and_training_detail(
             f'model_cls: {mc}',
             f'module_cast3: {mc3}',
             f'dataset: {ds}',
-            f'STUDENT_CHECKPOINT: {STUDENT_CHECKPOINT}',
+            f'RGB_DIFFUSION_TEACHER_CHECKPOINT: {RGB_DIFFUSION_TEACHER_CHECKPOINT}',
             f'STUDENT_SIZE: {STUDENT_SIZE}',
             f'DIFFUSION_NOISE_MODE: {DIFFUSION_NOISE_MODE}',
             f'DIFFUSION_NORMALIZE_INPUT: {DIFFUSION_NORMALIZE_INPUT}',

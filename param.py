@@ -231,11 +231,17 @@ def _apply_multimodal_ablation():
 
 _apply_multimodal_ablation()
 
-# Student diffusion（与 ../GFDiff/train_distill.py 中学生 UNet2DModel 一致）
-# 学生由 train_distill 中 UNet2DModel(block_out_channels=student_channels, ...) 构造，
-# checkpoint 为 diffusers DDPMPipeline.save_pretrained；此处为与蒸馏脚本对齐的元数据。
-STUDENT_CHECKPOINT = Path('../../autodl-fs/student32/final')
-STUDENT_SIZE = 32
+# 256×256 DDPM 扩散教师（RGB）：knowledge_distill/train_teacher_256.py；diffusers 目录（UNet+scheduler）
+# 预计算 teacher token / rgb_source=diffusion 时加载；与 LightweightRgbEncoder 无关。
+# 覆盖：MMDIFF_RGB_DIFFUSION_TEACHER_CHECKPOINT
+_raw_rgb_diff_teacher = (os.environ.get('MMDIFF_RGB_DIFFUSION_TEACHER_CHECKPOINT') or '').strip()
+RGB_DIFFUSION_TEACHER_CHECKPOINT = (
+    Path(_raw_rgb_diff_teacher).expanduser()
+    if _raw_rgb_diff_teacher
+    else Path('../../autodl-fs/distill_t256_s128_260320_100630/checkpoint-25000')
+)
+STUDENT_CHECKPOINT = RGB_DIFFUSION_TEACHER_CHECKPOINT  # 旧名，同「扩散教师」权重目录
+STUDENT_SIZE = 256
 STUDENT_IN_CHANNELS = 3
 STUDENT_CHANNELS = (128, 256, 512, 512)
 STUDENT_LAYERS_PER_BLOCK = 2
@@ -248,12 +254,18 @@ FEAT_SCALES = [
     'up_blocks.1',
 ]
 
-# RGB 分支：diffusion=在线冻结学生 UNet；student=轻量 CNN；cached_teacher=离线 token（需 batch 注入 rgb_teacher_tokens）
-RGB_SOURCE = (os.environ.get('MMDIFF_RGB_SOURCE') or 'diffusion').strip().lower()
-RGB_TEACHER_TOKEN_CACHE_TRAIN = DATA_DIR / 'rgb_teacher_tokens_train.npy'
-RGB_TEACHER_TOKEN_META_TRAIN = DATA_DIR / 'rgb_teacher_tokens_train.meta.json'
-RGB_TEACHER_TOKEN_CACHE_TEST = DATA_DIR / 'rgb_teacher_tokens_test.npy'
-RGB_TEACHER_TOKEN_META_TEST = DATA_DIR / 'rgb_teacher_tokens_test.meta.json'
+# HR 严格视野（唯一 RGB 空间对齐）：需 data_prepare 生成 rgb_hr.npy + rgb_hr.meta.json
+TRAIN_RGB_HR_PATH = DATA_DIR / 'rgb_hr.npy'
+RGB_HR_META_PATH = DATA_DIR / 'rgb_hr.meta.json'
+HR_TEACHER_INPUT_SIZE = 256
+
+# RGB 分支：diffusion=在线冻结扩散教师 UNet；student=LightweightRgbEncoder；cached_teacher=离线 token
+_DEFAULT_RGB_SOURCE = 'student'
+RGB_SOURCE = (os.environ.get('MMDIFF_RGB_SOURCE') or _DEFAULT_RGB_SOURCE).strip().lower()
+RGB_TEACHER_TOKEN_CACHE_TRAIN = DATA_DIR / 'rgb_teacher_tokens_train_strict.npy'
+RGB_TEACHER_TOKEN_META_TRAIN = DATA_DIR / 'rgb_teacher_tokens_train_strict.meta.json'
+RGB_TEACHER_TOKEN_CACHE_TEST = DATA_DIR / 'rgb_teacher_tokens_test_strict.npy'
+RGB_TEACHER_TOKEN_META_TEST = DATA_DIR / 'rgb_teacher_tokens_test_strict.meta.json'
 RGB_STUDENT_CHECKPOINT = (os.environ.get('MMDIFF_RGB_STUDENT_CHECKPOINT') or '').strip()
 
 def _cls_diffusion_timesteps_from_env():
@@ -409,7 +421,7 @@ def build_opt():
             ('resume_state', None),
             ('enabled_modalities', list(ENABLED_MODALITIES)),
             ('modality_combo', MODALITY_COMBO),
-            ('rgb_source', (os.environ.get('MMDIFF_RGB_SOURCE') or 'diffusion').strip().lower()),
+            ('rgb_source', (os.environ.get('MMDIFF_RGB_SOURCE') or _DEFAULT_RGB_SOURCE).strip().lower()),
             ('rgb_student_checkpoint', RGB_STUDENT_CHECKPOINT or None),
         ]
     )

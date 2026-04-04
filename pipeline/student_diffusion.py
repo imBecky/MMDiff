@@ -22,12 +22,12 @@ def normalize_student_checkpoint_dir(checkpoint_path) -> str:
     """去掉路径首尾空白并转为绝对路径，避免 diffusers 误判为 Hub repo id。"""
     s = str(checkpoint_path).strip()
     if not s:
-        raise ValueError('学生模型 checkpoint 路径为空（param.STUDENT_CHECKPOINT）')
+        raise ValueError('扩散教师 checkpoint 路径为空（param.RGB_DIFFUSION_TEACHER_CHECKPOINT）')
     p = Path(s).expanduser()
     abs_s = os.path.abspath(str(p)) if not p.is_absolute() else str(p.resolve())
     if not os.path.isdir(abs_s):
         raise FileNotFoundError(
-            f'学生 DDPMPipeline 目录不存在或不是文件夹:\n  {abs_s}'
+            f'扩散教师 DDPMPipeline 目录不存在或不是文件夹:\n  {abs_s}'
         )
     return abs_s
 

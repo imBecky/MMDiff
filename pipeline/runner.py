@@ -35,10 +35,10 @@ from param import (
     NUM_EPOCHS,
     RANDOM_SEED,
     RESUME_CHECKPOINT,
+    RGB_DIFFUSION_TEACHER_CHECKPOINT,
     RGB_SOURCE,
     RGB_STUDENT_CHECKPOINT,
     SAVE_EVERY_EPOCH,
-    STUDENT_CHECKPOINT,
     STUDENT_NUM_TRAIN_TIMESTEPS,
     TB_LOG_ROOT,
     TRAIN_QUICK_VERIFY,
@@ -58,6 +58,8 @@ from .data import (
     batch_to_dict,
     build_dataloaders,
     build_test_loader,
+    load_rgb_hr_meta,
+    load_rgb_hr_volume,
     load_test_indices_shifted,
     load_train_bundle,
     split_train_val_indices,
@@ -202,6 +204,14 @@ def run_training(
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
     feats_vol, rgb_vol, train_indices, label_shift = load_train_bundle()
+    rgb_hr_vol = None
+    hr_rh = 1
+    hr_rw = 1
+    if USE_RGB_PATCHES:
+        rgb_hr_vol = load_rgb_hr_volume()
+        _hr_meta = load_rgb_hr_meta()
+        hr_rh = int(_hr_meta['rh'])
+        hr_rw = int(_hr_meta['rw'])
     if TRAIN_QUICK_VERIFY:
         n_before = len(train_indices)
         train_indices = subset_train_indices_balanced(
@@ -236,6 +246,10 @@ def run_training(
         defer_test=defer_test_load,
         train_global_rows=tr_pos,
         val_global_rows=va_pos,
+        rgb_strict_view=bool(USE_RGB_PATCHES),
+        rgb_hr_vol=rgb_hr_vol,
+        hr_rh=hr_rh,
+        hr_rw=hr_rw,
     )
     opt['len_train_dataloader'] = len(train_loader)
     # 续训：用首次训练时的总 step 数计算 LambdaLR 边界，避免仅因增大 NUM_EPOCHS 而重算 b1/b2 导致 LR 跳变
@@ -367,12 +381,12 @@ def run_training(
 
     diffusion = None
     if not compare_run:
-        rgb_src = (RGB_SOURCE or 'diffusion').strip().lower()
+        rgb_src = (RGB_SOURCE or 'student').strip().lower()
         if rgb_src not in ('diffusion', 'student', 'cached_teacher'):
             raise ValueError(f'RGB_SOURCE / MMDIFF_RGB_SOURCE 无效: {rgb_src!r}')
         if rgb_src == 'diffusion':
             diffusion = StudentDiffusionWrapper(
-                STUDENT_CHECKPOINT,
+                RGB_DIFFUSION_TEACHER_CHECKPOINT,
                 STUDENT_NUM_TRAIN_TIMESTEPS,
                 noise_mode=DIFFUSION_NOISE_MODE,
                 noise_seed_base=RANDOM_SEED,
@@ -426,7 +440,7 @@ def run_training(
             '续训学习率缩放 ×0.5 | 当前 param_group lr=%s',
             [float(g['lr']) for g in optimizer.param_groups],
         )
-    elif not compare_run and (RGB_SOURCE or 'diffusion').strip().lower() == 'student':
+    elif not compare_run and (RGB_SOURCE or 'student').strip().lower() == 'student':
         ck = (RGB_STUDENT_CHECKPOINT or '').strip()
         if ck:
             ck_path = Path(ck)
@@ -442,7 +456,7 @@ def run_training(
     if (
         not compare_run
         and not resume_ckpt
-        and (RGB_SOURCE or 'diffusion').strip().lower() == 'student'
+        and (RGB_SOURCE or 'student').strip().lower() == 'student'
         and (os.environ.get('MMDIFF_FREEZE_RGB_STUDENT') or '').strip().lower()
         in ('1', 'true', 'yes', 'on')
     ):
@@ -749,7 +763,14 @@ def run_training(
             logger.info('加载测试集（final evaluation）...')
             ti = load_test_indices_shifted(label_shift)
             test_loader = build_test_loader(
-                feats_vol, rgb_vol, ti, BATCH_SIZE
+                feats_vol,
+                rgb_vol,
+                ti,
+                BATCH_SIZE,
+                rgb_strict_view=bool(USE_RGB_PATCHES),
+                rgb_hr_vol=rgb_hr_vol,
+                hr_rh=hr_rh,
+                hr_rw=hr_rw,
             )
         preds_final, targets_final, conf_final, eval_loss_final, eval_acc_final = evaluate(
             best_model,
@@ -861,6 +882,14 @@ def verify_projection_gradients(create_classifier: CreateClassifierFn) -> None:
     logger.info('[verify_projection_grad] %s', MULTIMODAL_ABLATION_LOG_LINE)
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     fv, rv, tr_ind, ls = load_train_bundle()
+    rgb_hr_vol = None
+    hr_rh = 1
+    hr_rw = 1
+    if USE_RGB_PATCHES:
+        rgb_hr_vol = load_rgb_hr_volume()
+        _hr_meta = load_rgb_hr_meta()
+        hr_rh = int(_hr_meta['rh'])
+        hr_rw = int(_hr_meta['rw'])
     tr_i, va_i, tr_p, va_p = split_train_val_indices(tr_ind, VAL_RATIO, RANDOM_SEED)
     defer = 0 < VAL_RATIO < 1.0
     te_i = None if defer else load_test_indices_shifted(ls)
@@ -874,13 +903,17 @@ def verify_projection_gradients(create_classifier: CreateClassifierFn) -> None:
         defer_test=defer,
         train_global_rows=tr_p,
         val_global_rows=va_p,
+        rgb_strict_view=bool(USE_RGB_PATCHES),
+        rgb_hr_vol=rgb_hr_vol,
+        hr_rh=hr_rh,
+        hr_rw=hr_rw,
     )
     opt['len_train_dataloader'] = len(train_loader)
     diffusion = None
-    rgb_src = (RGB_SOURCE or 'diffusion').strip().lower()
+    rgb_src = (RGB_SOURCE or 'student').strip().lower()
     if rgb_src == 'diffusion':
         diffusion = StudentDiffusionWrapper(
-            STUDENT_CHECKPOINT,
+            RGB_DIFFUSION_TEACHER_CHECKPOINT,
             STUDENT_NUM_TRAIN_TIMESTEPS,
             noise_mode=DIFFUSION_NOISE_MODE,
             noise_seed_base=RANDOM_SEED,

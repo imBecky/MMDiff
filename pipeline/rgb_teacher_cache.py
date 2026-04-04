@@ -19,8 +19,9 @@ def default_meta(
     d_model: int,
     feat_scales: list[str],
     diffusion_ts: list[int],
-    student_checkpoint: str,
+    diffusion_teacher_checkpoint: str,
 ) -> dict[str, Any]:
+    s = str(diffusion_teacher_checkpoint)
     return {
         'version': 1,
         'n_rows': int(n_rows),
@@ -29,7 +30,8 @@ def default_meta(
         'd_model': int(d_model),
         'feat_scales': list(feat_scales),
         'diffusion_ts': [int(x) for x in diffusion_ts],
-        'student_checkpoint': str(student_checkpoint),
+        'diffusion_teacher_checkpoint': s,
+        'student_checkpoint': s,
     }
 
 

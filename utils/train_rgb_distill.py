@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
-轻量 RGB student 蒸馏：拟合离线预计算的 teacher token（MSE + 余弦）。
+轻量 RGB 编码器蒸馏：拟合离线预计算的扩散教师 token（MSE + 余弦）。
+学生输入为 HR 严格视野块均值得到的 11×11（需 rgb_hr.npy）。
 
 依赖：先运行 `python utils/precompute_rgb_teacher_tokens.py --split train`
 
@@ -44,8 +45,11 @@ from model.rgb_student import LightweightRgbEncoder  # noqa: E402
 from pipeline.rgb_teacher_cache import mmap_tokens  # noqa: E402
 from pipeline.data import (  # noqa: E402
     _apply_rot_k,
-    _crop_patch_hwc,
+    _crop_hr_strict_hwc,
     _random_rot_k,
+    hr_crop_downsample_to_lr_patch,
+    load_rgb_hr_meta,
+    load_rgb_hr_volume,
     load_train_bundle,
     split_train_val_indices,
 )
@@ -56,20 +60,26 @@ class _RgbDistillDataset(Dataset):
 
     def __init__(
         self,
-        rgb_vol: np.ndarray,
         indices: np.ndarray,
         global_rows: np.ndarray,
         cache: np.ndarray,
+        rgb_hr_vol: np.ndarray,
+        rh: int,
+        rw: int,
         training: bool,
         rot_factor: int,
     ):
-        self.rgb = rgb_vol
         self.indices = np.asarray(indices, dtype=np.int64)
         self.global_rows = np.asarray(global_rows, dtype=np.int64)
         self.cache = cache
+        self.rgb_hr_vol = rgb_hr_vol
+        self.rh = int(rh)
+        self.rw = int(rw)
         self.training = training
         self.rot_factor = int(rot_factor)
         self.w = int(PATCH_WINDOW_SIZE)
+        if self.rh != self.rw:
+            raise ValueError('严格视野蒸馏要求 rh==rw')
 
     def __len__(self) -> int:
         return len(self.indices)
@@ -83,10 +93,10 @@ class _RgbDistillDataset(Dataset):
             rk = _random_rot_k(self.rot_factor)
         else:
             rk = 0
-        rp = _crop_patch_hwc(self.rgb, row, col, self.w)
+        hp = _crop_hr_strict_hwc(self.rgb_hr_vol, row, col, self.w, self.rh, self.rw)
+        rp = hr_crop_downsample_to_lr_patch(hp, self.rh, self.rw, self.w)
         if rk:
             rp = _apply_rot_k(rp, rk)
-        # mmap 上的数组只读；from_numpy 需要可写 buffer，否则 PyTorch 报警
         x = np.array(np.transpose(rp, (2, 0, 1)), dtype=np.float32, copy=True)
         tgt = np.asarray(self.cache[gr, rk], dtype=np.float32, copy=True)
         return (
@@ -98,7 +108,7 @@ class _RgbDistillDataset(Dataset):
 
 
 def _parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description='RGB student 蒸馏 teacher token')
+    p = argparse.ArgumentParser(description='RGB 轻量编码器蒸馏扩散教师 token')
     p.add_argument('--epochs', type=int, default=100, help='最大 epoch 数（配合早停）')
     p.add_argument(
         '--early-stopping-patience',
@@ -109,7 +119,12 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument('--batch-size', type=int, default=0, help='0 表示使用 param.BATCH_SIZE')
     p.add_argument('--lr', type=float, default=1e-3)
     p.add_argument('--weight-decay', type=float, default=1e-4)
-    p.add_argument('--cache', type=str, default='', help='rgb_teacher_tokens_train.npy 路径')
+    p.add_argument(
+        '--cache',
+        type=str,
+        default='',
+        help='teacher token npy；默认 DATA_DIR/rgb_teacher_tokens_train_strict.npy',
+    )
     p.add_argument('--out', type=str, default='rgb_student_distill.pt')
     p.add_argument('--device', type=str, default='cuda')
     p.add_argument('--val-ratio', type=float, default=0.1)
@@ -126,22 +141,44 @@ def main() -> None:
     np.random.seed(seed)
     device = torch.device(args.device if torch.cuda.is_available() else 'cpu')
 
-    cache_path = Path(args.cache) if args.cache else (Path(DATA_DIR) / 'rgb_teacher_tokens_train.npy')
+    cache_path = Path(args.cache) if args.cache else Path(DATA_DIR) / 'rgb_teacher_tokens_train_strict.npy'
     if not cache_path.is_file():
         raise FileNotFoundError(
             f'未找到 teacher 缓存 {cache_path}，请先运行 utils/precompute_rgb_teacher_tokens.py --split train'
         )
     cache = mmap_tokens(cache_path)
 
-    _feats, rgb_vol, train_indices, _ls = load_train_bundle()
+    _feats, _rgb_vol, train_indices, _ls = load_train_bundle()
+    rgb_hr_vol = load_rgb_hr_volume()
+    _m = load_rgb_hr_meta()
+    rh = int(_m['rh'])
+    rw = int(_m['rw'])
 
     tr_idx, va_idx, tr_pos, va_pos = split_train_val_indices(train_indices, float(args.val_ratio), seed)
     rot = int(TRAIN_ROT_AUGMENT_FACTOR)
     if rot not in (1, 2, 4):
         rot = 1
 
-    train_ds = _RgbDistillDataset(rgb_vol, tr_idx, tr_pos, cache, training=True, rot_factor=rot)
-    val_ds = _RgbDistillDataset(rgb_vol, va_idx, va_pos, cache, training=False, rot_factor=1)
+    train_ds = _RgbDistillDataset(
+        tr_idx,
+        tr_pos,
+        cache,
+        rgb_hr_vol,
+        rh,
+        rw,
+        training=True,
+        rot_factor=rot,
+    )
+    val_ds = _RgbDistillDataset(
+        va_idx,
+        va_pos,
+        cache,
+        rgb_hr_vol,
+        rh,
+        rw,
+        training=False,
+        rot_factor=1,
+    )
 
     bs = int(args.batch_size) if args.batch_size > 0 else int(BATCH_SIZE)
     train_loader = DataLoader(

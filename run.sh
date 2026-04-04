@@ -31,11 +31,10 @@ setup_common() {
   export MMDIFF_USE_SUPCON="${MMDIFF_USE_SUPCON:-0}"
 }
 
-# 主训练：RGB_SOURCE=student；ablate 为 random | freeze | finetune
+# 主训练：rgb_source 默认见 param；此处只设消融（random|freeze|finetune）
 setup_rgb_ablate() {
   local a="${1:?}"
   setup_common
-  export MMDIFF_RGB_SOURCE=student
   export MMDIFF_EXPERIMENT_NUM="${MMDIFF_EXPERIMENT_NUM:-1}"
   export MMDIFF_LR_TAG="${MMDIFF_LR_TAG:-$MMDIFF_LEARNING_RATE}"
   case "$a" in
@@ -76,7 +75,8 @@ usage() {
   help           本说明
 
 环境变量（节选）:
-  MMDIFF_RGB_STUDENT_CHECKPOINT   蒸馏 student 路径，默认 <仓库根>/rgb_student_distill.pt
+  扩散教师路径 / 默认 rgb_source / HR 严格视野：见 param.py（需 data_prepare 生成 rgb_hr.npy）
+  MMDIFF_RGB_STUDENT_CHECKPOINT   轻量 RGB 编码器权重路径，默认 <仓库根>/rgb_student_distill.pt
   MMDIFF_FREEZE_RGB_STUDENT       1/true 冻结 rgb_student（runner 内重建优化器）
   MMDIFF_PRECOMPUTE_BATCH / MMDIFF_DISTILL_BATCH
   MMDIFF_DISTILL_EPOCHS  蒸馏最大 epoch，默认 100
@@ -133,16 +133,15 @@ case "$1" in
     ;;
   precompute)
     _pcb="${MMDIFF_PRECOMPUTE_BATCH:-32}"
-    echo "=== precompute train (batch=$_pcb) ==="
+    echo "=== precompute train+test (batch=$_pcb) HR 严格视野 -> param 中 teacher token 路径 ==="
     python utils/precompute_rgb_teacher_tokens.py --split train --batch-size "$_pcb"
-    echo "=== precompute test (batch=$_pcb) ==="
     python utils/precompute_rgb_teacher_tokens.py --split test --batch-size "$_pcb"
     ;;
   distill)
     _de="${MMDIFF_DISTILL_EPOCHS:-100}"
     _db="${MMDIFF_DISTILL_BATCH:-0}"
     _esp="${MMDIFF_DISTILL_EARLY_STOP:-15}"
-    echo "=== distill student -> $RGB_STUDENT_CKPT (max_epochs=$_de early_stop_patience=$_esp TB under param.TB_LOG_ROOT) ==="
+    echo "=== distill LightweightRgbEncoder -> $RGB_STUDENT_CKPT (max_epochs=$_de early_stop_patience=$_esp) ==="
     python utils/train_rgb_distill.py --epochs "$_de" --batch-size "$_db" --early-stopping-patience "$_esp" --out "$RGB_STUDENT_CKPT"
     ;;
   train_random)

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from typing import Optional, Tuple
 
 import numpy as np
@@ -14,9 +15,11 @@ from param import (
     NUM_CLASSES,
     NUM_WORKERS,
     PATCH_WINDOW_SIZE,
+    RGB_HR_META_PATH,
     TEST_LABELS_PATH,
     TRAIN_LABELS_PATH,
     TRAIN_PATCHES_PATH,
+    TRAIN_RGB_HR_PATH,
     TRAIN_RGB_PATCHES_PATH,
     TRAIN_ROT_AUGMENT_FACTOR,
     USE_RGB_PATCHES,
@@ -51,6 +54,84 @@ def _require_prepared_data_files():
         raise FileNotFoundError(
             f'USE_RGB_PATCHES 为真但缺少 {TRAIN_RGB_PATCHES_PATH}，请运行 data_prepare 生成 train_rgb_patches.npy'
         )
+    if USE_RGB_PATCHES:
+        if not TRAIN_RGB_HR_PATH.is_file():
+            raise FileNotFoundError(
+                f'启用 rgb 需要 {TRAIN_RGB_HR_PATH}，请运行 data_prepare 生成 rgb_hr.npy'
+            )
+        if not RGB_HR_META_PATH.is_file():
+            raise FileNotFoundError(
+                f'启用 rgb 需要 {RGB_HR_META_PATH}，请运行 data_prepare 生成 rgb_hr.meta.json'
+            )
+
+
+def load_rgb_hr_meta() -> dict:
+    """读取 rgb_hr.meta.json（rh/rw、LR/HR 形状、严格视野块尺寸）。"""
+    if not RGB_HR_META_PATH.is_file():
+        raise FileNotFoundError(f'缺少 {RGB_HR_META_PATH}，请先运行 data_prepare.py')
+    with open(RGB_HR_META_PATH, encoding='utf-8') as f:
+        return json.load(f)
+
+
+def load_rgb_hr_volume():
+    """mmap 整幅归一化 HR RGB（与 train_rgb_patches 栅格对齐的裁切区域）。"""
+    if not TRAIN_RGB_HR_PATH.is_file():
+        raise FileNotFoundError(f'缺少 {TRAIN_RGB_HR_PATH}，请先运行 data_prepare.py')
+    return np.load(TRAIN_RGB_HR_PATH, mmap_mode='r')
+
+
+def _crop_hr_strict_hwc(
+    vol_hr_hwc: np.ndarray,
+    row_lr: int,
+    col_lr: int,
+    window_lr: int,
+    rh: int,
+    rw: int,
+) -> np.ndarray:
+    """
+    与 LR patch (row_lr,col_lr,window_lr) 空间对齐的 HR 裁块，形状
+    (window_lr*rh, window_lr*rw, C)。边界零填充与 _crop_patch_hwc 一致。
+    """
+    m = window_lr // 2
+    h, w, c = vol_hr_hwc.shape
+    r0, r1 = row_lr - m, row_lr + m + 1
+    c0, c1 = col_lr - m, col_lr + m + 1
+    hr_r0, hr_r1 = r0 * rh, r1 * rh
+    hr_c0, hr_c1 = c0 * rw, c1 * rw
+    pad_top = max(0, -hr_r0)
+    pad_bottom = max(0, hr_r1 - h)
+    pad_left = max(0, -hr_c0)
+    pad_right = max(0, hr_c1 - w)
+    hr_r0c, hr_r1c = max(0, hr_r0), min(h, hr_r1)
+    hr_c0c, hr_c1c = max(0, hr_c0), min(w, hr_c1)
+    patch = vol_hr_hwc[hr_r0c:hr_r1c, hr_c0c:hr_c1c, :].astype(np.float32, copy=False)
+    if pad_top or pad_bottom or pad_left or pad_right:
+        patch = np.pad(
+            patch,
+            ((pad_top, pad_bottom), (pad_left, pad_right), (0, 0)),
+            mode='constant',
+            constant_values=0.0,
+        )
+    exp_h, exp_w = window_lr * rh, window_lr * rw
+    if patch.shape[0] != exp_h or patch.shape[1] != exp_w:
+        raise ValueError(
+            f'HR strict crop 形状 {patch.shape[:2]} 与期望 ({exp_h},{exp_w}) 不一致'
+        )
+    return patch
+
+
+def hr_crop_downsample_to_lr_patch(
+    hr_patch_hwc: np.ndarray,
+    rh: int,
+    rw: int,
+    window_lr: int,
+) -> np.ndarray:
+    """HR 严格视野块按 rh×rw 非重叠块均值下采样为 (window_lr, window_lr, C)。"""
+    h, w, c = hr_patch_hwc.shape
+    exp_h, exp_w = window_lr * rh, window_lr * rw
+    if h != exp_h or w != exp_w:
+        raise ValueError(f'HR patch 形状 {h}x{w} 与期望 {exp_h}x{exp_w} 不一致')
+    return hr_patch_hwc.reshape(window_lr, rh, window_lr, rw, c).mean(axis=(1, 3))
 
 
 def _crop_patch_hwc(vol_hwc: np.ndarray, row: int, col: int, window_size: int) -> np.ndarray:
@@ -130,6 +211,10 @@ class PatchDataset(torch.utils.data.Dataset):
         rot_factor: int = 1,
         supcon_dual_view: bool = False,
         global_row_indices: Optional[np.ndarray] = None,
+        rgb_hr_vol: Optional[np.ndarray] = None,
+        hr_rh: int = 1,
+        hr_rw: int = 1,
+        rgb_strict_view: bool = False,
     ):
         super().__init__()
         self.feats = feats_vol
@@ -139,6 +224,19 @@ class PatchDataset(torch.utils.data.Dataset):
         self.training = training
         self.rot_factor = int(rot_factor)
         self.supcon_dual_view = bool(supcon_dual_view)
+        self.rgb_hr_vol = rgb_hr_vol
+        self.hr_rh = int(hr_rh)
+        self.hr_rw = int(hr_rw)
+        self.rgb_strict_view = bool(rgb_strict_view)
+        if self.rgb_strict_view:
+            if self.rgb_hr_vol is None:
+                raise ValueError('rgb_strict_view=True 时需要 rgb_hr_vol（rgb_hr.npy mmap）')
+            if self.hr_rh <= 0 or self.hr_rw <= 0:
+                raise ValueError('hr_rh/hr_rw 须为正整数')
+            if self.hr_rh != self.hr_rw:
+                raise ValueError(
+                    '严格视野 HR 旋转与 teacher 对齐需 rh==rw（当前 HR 块非正方形）'
+                )
         if global_row_indices is not None:
             gr = np.asarray(global_row_indices, dtype=np.int64).reshape(-1)
             if gr.shape[0] != len(self.indices):
@@ -148,6 +246,15 @@ class PatchDataset(torch.utils.data.Dataset):
             self.global_row_indices = gr
         else:
             self.global_row_indices = None
+
+    def _rgb_patch_base_hwc(self, row: int, col: int, w: int) -> np.ndarray:
+        """未旋转的 RGB patch（LR 下采样栅格；strict 时由 HR 块均值得到）。"""
+        if self.rgb_strict_view and self.rgb_hr_vol is not None:
+            hp = _crop_hr_strict_hwc(self.rgb_hr_vol, row, col, w, self.hr_rh, self.hr_rw)
+            return hr_crop_downsample_to_lr_patch(hp, self.hr_rh, self.hr_rw, w)
+        if self.rgb is None:
+            raise RuntimeError('需要 rgb_vol 或 rgb_hr_vol+strict')
+        return _crop_patch_hwc(self.rgb, row, col, w)
 
     def __len__(self):
         return len(self.indices)
@@ -163,8 +270,8 @@ class PatchDataset(torch.utils.data.Dataset):
         gr_t = torch.tensor(global_row, dtype=torch.long)
 
         if self.training and self.supcon_dual_view:
-            if self.rgb is not None:
-                rp = _crop_patch_hwc(self.rgb, row, col, w)
+            if self.rgb is not None or self.rgb_strict_view:
+                rp = self._rgb_patch_base_hwc(row, col, w)
                 h1, l1, r1, rk1 = _tensorize_view_from_crops(
                     fp, rp, rot_factor=self.rot_factor, training=self.training,
                 )
@@ -191,8 +298,8 @@ class PatchDataset(torch.utils.data.Dataset):
             np.transpose(fp[:, :, HSI_CHANNELS : HSI_CHANNELS + LIDAR_CHANNELS], (2, 0, 1))
         )
         rk_t = torch.tensor(int(rk), dtype=torch.long)
-        if self.rgb is not None:
-            rp = _crop_patch_hwc(self.rgb, row, col, w)
+        if self.rgb is not None or self.rgb_strict_view:
+            rp = self._rgb_patch_base_hwc(row, col, w)
             rp = _apply_rot_k(rp, rk)
             rgb = _patch_array_to_float32(np.transpose(rp, (2, 0, 1)))
             return (
@@ -296,6 +403,10 @@ def build_test_loader(
     batch_size: int,
     *,
     global_row_indices: Optional[np.ndarray] = None,
+    rgb_strict_view: bool = False,
+    rgb_hr_vol: Optional[np.ndarray] = None,
+    hr_rh: int = 1,
+    hr_rw: int = 1,
 ) -> DataLoader:
     if global_row_indices is None:
         global_row_indices = np.arange(len(test_indices), dtype=np.int64)
@@ -308,6 +419,10 @@ def build_test_loader(
         rot_factor=1,
         supcon_dual_view=False,
         global_row_indices=global_row_indices,
+        rgb_hr_vol=rgb_hr_vol,
+        hr_rh=hr_rh,
+        hr_rw=hr_rw,
+        rgb_strict_view=rgb_strict_view,
     )
     pin_memory = torch.cuda.is_available()
     return DataLoader(
@@ -331,6 +446,10 @@ def build_dataloaders(
     train_global_rows: Optional[np.ndarray] = None,
     val_global_rows: Optional[np.ndarray] = None,
     test_global_rows: Optional[np.ndarray] = None,
+    rgb_strict_view: bool = False,
+    rgb_hr_vol: Optional[np.ndarray] = None,
+    hr_rh: int = 1,
+    hr_rw: int = 1,
 ):
     pin_memory = torch.cuda.is_available()
     rot = int(TRAIN_ROT_AUGMENT_FACTOR)
@@ -346,6 +465,10 @@ def build_dataloaders(
         rot_factor=rot,
         supcon_dual_view=USE_SUPCON,
         global_row_indices=train_global_rows,
+        rgb_hr_vol=rgb_hr_vol,
+        hr_rh=hr_rh,
+        hr_rw=hr_rw,
+        rgb_strict_view=rgb_strict_view,
     )
     train_loader = DataLoader(
         train_ds,
@@ -366,6 +489,10 @@ def build_dataloaders(
             rot_factor=1,
             supcon_dual_view=False,
             global_row_indices=val_global_rows,
+            rgb_hr_vol=rgb_hr_vol,
+            hr_rh=hr_rh,
+            hr_rw=hr_rw,
+            rgb_strict_view=rgb_strict_view,
         )
         val_loader = DataLoader(
             val_ds,
@@ -381,7 +508,15 @@ def build_dataloaders(
         if tgr is None:
             tgr = np.arange(len(test_idx), dtype=np.int64)
         test_loader = build_test_loader(
-            feats_vol, rgb_vol, test_idx, batch_size, global_row_indices=tgr,
+            feats_vol,
+            rgb_vol,
+            test_idx,
+            batch_size,
+            global_row_indices=tgr,
+            rgb_strict_view=rgb_strict_view,
+            rgb_hr_vol=rgb_hr_vol,
+            hr_rh=hr_rh,
+            hr_rw=hr_rw,
         )
 
     return train_loader, val_loader, test_loader

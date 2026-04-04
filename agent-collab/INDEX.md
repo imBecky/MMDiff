@@ -4,6 +4,8 @@
 
 | 最近更新 | 主题 | 一句话结果 | 详情 |
 |---------|------|------------|------|
+| 2026-04-04 | **param 瘦身 + RGB 扩散教师** | 256 DDPM 默认路径、`rgb_source=student`、仅 HR+`*_strict` 缓存、减 env/减 `run.sh` 重复；原则见日志 | [logs/2026-04-04-param-slim-rgb-teacher.md](./logs/2026-04-04-param-slim-rgb-teacher.md) |
+| 2026-04-03 | **RGB 轻量 student：蒸馏 TB+早停、teacher 缓存与 run.sh 消融** | `rgb_teacher_cache`/`open_memmap`/`tempt.py`；`train_rgb_distill` 默认 100ep、**早停 15**、TensorBoard；**`MMDIFF_FREEZE_RGB_STUDENT`**；**`ablate_all`=先 distill 再 random/freeze/ft**；**`all`=precompute→ablate_all**（不重复 distill）；`run.sh` 不写本地 tee 日志 | [logs/2026-04-03-rgb-student-distill-ablation-and-cache.md](./logs/2026-04-03-rgb-student-distill-ablation-and-cache.md) |
 | 2026-04-03 | **run.sh 续训 exp3/4/5** | `exp3r`/`exp4r`/`exp5r` 从 `final` 续训；`resume345` 串行；`MMDIFF_RESUME_EXP*`/`RESUME_RUN_TS` 可覆盖；**exp5=piecewise** 对齐 best、非 cosine；runner 续训后 lr×0.5 | [logs/2026-04-03-runsh-resume-exp345-and-exp5-scheduler.md](./logs/2026-04-03-runsh-resume-exp345-and-exp5-scheduler.md) |
 | 2026-04-02 | **run.sh 主模型五组实验网格** | exp1=cosine+SupCon；exp2 关 SupCon；exp3/4=BS512 仅 WD 5e-4 vs 2e-4；exp5=piecewise 6e-4 无 SupCon；`all` 串行 1→5 | [logs/2026-04-02-runsh-exp-grid-five.md](./logs/2026-04-02-runsh-exp-grid-five.md) |
 | 2026-04-02 | **对比模型可复现 / 学术诚信（强制）** | 除统一数据+epoch/lr 等基础项外，对比须对齐**原论文方法**；Two-branch 三阶段；**DFINet**（联合损失+SGD，`dfinet_protocol`）与 **MACN**（Focal+Adam+无调度）已接；本机跑 Python 先 **`conda activate hbq`**（见 [`README`](./README.md)） | [logs/2026-04-02-compare-models-repro-integrity.md](./logs/2026-04-02-compare-models-repro-integrity.md) |

@@ -4,6 +4,8 @@
 输出（文件名与旧版一致，见 param）：
   train_patches.npy      (H,W,HSI+LiDAR) float16
   train_rgb_patches.npy  (H,W,3) float16
+  rgb_hr.npy             (H_hr,W_hr,3) float16  与 LR 对齐的 HR 裁切、归一化（严格视野蒸馏用）
+  rgb_hr.meta.json       rh/rw、LR/HR 形状、严格视野 HR patch 尺寸等
   train_labels.npy       (N,3) int32: [原始标签, row, col]
   test_labels.npy        (M,3) int32
   label_shift.npy        标量 int64，训练时与 pipeline/data 内平移一致
@@ -15,6 +17,7 @@
 from __future__ import annotations
 
 from os import makedirs
+import json
 import scipy.io as sio
 from scipy import sparse
 import numpy as np
@@ -27,9 +30,11 @@ from param import (
     NUM_CLASSES,
     PATCH_WINDOW_SIZE,
     RGB_CHANNELS,
+    RGB_HR_META_PATH,
     TEST_LABELS_PATH,
     TRAIN_LABELS_PATH,
     TRAIN_PATCHES_PATH,
+    TRAIN_RGB_HR_PATH,
     TRAIN_RGB_PATCHES_PATH,
 )
 
@@ -137,8 +142,15 @@ def main():
 
     hsi = ensure_hsi_channel_dim(data['hsi'])
     lidar = ensure_lidar_channel_dim(data['lidar'])
-    rgb = ensure_rgb_channel_dim(data['rgb'])
-    rgb = downsample_rgb_to_match(rgb, target_h=hsi.shape[0], target_w=hsi.shape[1])
+    rgb_raw = ensure_rgb_channel_dim(data['rgb'])
+    h_lr, w_lr = int(hsi.shape[0]), int(hsi.shape[1])
+    hh, ww, _ = rgb_raw.shape
+    rh = hh // h_lr
+    rw = ww // w_lr
+    h_crop = h_lr * rh
+    w_crop = w_lr * rw
+    rgb_hr_cropped = rgb_raw[:h_crop, :w_crop, :]
+    rgb = downsample_rgb_to_match(rgb_raw, target_h=h_lr, target_w=w_lr)
 
     feats = np.concatenate([hsi, lidar], axis=2)
 
@@ -153,6 +165,8 @@ def main():
     feats_norm = normalize_features(feats)
     print('Normalizing RGB features...')
     rgb_norm = normalize_features(rgb)
+    print('Normalizing HR RGB (aligned crop, strict-view distill)...')
+    rgb_hr_norm = normalize_features(rgb_hr_cropped)
 
     train = ensure_label_array(data['train'], 'train')
     test = ensure_label_array(data['test'], 'test')
@@ -170,6 +184,24 @@ def main():
     np.save(TRAIN_PATCHES_PATH, feats_norm.astype(PATCH_DTYPE))
     print(f'Saving train_rgb_patches -> {TRAIN_RGB_PATCHES_PATH} ({PATCH_DTYPE})...')
     np.save(TRAIN_RGB_PATCHES_PATH, rgb_norm.astype(PATCH_DTYPE))
+    print(f'Saving rgb_hr -> {TRAIN_RGB_HR_PATH} ({PATCH_DTYPE})...')
+    np.save(TRAIN_RGB_HR_PATH, rgb_hr_norm.astype(PATCH_DTYPE))
+    hr_meta = {
+        'rh': int(rh),
+        'rw': int(rw),
+        'lr_h': int(h_lr),
+        'lr_w': int(w_lr),
+        'hr_h': int(h_crop),
+        'hr_w': int(w_crop),
+        'patch_window_size': int(PATCH_WINDOW_SIZE),
+        'strict_hr_patch_h': int(PATCH_WINDOW_SIZE * rh),
+        'strict_hr_patch_w': int(PATCH_WINDOW_SIZE * rw),
+    }
+    RGB_HR_META_PATH.write_text(
+        json.dumps(hr_meta, indent=2, ensure_ascii=False) + '\n',
+        encoding='utf-8',
+    )
+    print(f'Saving rgb_hr meta -> {RGB_HR_META_PATH}')
     print(f'Saving train_labels -> {TRAIN_LABELS_PATH} (N={train_idx.shape[0]})...')
     np.save(TRAIN_LABELS_PATH, train_idx.astype(np.int32))
     print(f'Saving test_labels -> {TEST_LABELS_PATH} (M={test_idx.shape[0]})...')
