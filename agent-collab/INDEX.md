@@ -4,6 +4,9 @@
 
 | 最近更新 | 主题 | 一句话结果 | 详情 |
 |---------|------|------------|------|
+| 2026-04-08 | **run.sh：SE24 四组网格** | 去掉 base/lidar_wide；`train_exp exp1–4`；exp3 略增 wd；exp4 cls 320/160 + wd；`MMDIFF_CLS_*` 入 param | [logs/2026-04-08-runsh-grid-se24-wd-cls.md](./logs/2026-04-08-runsh-grid-se24-wd-cls.md) |
+| 2026-04-07 | **DFINet = formango 官方仓** | 已接 DFINet；新增注册别名 `formango_dfinet`/`hsi_msi_multisource`，`DFINET_PROTOCOL_COMPARE_NAMES` 统一走 `dfinet_protocol` | [logs/2026-04-07-dfinet-formango-registry-aliases.md](./logs/2026-04-07-dfinet-formango-registry-aliases.md) |
+| 2026-04-06 | **run.sh 精简 + HSI 48 + 融合仅 cross** | 根 `run.sh`：`bash "$RUN_SH"`、LF、**distill→grid**、无 precompute；`HSI_CHANNELS=48`/`MMDIFF_HSI_CHANNELS`；`load_train_bundle` 维校验；去掉 concat 与 `FUSION_MODE`；`mmdd-hhmm` | [logs/2026-04-06-runsh-slim-hsi48-cross-only.md](./logs/2026-04-06-runsh-slim-hsi48-cross-only.md) |
 | 2026-04-04 | **param 瘦身 + RGB 扩散教师** | 256 DDPM 默认路径、`rgb_source=student`、仅 HR+`*_strict` 缓存、减 env/减 `run.sh` 重复；原则见日志 | [logs/2026-04-04-param-slim-rgb-teacher.md](./logs/2026-04-04-param-slim-rgb-teacher.md) |
 | 2026-04-03 | **RGB 轻量 student：蒸馏 TB+早停、teacher 缓存与 run.sh 消融** | `rgb_teacher_cache`/`open_memmap`/`tempt.py`；`train_rgb_distill` 默认 100ep、**早停 15**、TensorBoard；**`MMDIFF_FREEZE_RGB_STUDENT`**；**`ablate_all`=先 distill 再 random/freeze/ft**；**`all`=precompute→ablate_all**（不重复 distill）；`run.sh` 不写本地 tee 日志 | [logs/2026-04-03-rgb-student-distill-ablation-and-cache.md](./logs/2026-04-03-rgb-student-distill-ablation-and-cache.md) |
 | 2026-04-03 | **run.sh 续训 exp3/4/5** | `exp3r`/`exp4r`/`exp5r` 从 `final` 续训；`resume345` 串行；`MMDIFF_RESUME_EXP*`/`RESUME_RUN_TS` 可覆盖；**exp5=piecewise** 对齐 best、非 cosine；runner 续训后 lr×0.5 | [logs/2026-04-03-runsh-resume-exp345-and-exp5-scheduler.md](./logs/2026-04-03-runsh-resume-exp345-and-exp5-scheduler.md) |

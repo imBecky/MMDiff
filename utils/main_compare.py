@@ -36,7 +36,11 @@ def main():
         '--model',
         type=str,
         required=True,
-        help='模型注册名，如 fgcnn fusatnet exvit two_branch_cnn dfinet macn（fgcn 为兼容旧名；exvit/mvit 为 ExViT）',
+        help=(
+            '模型注册名，如 fgcnn fusatnet exvit two_branch_cnn dfinet macn；'
+            'DFINet 官方仓库名别名：formango_dfinet / hsi_msi_multisource（'
+            'https://github.com/formango/HSI_MSI_Multisource_Classification ）'
+        ),
     )
     parser.add_argument(
         '--verify-projection-grad',

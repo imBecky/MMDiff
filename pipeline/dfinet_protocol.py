@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 from pathlib import Path
 from typing import Any, Callable, Optional
 
@@ -34,6 +35,7 @@ from param import (
     opt,
 )
 from model.compare_model.dfinet_loss import dfinet_calc_loss
+from model.compare_model.registry import DFINET_PROTOCOL_COMPARE_NAMES
 
 from .checkpoint import save_classifier_checkpoint
 from .classification_metrics import accuracies
@@ -48,7 +50,7 @@ def _use_dfinet_protocol() -> bool:
     if (os.environ.get('MMDIFF_DFINET_END2END') or '').strip().lower() in ('1', 'true', 'yes'):
         return False
     name = (os.environ.get('MMDIFF_COMPARE_MODEL') or '').strip().lower().replace('-', '_')
-    return name in ('dfinet', 'dfi_net', 'dfi')
+    return name in DFINET_PROTOCOL_COMPARE_NAMES
 
 
 def run_dfinet_protocol_if_needed(
@@ -118,6 +120,7 @@ def run_dfinet_protocol_if_needed(
     epoch_bar = tqdm(range(NUM_EPOCHS), desc='DFINet [paper loss]')
     last_epoch = -1
     for epoch in epoch_bar:
+        epoch_start = time.perf_counter()
         last_epoch = epoch
         prev_best_acc = best_acc
         model.train()
@@ -145,6 +148,12 @@ def run_dfinet_protocol_if_needed(
 
         tr_loss = running_loss / max(total, 1)
         tr_acc = correct / max(total, 1)
+        epoch_seconds = time.perf_counter() - epoch_start
+
+        if writer is not None:
+            writer.add_scalar('train/epoch_loss', tr_loss, epoch + 1)
+            writer.add_scalar('train/epoch_acc', tr_acc, epoch + 1)
+            writer.add_scalar('timing/epoch_seconds', epoch_seconds, epoch + 1)
 
         run_eval = epoch >= EVAL_VAL_START_EPOCH and selection_loader is not None
         run_selection = run_eval and tr_acc >= EVAL_MIN_TRAIN_ACC
@@ -170,8 +179,13 @@ def run_dfinet_protocol_if_needed(
                 split=selection_split,
                 use_center_logits=False,
             )
-            ovr_acc, _, _, kappa, _, aa = accuracies(conf)
+            ovr_acc, _, _, kappa, s_sqr, aa = accuracies(conf)
             last_eval_epoch = epoch
+            if writer is not None:
+                writer.add_scalar(f'{selection_split}/overall_accuracy', ovr_acc, epoch + 1)
+                writer.add_scalar(f'{selection_split}/average_accuracy', aa, epoch + 1)
+                writer.add_scalar(f'{selection_split}/kappa', kappa, epoch + 1)
+                writer.add_scalar(f'{selection_split}/kappa_variance', s_sqr, epoch + 1)
             logger.info(
                 'DFINet epoch %03d | train_loss=%.4f train_acc=%.4f %s oa=%.4f aa=%.4f kappa=%.4f',
                 epoch + 1,

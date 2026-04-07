@@ -178,7 +178,7 @@ class MCGF(nn.Module):
         dots = torch.einsum('b h i d, b h j d -> b h i j', f_q, f_k) * self.scale
         attn = self.dropout(self.attend(dots))
         out = torch.einsum('b h i j, b h j d -> b h i d', attn, f_v)
-        out = out.transpose(1, 2).contiguous().view(b, n, -1)
+        out = out.transpose(1, 2).contiguous().view(b, n1, -1)
         return self.to_out(out)
 
 

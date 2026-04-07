@@ -15,6 +15,8 @@ if str(ROOT) not in sys.path:
 
 import torch
 
+from param import HSI_CHANNELS
+
 from model.multimodal import HSICenterSpectralEncoder, _crop_center_3x3
 
 
@@ -38,7 +40,7 @@ def _gate_stats(enc: HSICenterSpectralEncoder, hsi: torch.Tensor) -> dict[str, f
 def main() -> None:
     p = argparse.ArgumentParser(description='HSI 分支 gate-before-pool 自检')
     p.add_argument('--batch', type=int, default=8)
-    p.add_argument('--channels', type=int, default=50)
+    p.add_argument('--channels', type=int, default=HSI_CHANNELS)
     p.add_argument('--patch', type=int, default=11)
     p.add_argument('--d-model', type=int, default=256)
     p.add_argument('--conv-hidden', type=int, default=96)

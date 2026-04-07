@@ -8,11 +8,10 @@ import utils.logger as Logger
 # ---------------------------------------------------------------------------
 # 数据与训练（常用修改处）
 # ---------------------------------------------------------------------------
-# 直接 python main.py（无 MMDIFF_*）：piecewise_two_step + 两阶乘子；曾对齐 best_model.log（BS64）
-# run.sh exp1 默认通过环境变量改为 cosine + lr=1e-3 + warmup 5%（见 run.sh setup_common）
+# 直接 python main.py（无 MMDIFF_*）：采用当前文件中的默认实验设置。
 SCHED_STEP_RATIOS = [0.6, 0.7]
 SCHED_GAMMAS = [0.4, 0.1]
-SCHEDULER_NAME = 'piecewise_two_step'
+SCHEDULER_NAME = 'cosine'
 # 仅 MMDIFF_SCHEDULER_NAME=cosine 时生效；warmup_ratio 为总 optimizer step 的占比（每 epoch 步数固定时等价于总轮数的相同比例）
 SCHEDULER_COSINE_ETA_MIN_RATIO = 0.01
 SCHEDULER_COSINE_WARMUP_RATIO = 0.05
@@ -51,12 +50,12 @@ def _apply_scheduler_env():
 _apply_scheduler_env()
 CLIP_GRAD_NORM = 1.0
 EVAL_VAL_START_EPOCH = 20
-LEARNING_RATE = 6e-4
+LEARNING_RATE = 8e-4
 WEIGHT_DECAY = 1e-4
 NUM_WORKERS = 14
 BATCH_SIZE = 64
 CLS_TRANSFORMER_DROPOUT = 0.1
-NUM_EPOCHS = 200
+NUM_EPOCHS = 300
 # 续训时 LambdaLR 衰减边界用：与首次训练一致的总 step 数（通常由 checkpoint 自动写入；旧断点可 export MMDIFF_SCHEDULER_LR_TOTAL_STEPS）
 SCHEDULER_LR_TOTAL_STEPS = 0
 
@@ -144,7 +143,7 @@ LOG_PATH = TB_LOG_ROOT / 'model.log'
 TRAIN_QUICK_VERIFY = False
 TRAIN_QUICK_VERIFY_SAMPLES_PER_CLASS = 150
 
-HSI_CHANNELS = 50
+HSI_CHANNELS = 48
 LIDAR_CHANNELS = 1
 # Houston2018 前景地物类为 20；GT 中背景常为 0，patch 仅含 y>0 像素，标签平移后为 0....19。
 NUM_CLASSES = 20
@@ -178,7 +177,7 @@ LOSS_WEIGHT_CENTER = 0.8
 
 # 监督对比损失 SupCon（Khosla et al.）：在 c_rep 上接 projection，训练集双视图（独立随机旋转）
 # 需要 RGB+扩散特征；与 CE 联合：L = L_ce + SUPCON_WEIGHT * L_supcon
-USE_SUPCON = True
+USE_SUPCON = False
 SUPCON_WEIGHT = 0.1
 SUPCON_TEMPERATURE = 0.07
 SUPCON_PROJ_DIM = 128
@@ -193,12 +192,11 @@ LIDAR_PROJ_HIDDEN_CFG = 64
 # stem 之后在 feat_ch 上追加的空间残差块数（见 model/multimodal.py _LidarSpatialResidualBlock）
 # 0=仅 stem；默认 1（略浅于 2～3 块堆叠）
 LIDAR_EXTRA_BLOCKS_CFG = 3
-HSI_RESIDUAL_BLOCKS_CFG = 4
+HSI_RESIDUAL_BLOCKS_CFG = 6
 HSI_CONV_HIDDEN_CFG = 96
-HSI_SE_RATIO_CFG = 8
+HSI_SE_RATIO_CFG = 16  # 0=关闭 SE；>0=开启并使用对应 squeeze ratio
 # HSI 3×3 空间聚合：mean | attn_pool（D1 可学习加权）| multi_token（D2 中心/四角/四边 三 token）
 HSI_AGG_MODE_CFG = 'attn_pool'
-
 _EFFECTIVE_ABLATION_AXIS = None
 _EFFECTIVE_ABLATION_INDEX = None
 
@@ -505,6 +503,8 @@ def _apply_mmdiff_env_overrides():
     MMDIFF_BATCH_SIZE → BATCH_SIZE 与 opt['dataset']['batch_size']
     MMDIFF_LEARNING_RATE → LEARNING_RATE 与 opt['train']['optimizer']['lr']
     MMDIFF_WEIGHT_DECAY → WEIGHT_DECAY 与 opt['train']['optimizer']['weight_decay']
+    MMDIFF_CLS_TOKEN_DIM → CLS_TOKEN_DIM 与 opt['model_cls']['token_dim']（须能被 transformer_heads 整除）
+    MMDIFF_CLS_HEAD_HIDDEN → CLS_HEAD_HIDDEN 与 opt['model_cls']['head_hidden']
     MMDIFF_EARLY_STOPPING_PATIENCE → EARLY_STOPPING_PATIENCE（0=关闭早停）
     MMDIFF_RESUME_CHECKPOINT → 覆盖 RESUME_CHECKPOINT
     MMDIFF_SCHEDULER_LR_TOTAL_STEPS → opt['scheduler_lr_total_steps']（续训边界；旧 checkpoint 无该字段时手动设）
@@ -554,6 +554,8 @@ def _apply_mmdiff_env_overrides():
     _int('MMDIFF_BATCH_SIZE', 'BATCH_SIZE')
     _int('MMDIFF_EARLY_STOPPING_PATIENCE', 'EARLY_STOPPING_PATIENCE')
     _int('MMDIFF_SCHEDULER_LR_TOTAL_STEPS', 'SCHEDULER_LR_TOTAL_STEPS')
+    _int('MMDIFF_CLS_TOKEN_DIM', 'CLS_TOKEN_DIM')
+    _int('MMDIFF_CLS_HEAD_HIDDEN', 'CLS_HEAD_HIDDEN')
 
     lh = int(g['LIDAR_PROJ_HIDDEN_CFG'])
     if lh < 1:
@@ -565,7 +567,9 @@ def _apply_mmdiff_env_overrides():
     hh = int(g['HSI_CONV_HIDDEN_CFG'])
     if hh < 1:
         raise ValueError(f'HSI_CONV_HIDDEN_CFG / MMDIFF_HSI_CONV_HIDDEN 须 >= 1，当前 {hh}')
-    sr = max(1, int(g['HSI_SE_RATIO_CFG']))
+    sr = int(g['HSI_SE_RATIO_CFG'])
+    if sr < 0:
+        raise ValueError(f'HSI_SE_RATIO_CFG / MMDIFF_HSI_SE_RATIO 须 >= 0，当前 {sr}')
     agg = str(g.get('HSI_AGG_MODE_CFG') or 'mean').strip().lower()
     if agg not in ('mean', 'attn_pool', 'multi_token'):
         raise ValueError(
@@ -596,6 +600,20 @@ def _apply_mmdiff_env_overrides():
 
     opt['train']['optimizer']['lr'] = float(g['LEARNING_RATE'])
     opt['train']['optimizer']['weight_decay'] = float(g['WEIGHT_DECAY'])
+
+    td = int(g['CLS_TOKEN_DIM'])
+    hh_cls = int(g['CLS_HEAD_HIDDEN'])
+    if td < 1:
+        raise ValueError(f'CLS_TOKEN_DIM / MMDIFF_CLS_TOKEN_DIM 须 >= 1，当前 {td}')
+    if hh_cls < 1:
+        raise ValueError(f'CLS_HEAD_HIDDEN / MMDIFF_CLS_HEAD_HIDDEN 须 >= 1，当前 {hh_cls}')
+    nhead = int(g['CLS_TRANSFORMER_HEADS'])
+    if td % nhead != 0:
+        raise ValueError(
+            f'token_dim={td} 须能被 CLS_TRANSFORMER_HEADS={nhead} 整除（MultimodalClassifier 约束）'
+        )
+    opt['model_cls']['token_dim'] = td
+    opt['model_cls']['head_hidden'] = hh_cls
 
     rs = (os.environ.get('MMDIFF_RGB_SOURCE') or '').strip().lower()
     if rs:
@@ -631,6 +649,5 @@ MULTIMODAL_ABLATION_LOG_LINE = (
     f"hsi_res_blocks={HSI_RESIDUAL_BLOCKS_CFG} hsi_conv_hidden={HSI_CONV_HIDDEN_CFG} "
     f"hsi_se_ratio={HSI_SE_RATIO_CFG} hsi_agg_mode={HSI_AGG_MODE_CFG} | "
     f"loss_global/center={LOSS_WEIGHT_GLOBAL}/{LOSS_WEIGHT_CENTER} | "
-    f"use_supcon={USE_SUPCON} supcon_w={SUPCON_WEIGHT} tau={SUPCON_TEMPERATURE} | "
-    f"fusion=cross"
+    f"use_supcon={USE_SUPCON} supcon_w={SUPCON_WEIGHT} tau={SUPCON_TEMPERATURE}"
 )

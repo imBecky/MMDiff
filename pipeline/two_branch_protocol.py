@@ -19,6 +19,7 @@ from tqdm import tqdm
 from param import (
     BATCH_SIZE,
     EARLY_STOPPING_PATIENCE,
+    HSI_CHANNELS,
     EVAL_INTERVAL_EPOCHS,
     EVAL_MIN_TRAIN_ACC,
     EVAL_VAL_START_EPOCH,
@@ -104,7 +105,7 @@ def run_two_branch_protocol_if_needed(
 
     ds = opt.get('dataset', {})
     patch_size = int(ds.get('patch_size') or 11)
-    hsi_c = int(ds.get('hsi_channels') or 50)
+    hsi_c = int(ds.get('hsi_channels') or HSI_CHANNELS)
     lidar_c = int(ds.get('lidar_channel') or 1)
     n_cls = int(ds.get('n_cls') or NUM_CLASSES)
 

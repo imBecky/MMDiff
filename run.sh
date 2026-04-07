@@ -1,109 +1,82 @@
 #!/usr/bin/env bash
-# 轻量 RGB 消融：随机初始化 / 蒸馏权重+冻结 / 蒸馏权重+微调
-# 无参数 = all：precompute → ablate_all（内含 distill + 三种主训练，仅终端输出）
+# 主实验网格：HSI SE + LiDAR 基线宽；不含 base / lidar_wide。
+# SE 默认 24；exp3 略增 wd；exp4 更大 classifier（320/160）+ 再略增 wd。
+# 须使用 Unix 换行（LF）
 set -euo pipefail
+
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 cd "$ROOT"
+RUN_SH="$ROOT/run.sh"
 
-_safe_combo() {
-  local s="${1:-}"
-  echo "${s//[^a-zA-Z0-9_-]/_}"
+: "${MMDIFF_GRID_SE:=24}"
+: "${MMDIFF_COMBO_LIDAR_BASE:=64}"
+: "${MMDIFF_RGB_STUDENT_CHECKPOINT:=$ROOT/model/rgb_student_distill.pt}"
+# exp3 / exp4 的 weight_decay（勿过大；可按需 export 覆盖）
+: "${MMDIFF_GRID_WD_EXP3:=1.5e-4}"
+: "${MMDIFF_GRID_WD_EXP4:=2e-4}"
+
+export_for_train() {
+  export MMDIFF_RGB_SOURCE=student
+  export MMDIFF_RGB_STUDENT_CHECKPOINT
+  export MMDIFF_FREEZE_RGB_STUDENT=0
+  export MMDIFF_RUN_TIMESTAMP="${MMDIFF_RUN_TIMESTAMP:-$(date +%m%d-%H%M)}"
 }
 
-PREFIX="${MMDIFF_EXPERIMENT_TAG_PREFIX:-multimodal}"
-COMBO="${MMDIFF_MODALITY_COMBO:-hsi+rgb+lidar}"
-SC="$(_safe_combo "$COMBO")"
-
-RGB_STUDENT_CKPT="${MMDIFF_RGB_STUDENT_CHECKPOINT:-$ROOT/rgb_student_distill.pt}"
-
-setup_common() {
-  export PYTHONUNBUFFERED="${PYTHONUNBUFFERED:-1}"
-  export MMDIFF_NUM_EPOCHS="${MMDIFF_NUM_EPOCHS:-200}"
-  export MMDIFF_MODALITY_COMBO="${MMDIFF_MODALITY_COMBO:-hsi+rgb+lidar}"
-  export MMDIFF_HSI_RESIDUAL_BLOCKS="${MMDIFF_HSI_RESIDUAL_BLOCKS:-6}"
-  export MMDIFF_HSI_CONV_HIDDEN="${MMDIFF_HSI_CONV_HIDDEN:-96}"
-  export MMDIFF_HSI_SE_RATIO="${MMDIFF_HSI_SE_RATIO:-16}"
-  export MMDIFF_SCHEDULER_NAME="${MMDIFF_SCHEDULER_NAME:-cosine}"
-  export MMDIFF_LEARNING_RATE="${MMDIFF_LEARNING_RATE:-1e-3}"
-  export MMDIFF_SCHED_COSINE_WARMUP_RATIO="${MMDIFF_SCHED_COSINE_WARMUP_RATIO:-0.05}"
-  export MMDIFF_BATCH_SIZE="${MMDIFF_BATCH_SIZE:-64}"
-  export MMDIFF_WEIGHT_DECAY="${MMDIFF_WEIGHT_DECAY:-1e-4}"
-  export MMDIFF_USE_SUPCON="${MMDIFF_USE_SUPCON:-0}"
-}
-
-# 主训练：rgb_source 默认见 param；此处只设消融（random|freeze|finetune）
-setup_rgb_ablate() {
-  local a="${1:?}"
-  setup_common
-  export MMDIFF_EXPERIMENT_NUM="${MMDIFF_EXPERIMENT_NUM:-1}"
-  export MMDIFF_LR_TAG="${MMDIFF_LR_TAG:-$MMDIFF_LEARNING_RATE}"
-  case "$a" in
-    random)
-      export MMDIFF_RGB_STUDENT_CHECKPOINT=""
-      export MMDIFF_FREEZE_RGB_STUDENT=0
-      export MMDIFF_EXPERIMENT_TAG="${MMDIFF_EXPERIMENT_TAG:-${PREFIX}_rgb_student_${SC}_rand}"
+apply_exp() {
+  case "$1" in
+    exp1)
+      export MMDIFF_HSI_SE_RATIO="$MMDIFF_GRID_SE"
+      export MMDIFF_LIDAR_HIDDEN="$MMDIFF_COMBO_LIDAR_BASE"
+      export MMDIFF_LIDAR_EXTRA_BLOCKS=3
+      export MMDIFF_WEIGHT_DECAY=1e-4
+      unset MMDIFF_CLS_TOKEN_DIM
+      unset MMDIFF_CLS_HEAD_HIDDEN
       ;;
-    freeze)
-      export MMDIFF_RGB_STUDENT_CHECKPOINT="$RGB_STUDENT_CKPT"
-      export MMDIFF_FREEZE_RGB_STUDENT=1
-      export MMDIFF_EXPERIMENT_TAG="${MMDIFF_EXPERIMENT_TAG:-${PREFIX}_rgb_student_${SC}_freeze}"
+    exp2)
+      export MMDIFF_HSI_SE_RATIO="$MMDIFF_GRID_SE"
+      export MMDIFF_LIDAR_HIDDEN="$MMDIFF_COMBO_LIDAR_BASE"
+      export MMDIFF_LIDAR_EXTRA_BLOCKS=4
+      export MMDIFF_WEIGHT_DECAY=1e-4
+      unset MMDIFF_CLS_TOKEN_DIM
+      unset MMDIFF_CLS_HEAD_HIDDEN
       ;;
-    finetune|ft)
-      export MMDIFF_RGB_STUDENT_CHECKPOINT="$RGB_STUDENT_CKPT"
-      export MMDIFF_FREEZE_RGB_STUDENT=0
-      export MMDIFF_EXPERIMENT_TAG="${MMDIFF_EXPERIMENT_TAG:-${PREFIX}_rgb_student_${SC}_ft}"
+    exp3)
+      export MMDIFF_HSI_SE_RATIO="$MMDIFF_GRID_SE"
+      export MMDIFF_LIDAR_HIDDEN="$MMDIFF_COMBO_LIDAR_BASE"
+      export MMDIFF_LIDAR_EXTRA_BLOCKS=3
+      export MMDIFF_WEIGHT_DECAY="$MMDIFF_GRID_WD_EXP3"
+      unset MMDIFF_CLS_TOKEN_DIM
+      unset MMDIFF_CLS_HEAD_HIDDEN
+      ;;
+    exp4)
+      export MMDIFF_HSI_SE_RATIO="$MMDIFF_GRID_SE"
+      export MMDIFF_LIDAR_HIDDEN="$MMDIFF_COMBO_LIDAR_BASE"
+      export MMDIFF_LIDAR_EXTRA_BLOCKS=3
+      export MMDIFF_WEIGHT_DECAY="$MMDIFF_GRID_WD_EXP4"
+      export MMDIFF_CLS_TOKEN_DIM=320
+      export MMDIFF_CLS_HEAD_HIDDEN=160
       ;;
     *)
-      echo "内部错误: setup_rgb_ablate $a" >&2
+      echo "未知 exp: $1（exp1|exp2|exp3|exp4）" >&2
       exit 1
       ;;
   esac
+  export MMDIFF_EXPERIMENT_TAG="${MMDIFF_EXPERIMENT_TAG:-${MMDIFF_EXPERIMENT_TAG_PREFIX:-exp}_$1}"
 }
 
-usage() {
-  cat <<'EOF'
-用法: bash run.sh [子命令]
-
-  无参数 | all   串行：precompute →（distill + 三种主训练），其中 ablate_all 会先 distill 再消融；默认结束后关机（MMDIFF_SHUTDOWN_AT_END=0 则不关机）
-  precompute     离线预计算 RGB teacher token（train + test）
-  distill        蒸馏 student：默认最多 100 epoch、早停 15；TensorBoard 见 train_rgb_distill 输出路径
-  ablate_all     先 distill（重新蒸馏）再串行 random → freeze → finetune
-  train_random   消融：RGB student 随机初始化（不加载 MMDIFF_RGB_STUDENT_CHECKPOINT）
-  train_freeze   消融：加载蒸馏权重 + 冻结 rgb_student（MMDIFF_FREEZE_RGB_STUDENT=1）
-  train_finetune|train|main  消融：加载蒸馏权重 + 微调 rgb_student（默认）
-  sanity         HSI 分支自检；额外参数: bash run.sh sanity --batch 4
-  help           本说明
-
-环境变量（节选）:
-  扩散教师路径 / 默认 rgb_source / HR 严格视野：见 param.py（需 data_prepare 生成 rgb_hr.npy）
-  MMDIFF_RGB_STUDENT_CHECKPOINT   轻量 RGB 编码器权重路径，默认 <仓库根>/rgb_student_distill.pt
-  MMDIFF_FREEZE_RGB_STUDENT       1/true 冻结 rgb_student（runner 内重建优化器）
-  MMDIFF_PRECOMPUTE_BATCH / MMDIFF_DISTILL_BATCH
-  MMDIFF_DISTILL_EPOCHS  蒸馏最大 epoch，默认 100
-  MMDIFF_DISTILL_EARLY_STOP  验证 loss 早停 patience，默认 15（0=关闭）
-  MMDIFF_SHUTDOWN_AT_END=0 取消关机
-
-示例:
-  bash run.sh ablate_all
-  bash run.sh all
-  bash run.sh train_finetune
-EOF
+run_train_exp() {
+  export_for_train
+  apply_exp "$1"
+  exec python main.py
 }
 
-log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*"; }
-
-run_step() {
-  local name="$1"
-  shift
-  log "========== START $name =========="
-  "$@"
-  local ec=$?
-  if [ "$ec" -eq 0 ]; then
-    log "========== END $name OK =========="
-  else
-    log "========== END $name FAILED (exit $ec) =========="
-  fi
-  return "$ec"
+run_grid() {
+  local ts="${MMDIFF_RUN_TIMESTAMP:-$(date +%m%d-%H%M)}"
+  local e failed=0
+  for e in exp1 exp2 exp3 exp4; do
+    MMDIFF_RUN_TIMESTAMP="$ts" MMDIFF_EXPERIMENT_TAG="" bash "$RUN_SH" train_exp "$e" || failed=$((failed + 1))
+  done
+  exit "$failed"
 }
 
 do_shutdown() {
@@ -117,95 +90,50 @@ do_shutdown() {
   curl "https://sctapi.ftqq.com/SCT313662TGZ7JRPbisBQfDZbabO1Kmmdt.send?title=服务器关闭失败&desp=服务器关闭失败channel=9"
 }
 
-_run_train_ablate() {
-  local tag="$1"
-  echo "=== ${tag} | MMDIFF_EXPERIMENT_TAG=${MMDIFF_EXPERIMENT_TAG} | FREEZE=${MMDIFF_FREEZE_RGB_STUDENT:-0} | ckpt=${MMDIFF_RGB_STUDENT_CHECKPOINT:-<empty>} ==="
-  python main.py
+usage() {
+  cat <<'EOF'
+用法: bash run.sh <子命令>
+
+  train_exp <exp1|exp2|exp3|exp4>   单组实验
+  grid                              串行 exp1→exp4
+  all                               等同 grid，结束可配合 MMDIFF_SHUTDOWN_AT_END
+  sanity [args...]
+
+网格摘要:
+  exp1  HSI_SE=24 lidar=64 blk=3 wd=1e-4 cls=默认
+  exp2  同 exp1 但 LiDAR 残差块=4（轻微加深）
+  exp3  同 exp1 结构 wd=MMDIFF_GRID_WD_EXP3（默认 1.5e-4）
+  exp4  同 exp3  cls token=320 head=160 wd=MMDIFF_GRID_WD_EXP4（默认 2e-4）
+
+可调: MMDIFF_GRID_SE MMDIFF_COMBO_LIDAR_BASE MMDIFF_GRID_WD_EXP3 MMDIFF_GRID_WD_EXP4
+      MMDIFF_RGB_STUDENT_CHECKPOINT
+
+若 Linux 报 pipefail: sed -i 's/\r$//' run.sh 或 dos2unix run.sh
+EOF
 }
 
-if [ $# -eq 0 ]; then
-  set -- all
-fi
+[ $# -eq 0 ] && set -- grid
 
-case "$1" in
-  help|-h|--help)
-    usage
-    ;;
-  precompute)
-    _pcb="${MMDIFF_PRECOMPUTE_BATCH:-32}"
-    echo "=== precompute train+test (batch=$_pcb) HR 严格视野 -> param 中 teacher token 路径 ==="
-    python utils/precompute_rgb_teacher_tokens.py --split train --batch-size "$_pcb"
-    python utils/precompute_rgb_teacher_tokens.py --split test --batch-size "$_pcb"
-    ;;
-  distill)
-    _de="${MMDIFF_DISTILL_EPOCHS:-100}"
-    _db="${MMDIFF_DISTILL_BATCH:-0}"
-    _esp="${MMDIFF_DISTILL_EARLY_STOP:-15}"
-    echo "=== distill LightweightRgbEncoder -> $RGB_STUDENT_CKPT (max_epochs=$_de early_stop_patience=$_esp) ==="
-    python utils/train_rgb_distill.py --epochs "$_de" --batch-size "$_db" --early-stopping-patience "$_esp" --out "$RGB_STUDENT_CKPT"
-    ;;
-  train_random)
-    setup_rgb_ablate random
-    export MMDIFF_RUN_TIMESTAMP="${MMDIFF_RUN_TIMESTAMP:-$(date +%Y%m%d-%H%M%S)}"
-    _run_train_ablate train_random
-    ;;
-  train_freeze)
-    setup_rgb_ablate freeze
-    export MMDIFF_RUN_TIMESTAMP="${MMDIFF_RUN_TIMESTAMP:-$(date +%Y%m%d-%H%M%S)}"
-    _run_train_ablate train_freeze
-    ;;
-  train_finetune|train|main)
-    setup_rgb_ablate finetune
-    export MMDIFF_RUN_TIMESTAMP="${MMDIFF_RUN_TIMESTAMP:-$(date +%Y%m%d-%H%M%S)}"
-    _run_train_ablate train_finetune
-    ;;
-  ablate_all)
-    PIPE_TS="$(date +%Y%m%d-%H%M%S)"
-    (
-      set +e
-      log "ablate_all | PIPE_TS=$PIPE_TS（先 distill 再三种主训练）"
-      FAILED=0
-      MMDIFF_RUN_TIMESTAMP="$PIPE_TS" run_step distill bash "$ROOT/run.sh" distill || FAILED=$((FAILED + 1))
-      MMDIFF_RUN_TIMESTAMP="$PIPE_TS" RGB_STUDENT_CKPT="$RGB_STUDENT_CKPT" run_step train_random bash "$ROOT/run.sh" train_random || FAILED=$((FAILED + 1))
-      MMDIFF_RUN_TIMESTAMP="$PIPE_TS" RGB_STUDENT_CKPT="$RGB_STUDENT_CKPT" run_step train_freeze bash "$ROOT/run.sh" train_freeze || FAILED=$((FAILED + 1))
-      MMDIFF_RUN_TIMESTAMP="$PIPE_TS" RGB_STUDENT_CKPT="$RGB_STUDENT_CKPT" run_step train_finetune bash "$ROOT/run.sh" train_finetune || FAILED=$((FAILED + 1))
-      log "ablate_all finished | failed_steps=$FAILED (0=all ok)"
-      if [ "${MMDIFF_SHUTDOWN_AT_END:-1}" != "0" ]; then
-        log "MMDIFF_SHUTDOWN_AT_END default/on -> shutdown (set MMDIFF_SHUTDOWN_AT_END=0 to skip)"
-        do_shutdown
-      fi
-      if [ "$FAILED" -gt 0 ]; then
-        exit 1
-      fi
-      exit 0
-    )
-    ;;
+case "${1:-}" in
+  help|-h|--help) usage ;;
+  train_exp) run_train_exp "${2:-exp1}" ;;
+  grid) run_grid ;;
   all)
-    PIPE_TS="$(date +%Y%m%d-%H%M%S)"
-    (
-      set +e
-      log "all | PIPE_TS=$PIPE_TS（precompute → ablate_all 内含 distill+消融）"
-      FAILED=0
-      MMDIFF_RUN_TIMESTAMP="$PIPE_TS" run_step precompute bash "$ROOT/run.sh" precompute || FAILED=$((FAILED + 1))
-      MMDIFF_RUN_TIMESTAMP="$PIPE_TS" RGB_STUDENT_CKPT="$RGB_STUDENT_CKPT" run_step ablate_all bash "$ROOT/run.sh" ablate_all || FAILED=$((FAILED + 1))
-      log "all finished | failed_steps=$FAILED (0=all ok)"
-      if [ "${MMDIFF_SHUTDOWN_AT_END:-1}" != "0" ]; then
-        log "MMDIFF_SHUTDOWN_AT_END default/on -> shutdown (set MMDIFF_SHUTDOWN_AT_END=0 to skip)"
-        do_shutdown
-      fi
-      if [ "$FAILED" -gt 0 ]; then
-        exit 1
-      fi
-      exit 0
-    )
+    ts="${MMDIFF_RUN_TIMESTAMP:-$(date +%m%d-%H%M)}"
+    f=0
+    MMDIFF_RUN_TIMESTAMP="$ts" MMDIFF_EXPERIMENT_TAG="" bash "$RUN_SH" grid || f=$((f + 1))
+    if [ "${MMDIFF_SHUTDOWN_AT_END:-0}" = 1 ]; then
+      sleep 2
+      /usr/bin/shutdown 2>/dev/null || true
+    fi
+    do_shutdown
+    exit "$f"
     ;;
-  sanity)
-    echo "=== utils/hsi_branch_sanity.py ==="
-    python utils/hsi_branch_sanity.py "${@:2}"
-    ;;
-  *)
-    echo "未知子命令: $1" >&2
-    usage >&2
+  sanity) python utils/hsi_branch_sanity.py "${@:2}" ;;
+  # 兼容旧入口（已废弃 combo）
+  train_combo)
+    echo "train_combo 已改为 train_exp；请: bash run.sh train_exp ${2:-exp1}" >&2
     exit 1
     ;;
+  *) echo "未知: $1" >&2; usage >&2; exit 1 ;;
 esac

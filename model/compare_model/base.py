@@ -6,6 +6,8 @@ from typing import Any, Dict, Optional, Tuple, Union
 import torch
 import torch.nn as nn
 
+from param import HSI_CHANNELS
+
 from pipeline.train_scheduler import build_lr_scheduler
 
 
@@ -22,7 +24,7 @@ class CompareClassifierBase(nn.Module):
         self.diffusion = diffusion
         ds_cfg = opt.get('dataset', {})
         self.num_classes = int(ds_cfg.get('n_cls') or opt.get('model_cls', {}).get('out_channels') or 20)
-        self.hsi_channels = int(ds_cfg.get('hsi_channels') or 50)
+        self.hsi_channels = int(ds_cfg.get('hsi_channels') or HSI_CHANNELS)
         self.lidar_channels = int(ds_cfg.get('lidar_channel') or 1)
 
         # 优化器须在子类注册完所有 Parameter 后再建，否则 parameters() 为空会报错

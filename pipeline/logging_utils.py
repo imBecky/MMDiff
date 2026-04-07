@@ -65,17 +65,14 @@ def _is_compare_run() -> bool:
     return (os.environ.get('MMDIFF_COMPARE_RUN') or '').strip().lower() in ('1', 'true', 'yes')
 
 
-def _compare_run_name_without_timestamp() -> str:
-    """对比实验未设 MMDIFF_EXPERIMENT_TAG 时：方法名 + 模态 + 当前 param 结构/batch 摘要。"""
+def _compare_tb_model_slug() -> str:
+    """对比实验未设 MMDIFF_EXPERIMENT_TAG 时：仅用 `--model` 注册名，便于 TB 侧栏阅读。
+
+    （旧版曾在目录名里拼主模型的 B/H/SE/bs 与 modality，对对比基线无意义且冗长。）
+    如需在目录名里区分更多因素，请设置 ``MMDIFF_EXPERIMENT_TAG``。
+    """
     model = (os.environ.get('MMDIFF_COMPARE_MODEL') or 'compare').strip().lower()
-    model = re.sub(r'[^\w\-.]', '_', model)
-    combo = (os.environ.get('MMDIFF_MODALITY_COMBO') or '').strip()
-    if combo:
-        combo_safe = re.sub(r'[^\w\-.]', '_', combo.replace('+', '-'))
-    else:
-        combo_safe = 'default'
-    cfg = f'B{HSI_RESIDUAL_BLOCKS_CFG}_H{HSI_CONV_HIDDEN_CFG}_SE{HSI_SE_RATIO_CFG}_bs{BATCH_SIZE}'
-    return f'{model}_{combo_safe}_{cfg}'
+    return re.sub(r'[^\w\-.]', '_', model) or 'compare'
 
 
 def _lr_slug_for_run_dir() -> str:
@@ -120,7 +117,7 @@ def prepare_tb_run_dir():
     """
     TB_LOG_ROOT.mkdir(parents=True, exist_ok=True)
     tag = os.environ.get('MMDIFF_EXPERIMENT_TAG', '').strip()
-    ts = (os.environ.get('MMDIFF_RUN_TIMESTAMP') or '').strip() or datetime.now().strftime('%Y%m%d-%H%M%S')
+    ts = (os.environ.get('MMDIFF_RUN_TIMESTAMP') or '').strip() or datetime.now().strftime('%m%d-%H%M')
     prefix = (RUN_NAME_PREFIX or '').strip()
     exp_raw = (os.environ.get('MMDIFF_EXPERIMENT_NUM') or '').strip()
     want_long = (os.environ.get('MMDIFF_TB_LONG_TAG') or '').strip().lower() in ('1', 'true', 'yes', 'y')
@@ -149,7 +146,7 @@ def prepare_tb_run_dir():
             run_name = f'{ts}_{safe}'
     else:
         if _is_compare_run():
-            body = _compare_run_name_without_timestamp()
+            body = _compare_tb_model_slug()
             if prefix:
                 run_name = f'{prefix}_{body}_{ts}'
             else:
@@ -451,7 +448,7 @@ def log_model_and_training_detail(
 
     if hasattr(model, 'd_model') and not compare_run:
         logger.info(
-            'classifier layout | fusion=cross d_model=%s seq_len=%s num_classes=%s diffusion_ts=%s feat_layers=%s',
+            'classifier layout | d_model=%s seq_len=%s num_classes=%s diffusion_ts=%s feat_layers=%s',
             getattr(model, 'd_model', '-'),
             getattr(model, 'seq_len', '-'),
             getattr(model, 'num_classes', '-'),
@@ -506,7 +503,7 @@ def log_model_and_training_detail(
         logger.info('compare run | model=%s', os.environ.get('MMDIFF_COMPARE_MODEL', ''))
     else:
         logger.info(
-            'model_cls | fusion=cross token_dim=%s transformer: heads=%s layers=%s ff=%s dropout=%s head_hidden=%s',
+            'model_cls | token_dim=%s transformer: heads=%s layers=%s ff=%s dropout=%s head_hidden=%s',
             mc.get('token_dim'),
             mc.get('transformer_heads'),
             mc.get('transformer_layers'),

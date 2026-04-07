@@ -224,7 +224,7 @@ def main() -> None:
     epochs_no_improve = 0
     writer: SummaryWriter | None = None
     if not args.no_tb:
-        ts = (os.environ.get('MMDIFF_RUN_TIMESTAMP') or '').strip() or datetime.now().strftime('%Y%m%d-%H%M%S')
+        ts = (os.environ.get('MMDIFF_RUN_TIMESTAMP') or '').strip() or datetime.now().strftime('%m%d-%H%M')
         tb_root = Path(args.tb_dir) if args.tb_dir else Path(TB_LOG_ROOT) / f'rgb_student_distill_{ts}'
         tb_root.mkdir(parents=True, exist_ok=True)
         writer = SummaryWriter(log_dir=str(tb_root))

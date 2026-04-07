@@ -101,7 +101,8 @@ class HSICenterSpectralEncoder(nn.Module):
         self.agg_mode = mode
         c = int(in_channels)
         h = max(32, int(conv_hidden))
-        se_mid = max(8, h // max(1, int(se_ratio)))
+        se_ratio = int(se_ratio)
+        se_mid = max(8, h // max(1, se_ratio)) if se_ratio > 0 else 0
         self.stem = nn.Sequential(
             nn.Conv1d(1, h // 2, kernel_size=3, padding=1, bias=False),
             nn.BatchNorm1d(h // 2),
@@ -116,11 +117,15 @@ class HSICenterSpectralEncoder(nn.Module):
         n_res = max(0, int(residual_blocks))
         self.res_blocks = nn.Sequential(*[_HSISpectralResidualBlock(h) for _ in range(n_res)])
         self.pool = nn.AdaptiveAvgPool1d(1)
-        self.se = nn.Sequential(
-            nn.Linear(h, se_mid, bias=False),
-            nn.ReLU(inplace=True),
-            nn.Linear(se_mid, h, bias=False),
-            nn.Sigmoid(),
+        self.se = (
+            nn.Sequential(
+                nn.Linear(h, se_mid, bias=False),
+                nn.ReLU(inplace=True),
+                nn.Linear(se_mid, h, bias=False),
+                nn.Sigmoid(),
+            )
+            if se_ratio > 0
+            else None
         )
         self.proj = nn.Linear(h, int(d_model))
         self.spatial_attn = nn.Linear(h, 1, bias=True) if self.agg_mode == 'attn_pool' else None
@@ -136,8 +141,9 @@ class HSICenterSpectralEncoder(nn.Module):
         feat = self.stem(x)
         feat = self.res_blocks(feat)
 
-        gate = self.se(feat.mean(dim=2))
-        feat = feat * gate.unsqueeze(2)
+        if self.se is not None:
+            gate = self.se(feat.mean(dim=2))
+            feat = feat * gate.unsqueeze(2)
 
         feat = self.pool(feat).squeeze(-1)
         feat = feat.view(b, 9, -1)
@@ -255,7 +261,7 @@ class MultimodalClassifier(nn.Module):
     HSI：中心 3x3，1D 光谱卷积 + SE；空间聚合可为 1 token（mean/attn_pool）或 3 token（multi_token）
     RGB：默认冻结 UNet（rgb_source=diffusion）；可选轻量 student（rgb_source=student）或离线 teacher token（cached_teacher）
     LiDAR：小 CNN（stem + 可选空间残差块）-> global + center 共 2 token
-    融合：两枚可学习 CLS 为 query，模态 token 为 memory，TransformerDecoder（交叉注意力 + CLS 间自注意力）
+    融合：两枚可学习 CLS 为 query，模态 token 为 memory，TransformerDecoder（交叉注意力）
     双头：global_head(cls[0])，center_head(cls[1])
     """
     def __init__(self, opt, diffusion=None):
@@ -378,12 +384,10 @@ class MultimodalClassifier(nn.Module):
         )
         n_lidar = 2 if self.use_lidar else 0
         self.mem_len = n_hsi + n_rgb + n_lidar  # 启用模态 token 拼接长度
-        self.seq_len = 2 + self.mem_len  # 两枚 CLS + memory 长度（日志用）
-
+        self.seq_len = 2 + self.mem_len
+        self.pos_embed_mem = nn.Parameter(torch.randn(1, self.mem_len, d_model))
         self.global_cls = nn.Parameter(torch.randn(1, 1, d_model))
         self.center_cls = nn.Parameter(torch.randn(1, 1, d_model))
-
-        self.pos_embed_mem = nn.Parameter(torch.randn(1, self.mem_len, d_model))
         self.pos_embed_tgt = nn.Parameter(torch.randn(1, 2, d_model))
         dec_layer = nn.TransformerDecoderLayer(
             d_model=d_model,
@@ -429,9 +433,9 @@ class MultimodalClassifier(nn.Module):
             init_type=str(cls_cfg.get('init_type') or 'kaiming'),
             scale=float(cls_cfg.get('scale') or 1.0),
         )
+        nn.init.normal_(self.pos_embed_mem, std=0.02)
         nn.init.normal_(self.global_cls, std=0.02)
         nn.init.normal_(self.center_cls, std=0.02)
-        nn.init.normal_(self.pos_embed_mem, std=0.02)
         nn.init.normal_(self.pos_embed_tgt, std=0.02)
 
         self.loss_func = self._build_loss(cls_cfg)
@@ -547,13 +551,12 @@ class MultimodalClassifier(nn.Module):
         if not memory_parts:
             raise RuntimeError('memory_parts 为空，无法拼接 token')
 
-        g_cls = self.global_cls.expand(b, -1, -1)
-        c_cls = self.center_cls.expand(b, -1, -1)
-
         memory = torch.cat(memory_parts, dim=1)
         if memory.shape[1] != self.mem_len:
             raise RuntimeError(f'memory 长度 {memory.shape[1]} 与预期 {self.mem_len} 不一致')
         memory = memory + self.pos_embed_mem
+        g_cls = self.global_cls.expand(b, -1, -1)
+        c_cls = self.center_cls.expand(b, -1, -1)
         tgt = torch.cat([g_cls, c_cls], dim=1)
         tgt = tgt + self.pos_embed_tgt
         out = self.decoder(tgt, memory)
