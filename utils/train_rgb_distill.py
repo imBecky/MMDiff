@@ -8,6 +8,8 @@
 用法:
   python utils/train_rgb_distill.py --epochs 100 --early-stopping-patience 15 --out path/to/rgb_student.pt
 
+学习率：warmup（线性 0.01×lr → lr）后接 cosine 衰减至 --eta-min；每 epoch 末 scheduler.step()。
+
 TensorBoard 默认写入 param.TB_LOG_ROOT 下 rgb_student_distill_<时间戳>/；可用 --tb-dir 覆盖。
 """
 from __future__ import annotations
@@ -21,6 +23,7 @@ from pathlib import Path
 import numpy as np
 import torch
 import torch.nn.functional as F
+from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 from torch.utils.data import DataLoader, Dataset
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
@@ -107,6 +110,23 @@ class _RgbDistillDataset(Dataset):
         )
 
 
+def _build_lr_scheduler(
+    optimizer: torch.optim.Optimizer,
+    epochs: int,
+    warmup_epochs: int,
+    eta_min: float,
+) -> CosineAnnealingLR | SequentialLR:
+    """Warmup 后 cosine；按 epoch 调度。"""
+    epochs = max(1, int(epochs))
+    wu = max(0, min(int(warmup_epochs), max(0, epochs - 1)))
+    if wu == 0:
+        return CosineAnnealingLR(optimizer, T_max=max(1, epochs), eta_min=float(eta_min))
+    cos_epochs = max(1, epochs - wu)
+    warmup = LinearLR(optimizer, start_factor=0.01, end_factor=1.0, total_iters=wu)
+    cosine = CosineAnnealingLR(optimizer, T_max=cos_epochs, eta_min=float(eta_min))
+    return SequentialLR(optimizer, [warmup, cosine], milestones=[wu])
+
+
 def _parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description='RGB 轻量编码器蒸馏扩散教师 token')
     p.add_argument('--epochs', type=int, default=100, help='最大 epoch 数（配合早停）')
@@ -119,6 +139,18 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument('--batch-size', type=int, default=0, help='0 表示使用 param.BATCH_SIZE')
     p.add_argument('--lr', type=float, default=1e-3)
     p.add_argument('--weight-decay', type=float, default=1e-4)
+    p.add_argument(
+        '--warmup-epochs',
+        type=int,
+        default=5,
+        help='cosine 前线性 warmup 的 epoch 数；0 表示无 warmup',
+    )
+    p.add_argument(
+        '--eta-min',
+        type=float,
+        default=1e-6,
+        help='cosine 末端最小学习率',
+    )
     p.add_argument(
         '--cache',
         type=str,
@@ -210,6 +242,12 @@ def main() -> None:
     ).to(device)
 
     opt = torch.optim.AdamW(model.parameters(), lr=float(args.lr), weight_decay=float(args.weight_decay))
+    scheduler = _build_lr_scheduler(
+        opt,
+        int(args.epochs),
+        int(args.warmup_epochs),
+        float(args.eta_min),
+    )
 
     def step_batch(pred: torch.Tensor, tgt: torch.Tensor) -> torch.Tensor:
         mse = F.mse_loss(pred, tgt)
@@ -259,10 +297,13 @@ def main() -> None:
                 va_loss += float(loss.item()) * x.size(0)
                 n_va += x.size(0)
         va_loss /= max(n_va, 1)
-        print(f'Epoch {epoch+1}: train_loss={tr_loss:.6f} val_loss={va_loss:.6f}')
+        lr_now = float(opt.param_groups[0]['lr'])
+        scheduler.step()
+        print(f'Epoch {epoch+1}: train_loss={tr_loss:.6f} val_loss={va_loss:.6f} lr={lr_now:.2e}')
         if writer is not None:
             writer.add_scalar('loss/train', tr_loss, epoch)
             writer.add_scalar('loss/val', va_loss, epoch)
+            writer.add_scalar('train/lr', lr_now, epoch)
 
         improved = va_loss < best_val - 1e-12
         if improved:

@@ -87,6 +87,45 @@ from .student_diffusion import StudentDiffusionWrapper
 CreateClassifierFn = Callable[[Any, Any], torch.nn.Module]
 
 
+def _state_dict_shape_compatible(model: torch.nn.Module, sd: dict) -> dict:
+    """仅加载与当前模型同形状的权重；支持 checkpoint 带 module. 前缀；避免 rgb_student 与 token_dim 不一致时崩。"""
+    target = model.state_dict()
+    good: dict = {}
+    for k, v in sd.items():
+        if k in target and v.shape == target[k].shape:
+            good[k] = v
+            continue
+        if k.startswith("module."):
+            k2 = k[7:]
+            if k2 in target and v.shape == target[k2].shape:
+                good[k2] = v
+    return good
+
+
+def _load_rgb_student_checkpoint_filtered(
+    model: torch.nn.Module, sd: dict, logger, ck_path: Path
+) -> None:
+    """只加载形状一致的键；绝不因 fc 等维度变化抛 RuntimeError。"""
+    compatible = _state_dict_shape_compatible(model, sd)
+    tgt = model.state_dict()
+    skipped = []
+    for k, v in sd.items():
+        tk = k[7:] if k.startswith("module.") else k
+        if tk not in tgt:
+            continue
+        if v.shape != tgt[tk].shape:
+            skipped.append(tk)
+    if skipped:
+        logger.warning(
+            "RGB student checkpoint 与当前模型形状不一致，已跳过 %d 个键（token_dim 等与蒸馏不一致时 fc 会重初始化）: %s%s",
+            len(skipped),
+            ", ".join(sorted(skipped)[:12]),
+            " ..." if len(skipped) > 12 else "",
+        )
+    model.load_state_dict(compatible, strict=False)
+    logger.info("已加载 RGB student 权重（形状匹配键）: %s", ck_path)
+
+
 @dataclass
 class TrainingRunOptions:
     """训练运行选项（由 main 解析传入）。"""
@@ -446,8 +485,7 @@ def run_training(
             ck_path = Path(ck)
             if ck_path.is_file():
                 sd = torch.load(str(ck_path), map_location=device)
-                model.load_state_dict(sd, strict=False)
-                logger.info('已加载 RGB student 权重: %s', ck_path)
+                _load_rgb_student_checkpoint_filtered(model, sd, logger, ck_path)
             else:
                 logger.warning('MMDIFF_RGB_STUDENT_CHECKPOINT 不存在: %s', ck_path)
         else:

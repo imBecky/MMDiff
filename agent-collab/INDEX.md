@@ -4,6 +4,10 @@
 
 | 最近更新 | 主题 | 一句话结果 | 详情 |
 |---------|------|------------|------|
+| 2026-04-10 | **HSI：数据 patch vs 模型内 3×3** | `PATCH_WINDOW_SIZE` 管外层块；`HSICenterSpectralEncoder` 内 `_crop_center_3x3` 再取中心 3×3 做光谱编码；LiDAR 用整 patch | [logs/2026-04-10-multimodal-hsi-center-3x3-crop.md](./logs/2026-04-10-multimodal-hsi-center-3x3-crop.md) |
+| 2026-04-09 | **RGB(student)→LiDAR FiLM + fus.sh 覆盖** | 移除 LiDAR→HSI A/B/C；`MMDIFF_RGB_TO_LIDAR_GUIDANCE=none|film`；RGB token 均值 FiLM→`lidar_g/c`；`fus.sh` 仅 film+`train_exp` | [logs/2026-04-09-rgb-student-to-lidar-film-fus.md](./logs/2026-04-09-rgb-student-to-lidar-film-fus.md) |
+| 2026-04-07 | **对比基线 SS-MAE（TGRS 2023）** | 迁入 [summitgao/SS-MAE](https://github.com/summitgao/SS-MAE) `VisionTransfromers`；注册 `ss_mae`/`ssmae`；`crop_size`/PCA 环境变量；`compare.sh` 示例 `ss_mae:1e-4` | [logs/2026-04-07-compare-ss-mae.md](./logs/2026-04-07-compare-ss-mae.md) |
+| 2026-04-08 | **LiDAR→HSI 引导 A/B/C + fus.sh**（**已废弃**，见 04-09） | 历史记录 | [logs/2026-04-08-lidar-guidance-abc-fus-sh.md](./logs/2026-04-08-lidar-guidance-abc-fus-sh.md) |
 | 2026-04-08 | **run.sh：SE24 四组网格** | 去掉 base/lidar_wide；`train_exp exp1–4`；exp3 略增 wd；exp4 cls 320/160 + wd；`MMDIFF_CLS_*` 入 param | [logs/2026-04-08-runsh-grid-se24-wd-cls.md](./logs/2026-04-08-runsh-grid-se24-wd-cls.md) |
 | 2026-04-07 | **DFINet = formango 官方仓** | 已接 DFINet；新增注册别名 `formango_dfinet`/`hsi_msi_multisource`，`DFINET_PROTOCOL_COMPARE_NAMES` 统一走 `dfinet_protocol` | [logs/2026-04-07-dfinet-formango-registry-aliases.md](./logs/2026-04-07-dfinet-formango-registry-aliases.md) |
 | 2026-04-06 | **run.sh 精简 + HSI 48 + 融合仅 cross** | 根 `run.sh`：`bash "$RUN_SH"`、LF、**distill→grid**、无 precompute；`HSI_CHANNELS=48`/`MMDIFF_HSI_CHANNELS`；`load_train_bundle` 维校验；去掉 concat 与 `FUSION_MODE`；`mmdd-hhmm` | [logs/2026-04-06-runsh-slim-hsi48-cross-only.md](./logs/2026-04-06-runsh-slim-hsi48-cross-only.md) |

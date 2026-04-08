@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import warnings
 from typing import Dict, List, Optional, Tuple, Union
 
 import torch
@@ -217,10 +218,8 @@ class LidarMorphEncoder(nn.Module):
 
     def forward(self, lidar: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         feat = self.extra(self.stem(lidar))
-        g = F.adaptive_avg_pool2d(feat, output_size=1).flatten(1)
-        c_patch = _crop_center_3x3(feat)
-        c = c_patch.mean(dim=(2, 3))
-        return self.proj_global(g), self.proj_center(c)
+        pooled = F.adaptive_avg_pool2d(feat, output_size=1).flatten(1)
+        return self.proj_global(pooled), self.proj_center(pooled)
 
 
 class RGBLayerToToken(nn.Module):
@@ -376,6 +375,32 @@ class MultimodalClassifier(nn.Module):
             extra_blocks=lidar_extra_blocks,
         )
 
+        raw_r2l = str(cls_cfg.get('rgb_to_lidar_guidance_mode') or 'none').strip().upper()
+        if raw_r2l in ('', 'NONE', 'OFF', '0', 'FALSE'):
+            self._rgb_to_lidar_guidance = 'none'
+        elif raw_r2l in ('FILM', 'A'):
+            self._rgb_to_lidar_guidance = 'film'
+        else:
+            raise ValueError(
+                'model_cls.rgb_to_lidar_guidance_mode 须为 none|film|A，当前 '
+                f'{raw_r2l!r}'
+            )
+        if self._rgb_to_lidar_guidance == 'film':
+            if not (self.use_rgb and self.use_lidar and self.rgb_source == 'student'):
+                warnings.warn(
+                    'rgb_to_lidar_guidance_mode=film 需要 rgb_source=student 且同时启用 rgb 与 lidar，已关闭引导。',
+                    stacklevel=2,
+                )
+                self._rgb_to_lidar_guidance = 'none'
+
+        self.rgb_to_lidar_film_mlp: Optional[nn.Module] = None
+        if self._rgb_to_lidar_guidance == 'film':
+            self.rgb_to_lidar_film_mlp = nn.Sequential(
+                nn.Linear(d_model, d_model),
+                nn.ReLU(inplace=True),
+                nn.Linear(d_model, 2 * d_model),
+            )
+
         n_hsi = int(self.hsi_encoder.n_output_tokens) if self.use_hsi else 0
         n_rgb = (
             len(self.diffusion_ts) * len(self.feat_layer_names)
@@ -489,8 +514,8 @@ class MultimodalClassifier(nn.Module):
     def _forward_tokens(self, data_dict: Dict[str, torch.Tensor]) -> Tuple[torch.Tensor, torch.Tensor]:
         memory_parts: List[torch.Tensor] = []
         b = None
+        rgb_stack: Optional[torch.Tensor] = None
 
-        # 先准备各模态 token（根据 enabled_modalities 动态裁剪）
         if self.use_hsi:
             if 'hsi' not in data_dict:
                 raise KeyError('需要 hsi 模态，但 data_dict 中缺少 hsi')
@@ -540,8 +565,19 @@ class MultimodalClassifier(nn.Module):
         if self.use_lidar:
             if 'lidar' not in data_dict:
                 raise KeyError('需要 lidar 模态，但 data_dict 中缺少 lidar')
-            lidar = data_dict['lidar']
-            lidar_g, lidar_c = self.lidar_encoder(lidar)
+            lidar_g, lidar_c = self.lidar_encoder(data_dict['lidar'])
+            if self._rgb_to_lidar_guidance == 'film':
+                if self.rgb_to_lidar_film_mlp is None:
+                    raise RuntimeError('rgb_to_lidar_guidance=film 但未初始化 rgb_to_lidar_film_mlp')
+                if rgb_stack is None:
+                    raise RuntimeError(
+                        'RGB→LiDAR FiLM 需要 rgb_source=student 且本 batch 含 RGB student 特征（rgb_stack）'
+                    )
+                rgb_ctx = rgb_stack.mean(dim=1)
+                gb = self.rgb_to_lidar_film_mlp(rgb_ctx)
+                gamma, beta = gb.chunk(2, dim=-1)
+                lidar_g = lidar_g * (1.0 + torch.tanh(gamma)) + beta
+                lidar_c = lidar_c * (1.0 + torch.tanh(gamma)) + beta
             memory_parts.append(lidar_g.unsqueeze(1))
             memory_parts.append(lidar_c.unsqueeze(1))
             b = lidar_g.shape[0] if b is None else b

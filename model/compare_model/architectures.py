@@ -1,6 +1,8 @@
 """对比实验模型：与当前 Houston patch 数据管线一致（HSI+LiDAR）。"""
 from __future__ import annotations
 
+import os
+from types import SimpleNamespace
 from typing import Any, Dict
 
 import numpy as np
@@ -14,6 +16,7 @@ from .fusatnet_core import FusAtNetBackbone
 from .two_branch_cnn_core import TwoBranchCNNBackbone
 from .dfinet_core import DFINetBackbone
 from .macn_core import MACNBackbone
+from .ss_mae.mae import VisionTransfromers
 
 
 # ---------------------------------------------------------------------------
@@ -104,6 +107,144 @@ class ExViTClassifier(CompareClassifierBase):
             return logits, logits
         if return_supcon_proj:
             raise RuntimeError('对比模型未启用 SupCon')
+        return logits
+
+
+# ---------------------------------------------------------------------------
+# SS-MAE 微调网络（Gao et al. / TGRS 2023 — summitgao/SS-MAE）
+# https://github.com/summitgao/SS-MAE
+# ---------------------------------------------------------------------------
+
+
+class SSMAEClassifier(CompareClassifierBase):
+    """与官方 `net/VIT/mae.py` 中 `VisionTransfromers` 结构一致（类名保留原文拼写 Transfromers）。
+
+    官方预训练/数据管线见仓库 `get_dat.py` 与 `data/dataset`；本仓库用 `param` patch 尺寸，
+    将 HSI/LiDAR **双线性** 对齐到 ``crop_size``（默认 7，与 README Berlin 示例一致）。
+    ``hsi_pca`` 默认取光谱 **前 pca_num 维**；若需与官方一致的全数据 PCA，请提供
+    ``MMDIFF_SSMAE_PCA_MAT``（``.npy``，形状 ``(spectral_dim, pca_num)``，右乘 ``hsi`` 展平谱向量）。
+
+    环境变量（可选）：``MMDIFF_SSMAE_CROP_SIZE``、``MMDIFF_SSMAE_PCA_NUM``、``MMDIFF_SSMAE_DEPTH``、
+    ``MMDIFF_SSMAE_HEAD``、``MMDIFF_SSMAE_DIM``、``MMDIFF_SSMAE_PATCH_SIZE``、
+    ``MMDIFF_SSMAE_CHANNEL_NUM``（拼接通道数，默认 HSI+LiDAR）、``MMDIFF_SSMAE_WEIGHT_DECAY``（默认 0.05）、
+    ``MMDIFF_SSMAE_DATASET``（``hsi_e``/``lidar_e`` 分支用，默认 Houston2018）。
+    """
+
+    def __init__(self, opt, diffusion=None):
+        super().__init__(opt, diffusion)
+        self._ss = self._build_ss_args()
+        ch_raw = self.hsi_channels + self.lidar_channels
+        ch = int(os.environ.get('MMDIFF_SSMAE_CHANNEL_NUM') or ch_raw)
+        self.net = VisionTransfromers(
+            channel_number=ch,
+            img_size=self._ss.crop_size,
+            patch_size=self._ss.patch_size,
+            embed_dim=self._ss.dim,
+            depth=self._ss.depth,
+            num_heads=self._ss.head,
+            num_classes=self.num_classes,
+            args=self._ss,
+        )
+        self.projections = nn.ModuleDict({'vit': self.net.model})
+        if int(os.environ.get('MMDIFF_SSMAE_LOAD_PRETRAIN', '0')):
+            self.net._load_mae_pretrain(self._ss)
+        self._init_optimizer_and_scheduler()
+
+    def _build_ss_args(self) -> SimpleNamespace:
+        ds = self.opt.get('dataset', {})
+        crop = int(os.environ.get('MMDIFF_SSMAE_CROP_SIZE') or ds.get('ss_mae_crop_size') or 7)
+        pca = int(os.environ.get('MMDIFF_SSMAE_PCA_NUM') or ds.get('ss_mae_pca_num') or 30)
+        depth = int(os.environ.get('MMDIFF_SSMAE_DEPTH') or 2)
+        head = int(os.environ.get('MMDIFF_SSMAE_HEAD') or 8)
+        dim = int(os.environ.get('MMDIFF_SSMAE_DIM') or 256)
+        patch = int(os.environ.get('MMDIFF_SSMAE_PATCH_SIZE') or 1)
+        ds_name = os.environ.get('MMDIFF_SSMAE_DATASET', 'Houston2018')
+        device = os.environ.get('MMDIFF_SSMAE_DEVICE', 'cuda:0' if torch.cuda.is_available() else 'cpu')
+        return SimpleNamespace(
+            dataset=ds_name,
+            pca_num=pca,
+            crop_size=crop,
+            patch_size=patch,
+            depth=depth,
+            dim=dim,
+            head=head,
+            pretrain_num=int(os.environ.get('MMDIFF_SSMAE_PRETRAIN_NUM', '50000')),
+            mask_ratio=float(os.environ.get('MMDIFF_SSMAE_MASK_RATIO', '0.3')),
+            device=device,
+            is_load_pretrain=int(os.environ.get('MMDIFF_SSMAE_LOAD_PRETRAIN', '0')),
+            is_pretrain=0,
+            is_train=1,
+        )
+
+    def _build_optimizer(self, train_cfg: Dict[str, Any]) -> torch.optim.Optimizer:
+        optim_cfg = train_cfg.get('optimizer', {})
+        lr = float(optim_cfg.get('lr') or 1e-4)
+        wd = float(os.environ.get('MMDIFF_SSMAE_WEIGHT_DECAY', optim_cfg.get('weight_decay', 0.05)))
+        betas = tuple(optim_cfg.get('betas') or (0.9, 0.999))
+        params = [p for p in self.parameters() if p.requires_grad]
+        if not params:
+            raise ValueError('SSMAEClassifier 无可训练参数')
+        return torch.optim.AdamW(params, lr=lr, betas=betas, weight_decay=wd)
+
+    def _resize_to_crop(self, x: torch.Tensor) -> torch.Tensor:
+        s = self._ss.crop_size
+        if x.shape[-1] == s and x.shape[-2] == s:
+            return x
+        return F.interpolate(x, size=(s, s), mode='bilinear', align_corners=False)
+
+    def _hsi_pca_tensor(self, hsi: torch.Tensor) -> torch.Tensor:
+        """返回 (B,1,pca_num,H,W)，供 `hsi_e` 使用。"""
+        pca = self._ss.pca_num
+        if hsi.shape[1] >= pca:
+            z = hsi[:, :pca].contiguous()
+        else:
+            z = torch.zeros(
+                hsi.shape[0],
+                pca,
+                hsi.shape[2],
+                hsi.shape[3],
+                device=hsi.device,
+                dtype=hsi.dtype,
+            )
+            z[:, : hsi.shape[1]] = hsi
+        mat = os.environ.get('MMDIFF_SSMAE_PCA_MAT', '').strip()
+        if mat and os.path.isfile(mat):
+            w_np = np.load(mat)
+            w_t = torch.from_numpy(w_np).to(device=hsi.device, dtype=hsi.dtype)
+            c = hsi.shape[1]
+            if w_t.shape == (c, pca):
+                wt = w_t
+            elif w_t.shape == (pca, c):
+                wt = w_t.T
+            else:
+                raise ValueError(
+                    f'MMDIFF_SSMAE_PCA_MAT 形状应为 ({c},{pca}) 或 ({pca},{c})，当前 {tuple(w_t.shape)}'
+                )
+            hc = hsi.permute(0, 2, 3, 1).reshape(-1, c)
+            z = (hc @ wt).reshape(hsi.shape[0], hsi.shape[2], hsi.shape[3], pca).permute(0, 3, 1, 2)
+        return z.unsqueeze(1)
+
+    def forward(
+        self,
+        data_dict: Dict[str, torch.Tensor],
+        return_center_logits: bool = False,
+        return_supcon_proj: bool = False,
+    ):
+        if return_supcon_proj:
+            raise RuntimeError('对比模型未启用 SupCon')
+        hsi, lidar = self._hsi_lidar(data_dict)
+        hsi = self._resize_to_crop(hsi)
+        lidar = self._resize_to_crop(lidar)
+        ch = int(os.environ.get('MMDIFF_SSMAE_CHANNEL_NUM') or (self.hsi_channels + self.lidar_channels))
+        if hsi.shape[1] + lidar.shape[1] != ch:
+            raise ValueError(
+                f'SS-MAE：HSI+LiDAR 通道数 {hsi.shape[1]}+{lidar.shape[1]} 与期望 {ch} 不一致，'
+                f'请调整数据或设置 MMDIFF_SSMAE_CHANNEL_NUM'
+            )
+        hsi_pca = self._hsi_pca_tensor(hsi)
+        logits, _ = self.net(hsi, lidar, hsi_pca)
+        if return_center_logits:
+            return logits, logits
         return logits
 
 

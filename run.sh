@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
-# 主实验网格：HSI SE + LiDAR 基线宽；不含 base / lidar_wide。
-# SE 默认 24；exp3 略增 wd；exp4 更大 classifier（320/160）+ 再略增 wd。
+# 主实验：强 HSI SE + 较大分类头；骨干刻意变浅（HSI/LiDAR/融合），其余 lr/wd 等见 param 默认。
 # 须使用 Unix 换行（LF）
 set -euo pipefail
 
@@ -8,75 +7,45 @@ ROOT="$(cd "$(dirname "$0")" && pwd)"
 cd "$ROOT"
 RUN_SH="$ROOT/run.sh"
 
+# --- 结构：SE + 大分类头（可 export 覆盖）---
 : "${MMDIFF_GRID_SE:=24}"
-: "${MMDIFF_COMBO_LIDAR_BASE:=64}"
+: "${MMDIFF_CLS_TOKEN_DIM:=320}"
+: "${MMDIFF_CLS_HEAD_HIDDEN:=160}"
+
+# --- 骨干变浅（可 export 覆盖）---
+: "${MMDIFF_HSI_RESIDUAL_BLOCKS:=3}"
+: "${MMDIFF_HSI_CONV_HIDDEN:=64}"
+: "${MMDIFF_HSI_AGG_MODE:=mean}"
+: "${MMDIFF_LIDAR_HIDDEN:=48}"
+: "${MMDIFF_LIDAR_EXTRA_BLOCKS:=1}"
+: "${MMDIFF_CLS_TRANSFORMER_LAYERS:=1}"
+: "${MMDIFF_CLS_TRANSFORMER_FF_DIM:=384}"
+
 : "${MMDIFF_RGB_STUDENT_CHECKPOINT:=$ROOT/model/rgb_student_distill.pt}"
-# exp3 / exp4 的 weight_decay（勿过大；可按需 export 覆盖）
-: "${MMDIFF_GRID_WD_EXP3:=1.5e-4}"
-: "${MMDIFF_GRID_WD_EXP4:=2e-4}"
 
 export_for_train() {
+  # 容器里常见 OMP_NUM_THREADS=空串，libgomp 会报错；:- 在空串时也会用默认值
+  export OMP_NUM_THREADS="${OMP_NUM_THREADS:-4}"
   export MMDIFF_RGB_SOURCE=student
   export MMDIFF_RGB_STUDENT_CHECKPOINT
   export MMDIFF_FREEZE_RGB_STUDENT=0
   export MMDIFF_RUN_TIMESTAMP="${MMDIFF_RUN_TIMESTAMP:-$(date +%m%d-%H%M)}"
 }
 
-apply_exp() {
-  case "$1" in
-    exp1)
-      export MMDIFF_HSI_SE_RATIO="$MMDIFF_GRID_SE"
-      export MMDIFF_LIDAR_HIDDEN="$MMDIFF_COMBO_LIDAR_BASE"
-      export MMDIFF_LIDAR_EXTRA_BLOCKS=3
-      export MMDIFF_WEIGHT_DECAY=1e-4
-      unset MMDIFF_CLS_TOKEN_DIM
-      unset MMDIFF_CLS_HEAD_HIDDEN
-      ;;
-    exp2)
-      export MMDIFF_HSI_SE_RATIO="$MMDIFF_GRID_SE"
-      export MMDIFF_LIDAR_HIDDEN="$MMDIFF_COMBO_LIDAR_BASE"
-      export MMDIFF_LIDAR_EXTRA_BLOCKS=4
-      export MMDIFF_WEIGHT_DECAY=1e-4
-      unset MMDIFF_CLS_TOKEN_DIM
-      unset MMDIFF_CLS_HEAD_HIDDEN
-      ;;
-    exp3)
-      export MMDIFF_HSI_SE_RATIO="$MMDIFF_GRID_SE"
-      export MMDIFF_LIDAR_HIDDEN="$MMDIFF_COMBO_LIDAR_BASE"
-      export MMDIFF_LIDAR_EXTRA_BLOCKS=3
-      export MMDIFF_WEIGHT_DECAY="$MMDIFF_GRID_WD_EXP3"
-      unset MMDIFF_CLS_TOKEN_DIM
-      unset MMDIFF_CLS_HEAD_HIDDEN
-      ;;
-    exp4)
-      export MMDIFF_HSI_SE_RATIO="$MMDIFF_GRID_SE"
-      export MMDIFF_LIDAR_HIDDEN="$MMDIFF_COMBO_LIDAR_BASE"
-      export MMDIFF_LIDAR_EXTRA_BLOCKS=3
-      export MMDIFF_WEIGHT_DECAY="$MMDIFF_GRID_WD_EXP4"
-      export MMDIFF_CLS_TOKEN_DIM=320
-      export MMDIFF_CLS_HEAD_HIDDEN=160
-      ;;
-    *)
-      echo "未知 exp: $1（exp1|exp2|exp3|exp4）" >&2
-      exit 1
-      ;;
-  esac
-  export MMDIFF_EXPERIMENT_TAG="${MMDIFF_EXPERIMENT_TAG:-${MMDIFF_EXPERIMENT_TAG_PREFIX:-exp}_$1}"
-}
-
-run_train_exp() {
+run_train() {
   export_for_train
-  apply_exp "$1"
+  export MMDIFF_HSI_SE_RATIO="$MMDIFF_GRID_SE"
+  export MMDIFF_CLS_TOKEN_DIM
+  export MMDIFF_CLS_HEAD_HIDDEN
+  export MMDIFF_HSI_RESIDUAL_BLOCKS
+  export MMDIFF_HSI_CONV_HIDDEN
+  export MMDIFF_HSI_AGG_MODE
+  export MMDIFF_LIDAR_HIDDEN
+  export MMDIFF_LIDAR_EXTRA_BLOCKS
+  export MMDIFF_CLS_TRANSFORMER_LAYERS
+  export MMDIFF_CLS_TRANSFORMER_FF_DIM
+  export MMDIFF_EXPERIMENT_TAG="${MMDIFF_EXPERIMENT_TAG:-${MMDIFF_EXPERIMENT_TAG_PREFIX:-exp}_se_cls_shallow}"
   exec python main.py
-}
-
-run_grid() {
-  local ts="${MMDIFF_RUN_TIMESTAMP:-$(date +%m%d-%H%M)}"
-  local e failed=0
-  for e in exp1 exp2 exp3 exp4; do
-    MMDIFF_RUN_TIMESTAMP="$ts" MMDIFF_EXPERIMENT_TAG="" bash "$RUN_SH" train_exp "$e" || failed=$((failed + 1))
-  done
-  exit "$failed"
 }
 
 do_shutdown() {
@@ -94,34 +63,32 @@ usage() {
   cat <<'EOF'
 用法: bash run.sh <子命令>
 
-  train_exp <exp1|exp2|exp3|exp4>   单组实验
-  grid                              串行 exp1→exp4
-  all                               等同 grid，结束可配合 MMDIFF_SHUTDOWN_AT_END
+  train     浅骨干 + SE + 大分类头（见脚本顶部 MMDIFF_* 默认值）
+  grid      同 train
+  all       train 结束后 do_shutdown
   sanity [args...]
 
-网格摘要:
-  exp1  HSI_SE=24 lidar=64 blk=3 wd=1e-4 cls=默认
-  exp2  同 exp1 但 LiDAR 残差块=4（轻微加深）
-  exp3  同 exp1 结构 wd=MMDIFF_GRID_WD_EXP3（默认 1.5e-4）
-  exp4  同 exp3  cls token=320 head=160 wd=MMDIFF_GRID_WD_EXP4（默认 2e-4）
-
-可调: MMDIFF_GRID_SE MMDIFF_COMBO_LIDAR_BASE MMDIFF_GRID_WD_EXP3 MMDIFF_GRID_WD_EXP4
-      MMDIFF_RGB_STUDENT_CHECKPOINT
+默认变浅：HSI 残差块 3、conv_hidden 64、agg=mean；LiDAR hidden 48、extra_blocks=1；
+融合 Decoder 层数 1、ff_dim=384。SE 与 cls token/head 仍由 MMDIFF_GRID_SE / MMDIFF_CLS_* 控制。
 
 若 Linux 报 pipefail: sed -i 's/\r$//' run.sh 或 dos2unix run.sh
 EOF
 }
 
-[ $# -eq 0 ] && set -- grid
+[ $# -eq 0 ] && set -- train
 
 case "${1:-}" in
   help|-h|--help) usage ;;
-  train_exp) run_train_exp "${2:-exp1}" ;;
-  grid) run_grid ;;
+  train) run_train ;;
+  grid)
+    export MMDIFF_RUN_TIMESTAMP="${MMDIFF_RUN_TIMESTAMP:-$(date +%m%d-%H%M)}"
+    unset MMDIFF_EXPERIMENT_TAG 2>/dev/null || true
+    run_train
+    ;;
   all)
     ts="${MMDIFF_RUN_TIMESTAMP:-$(date +%m%d-%H%M)}"
     f=0
-    MMDIFF_RUN_TIMESTAMP="$ts" MMDIFF_EXPERIMENT_TAG="" bash "$RUN_SH" grid || f=$((f + 1))
+    MMDIFF_RUN_TIMESTAMP="$ts" bash "$RUN_SH" train || f=$((f + 1))
     if [ "${MMDIFF_SHUTDOWN_AT_END:-0}" = 1 ]; then
       sleep 2
       /usr/bin/shutdown 2>/dev/null || true
@@ -130,9 +97,8 @@ case "${1:-}" in
     exit "$f"
     ;;
   sanity) python utils/hsi_branch_sanity.py "${@:2}" ;;
-  # 兼容旧入口（已废弃 combo）
-  train_combo)
-    echo "train_combo 已改为 train_exp；请: bash run.sh train_exp ${2:-exp1}" >&2
+  train_exp|train_combo)
+    echo "已简化为单组 train；请: bash run.sh train" >&2
     exit 1
     ;;
   *) echo "未知: $1" >&2; usage >&2; exit 1 ;;

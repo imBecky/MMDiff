@@ -1,7 +1,11 @@
+from __future__ import annotations
+
 from collections import OrderedDict
 import os
 import re
+import warnings
 from pathlib import Path
+from typing import Optional
 import torch
 import utils.logger as Logger
 
@@ -112,9 +116,13 @@ def _parse_modality_combo(raw: str) -> tuple[str, ...]:
 ENABLED_MODALITIES = _parse_modality_combo(os.environ.get('MMDIFF_MODALITY_COMBO', '') or '')
 MODALITY_COMBO = '+'.join(ENABLED_MODALITIES)
 _RGB_ENABLED = 'rgb' in ENABLED_MODALITIES
+# 不在 import 时抛错，否则 data_prepare.py 等无法先 import param 再生成 .npy
 if _RGB_ENABLED and not TRAIN_RGB_PATCHES_PATH.is_file():
-    raise FileNotFoundError(
-        f'启用 rgb 模态但缺少 {TRAIN_RGB_PATCHES_PATH}（请先运行 data_prepare.py 生成 train_rgb_patches.npy）'
+    warnings.warn(
+        f'启用 rgb 模态但尚未找到 {TRAIN_RGB_PATCHES_PATH}；'
+        f'训练前请先运行 data_prepare.py 生成 train_rgb_patches.npy。',
+        UserWarning,
+        stacklevel=1,
     )
 USE_RGB_PATCHES = bool(_RGB_ENABLED)
 RGB_CHANNELS = 3
@@ -143,7 +151,8 @@ LOG_PATH = TB_LOG_ROOT / 'model.log'
 TRAIN_QUICK_VERIFY = False
 TRAIN_QUICK_VERIFY_SAMPLES_PER_CLASS = 150
 
-HSI_CHANNELS = 48
+# Houston 默认 48 波段；SZUTree 等 98 波段数据请设环境变量 MMDIFF_HSI_CHANNELS=98
+HSI_CHANNELS = int((os.environ.get('MMDIFF_HSI_CHANNELS') or '48').strip() or '48')
 LIDAR_CHANNELS = 1
 # Houston2018 前景地物类为 20；GT 中背景常为 0，patch 仅含 y>0 像素，标签平移后为 0....19。
 NUM_CLASSES = 20
@@ -186,6 +195,25 @@ SUPCON_PROJ_DIM = 128
 CENTER_GLOBAL_ABLATION = ((0.2, 0.8), (0.3, 0.7))
 MULTIMODAL_ABLATION_AXIS = None  # None | 'center_global'
 MULTIMODAL_ABLATION_INDEX = 0
+
+# RGB(student) -> LiDAR 引导（MultimodalClassifier）：none | film（FiLM 调制 lidar_g/lidar_c）
+# 仅 rgb_source=student 且同时启用 rgb+lidar 时生效，否则自动关。
+# 覆盖：MMDIFF_RGB_TO_LIDAR_GUIDANCE（别名 A 同 film）
+def _normalize_rgb_to_lidar_guidance(raw: Optional[str]) -> str:
+    s = (raw or 'none').strip().upper()
+    if s in ('', 'NONE', 'OFF', '0', 'FALSE'):
+        return 'none'
+    if s in ('FILM', 'A'):
+        return 'film'
+    raise ValueError(
+        'RGB_TO_LIDAR_GUIDANCE_MODE / MMDIFF_RGB_TO_LIDAR_GUIDANCE 须为 '
+        f'none|film|A，当前 {raw!r}'
+    )
+
+
+RGB_TO_LIDAR_GUIDANCE_MODE = _normalize_rgb_to_lidar_guidance(
+    os.environ.get('MMDIFF_RGB_TO_LIDAR_GUIDANCE')
+)
 
 # LiDAR 形态编码器 stem 隐藏通道（model/multimodal.py LidarMorphEncoder）
 LIDAR_PROJ_HIDDEN_CFG = 64
@@ -421,6 +449,7 @@ def build_opt():
             ('modality_combo', MODALITY_COMBO),
             ('rgb_source', (os.environ.get('MMDIFF_RGB_SOURCE') or _DEFAULT_RGB_SOURCE).strip().lower()),
             ('rgb_student_checkpoint', RGB_STUDENT_CHECKPOINT or None),
+            ('rgb_to_lidar_guidance_mode', RGB_TO_LIDAR_GUIDANCE_MODE),
         ]
     )
     path = OrderedDict(
@@ -505,8 +534,11 @@ def _apply_mmdiff_env_overrides():
     MMDIFF_WEIGHT_DECAY → WEIGHT_DECAY 与 opt['train']['optimizer']['weight_decay']
     MMDIFF_CLS_TOKEN_DIM → CLS_TOKEN_DIM 与 opt['model_cls']['token_dim']（须能被 transformer_heads 整除）
     MMDIFF_CLS_HEAD_HIDDEN → CLS_HEAD_HIDDEN 与 opt['model_cls']['head_hidden']
+    MMDIFF_CLS_TRANSFORMER_LAYERS → CLS_TRANSFORMER_LAYERS 与 opt['model_cls']['transformer_layers']
+    MMDIFF_CLS_TRANSFORMER_FF_DIM → CLS_TRANSFORMER_FF_DIM 与 opt['model_cls']['transformer_ff_dim']
     MMDIFF_EARLY_STOPPING_PATIENCE → EARLY_STOPPING_PATIENCE（0=关闭早停）
     MMDIFF_RESUME_CHECKPOINT → 覆盖 RESUME_CHECKPOINT
+    MMDIFF_RGB_TO_LIDAR_GUIDANCE → RGB_TO_LIDAR_GUIDANCE_MODE 与 opt['model_cls']['rgb_to_lidar_guidance_mode']（none|film）
     MMDIFF_SCHEDULER_LR_TOTAL_STEPS → opt['scheduler_lr_total_steps']（续训边界；旧 checkpoint 无该字段时手动设）
     MMDIFF_SCHEDULER_NAME / MMDIFF_SCHED_STEP_RATIOS / MMDIFF_SCHED_GAMMAS / MMDIFF_SCHED_COSINE_* → 见文件头 SCHEDULER_*
     （扩散 t 列表由模块加载时读取 MMDIFF_DIFFUSION_TIMESTEPS，见 _cls_diffusion_timesteps_from_env）
@@ -556,6 +588,8 @@ def _apply_mmdiff_env_overrides():
     _int('MMDIFF_SCHEDULER_LR_TOTAL_STEPS', 'SCHEDULER_LR_TOTAL_STEPS')
     _int('MMDIFF_CLS_TOKEN_DIM', 'CLS_TOKEN_DIM')
     _int('MMDIFF_CLS_HEAD_HIDDEN', 'CLS_HEAD_HIDDEN')
+    _int('MMDIFF_CLS_TRANSFORMER_LAYERS', 'CLS_TRANSFORMER_LAYERS')
+    _int('MMDIFF_CLS_TRANSFORMER_FF_DIM', 'CLS_TRANSFORMER_FF_DIM')
 
     lh = int(g['LIDAR_PROJ_HIDDEN_CFG'])
     if lh < 1:
@@ -615,6 +649,15 @@ def _apply_mmdiff_env_overrides():
     opt['model_cls']['token_dim'] = td
     opt['model_cls']['head_hidden'] = hh_cls
 
+    n_layers = int(g['CLS_TRANSFORMER_LAYERS'])
+    ff_dim = int(g['CLS_TRANSFORMER_FF_DIM'])
+    if n_layers < 1:
+        raise ValueError(f'CLS_TRANSFORMER_LAYERS / MMDIFF_CLS_TRANSFORMER_LAYERS 须 >= 1，当前 {n_layers}')
+    if ff_dim < 1:
+        raise ValueError(f'CLS_TRANSFORMER_FF_DIM / MMDIFF_CLS_TRANSFORMER_FF_DIM 须 >= 1，当前 {ff_dim}')
+    opt['model_cls']['transformer_layers'] = n_layers
+    opt['model_cls']['transformer_ff_dim'] = ff_dim
+
     rs = (os.environ.get('MMDIFF_RGB_SOURCE') or '').strip().lower()
     if rs:
         if rs not in ('diffusion', 'student', 'cached_teacher'):
@@ -632,6 +675,11 @@ def _apply_mmdiff_env_overrides():
     if resume_p:
         g['RESUME_CHECKPOINT'] = resume_p
 
+    _env_r2l = (os.environ.get('MMDIFF_RGB_TO_LIDAR_GUIDANCE') or '').strip()
+    r2l = _normalize_rgb_to_lidar_guidance(_env_r2l or g.get('RGB_TO_LIDAR_GUIDANCE_MODE') or 'none')
+    g['RGB_TO_LIDAR_GUIDANCE_MODE'] = r2l
+    opt['model_cls']['rgb_to_lidar_guidance_mode'] = r2l
+
 
 _apply_mmdiff_env_overrides()
 
@@ -648,6 +696,7 @@ MULTIMODAL_ABLATION_LOG_LINE = (
     f"lidar_hidden={LIDAR_PROJ_HIDDEN_CFG} lidar_extra_blocks={LIDAR_EXTRA_BLOCKS_CFG} "
     f"hsi_res_blocks={HSI_RESIDUAL_BLOCKS_CFG} hsi_conv_hidden={HSI_CONV_HIDDEN_CFG} "
     f"hsi_se_ratio={HSI_SE_RATIO_CFG} hsi_agg_mode={HSI_AGG_MODE_CFG} | "
+    f"rgb_to_lidar_guidance={RGB_TO_LIDAR_GUIDANCE_MODE} | "
     f"loss_global/center={LOSS_WEIGHT_GLOBAL}/{LOSS_WEIGHT_CENTER} | "
     f"use_supcon={USE_SUPCON} supcon_w={SUPCON_WEIGHT} tau={SUPCON_TEMPERATURE}"
 )

@@ -520,6 +520,10 @@ def log_model_and_training_detail(
             mc.get('t'),
         )
         logger.info(
+            'model_cls | rgb_to_lidar_guidance_mode=%s (none=关 film=RGB student FiLM→LiDAR token)',
+            mc.get('rgb_to_lidar_guidance_mode', 'none'),
+        )
+        logger.info(
             'rgb student | MMDIFF_RGB_STUDENT_CHECKPOINT=%s MMDIFF_FREEZE_RGB_STUDENT=%s',
             RGB_STUDENT_CHECKPOINT or '(empty=random init)',
             (os.environ.get('MMDIFF_FREEZE_RGB_STUDENT') or '').strip() or '0',

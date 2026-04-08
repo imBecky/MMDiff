@@ -12,6 +12,7 @@ from .architectures import (
     FGCNNClassifier,
     FusAtNetClassifier,
     MACNClassifier,
+    SSMAEClassifier,
     TwoBranchCNNClassifier,
 )
 
@@ -42,6 +43,9 @@ REGISTRY: Dict[str, Type[nn.Module]] = {
     'hsi_msi_multisource': DFINetClassifier,
     # Li et al. 2023 MACN（like413/MACN）
     'macn': MACNClassifier,
+    # Gao et al. 2023 SS-MAE（summitgao/SS-MAE，IEEE TGRS 2023）
+    'ss_mae': SSMAEClassifier,
+    'ssmae': SSMAEClassifier,
 }
 
 # 须走 pipeline/dfinet_protocol.py（联合损失+SGD）的注册名 = 所有指向 DFINetClassifier 的键

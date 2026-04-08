@@ -15,6 +15,8 @@ MODELS=(
   # DFINet = formango/HSI_MSI_Multisource_Classification（与 dfinet / formango_dfinet 同一实现）
   "hsi_msi_multisource:1e-3"
   "macn:1e-3"
+  # SS-MAE（TGRS 2023）微调默认 lr 1e-4、wd 0.05 见官方 README；此处仅传 lr，wd 仍可用 MMDIFF_SSMAE_WEIGHT_DECAY
+  "ss_mae:1e-4"
 )
 
 for entry in "${MODELS[@]}"; do

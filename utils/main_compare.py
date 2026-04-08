@@ -24,6 +24,11 @@ _ROOT = Path(__file__).resolve().parent.parent
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
+# 与 main.py 一致：空或非正整数 OMP_NUM_THREADS 会触发 libgomp 报错
+_omp = (os.environ.get('OMP_NUM_THREADS') or '').strip()
+if not _omp.isdigit() or int(_omp) <= 0:
+    os.environ['OMP_NUM_THREADS'] = '4'
+
 
 def _bootstrap_env():
     os.environ['MMDIFF_COMPARE_RUN'] = '1'
@@ -37,9 +42,10 @@ def main():
         type=str,
         required=True,
         help=(
-            '模型注册名，如 fgcnn fusatnet exvit two_branch_cnn dfinet macn；'
+            '模型注册名，如 fgcnn fusatnet exvit two_branch_cnn dfinet macn ss_mae；'
             'DFINet 官方仓库名别名：formango_dfinet / hsi_msi_multisource（'
-            'https://github.com/formango/HSI_MSI_Multisource_Classification ）'
+            'https://github.com/formango/HSI_MSI_Multisource_Classification ）；'
+            'SS-MAE：https://github.com/summitgao/SS-MAE'
         ),
     )
     parser.add_argument(
