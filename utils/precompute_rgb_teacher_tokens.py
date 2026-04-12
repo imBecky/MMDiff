@@ -3,14 +3,19 @@
 离线预计算 RGB 扩散教师 token（与 MultimodalClassifier 中 RGBLayerToToken 后一致），
 写入 npy + meta.json。输入为 HR 严格视野裁块（rgb_hr.npy），双线性到 HR_TEACHER_INPUT_SIZE 再喂冻结 UNet。
 
+默认提取层（偏纹理：浅层 down + 解码 up）::
+  down_blocks.0, down_blocks.1, up_blocks.1
+
+训练时使用 cached_teacher 须与 param.FEAT_SCALES（及 token维）一致，否则需重算缓存或改 --feat-layers。
+
 用法（在仓库根目录）:
   python utils/precompute_rgb_teacher_tokens.py --split train --batch-size 32
   python utils/precompute_rgb_teacher_tokens.py --split test --batch-size 32
+  python utils/precompute_rgb_teacher_tokens.py --split train --feat-layers down_blocks.0,down_blocks.1,up_blocks.1
 """
 from __future__ import annotations
 
 import argparse
-import os
 import sys
 from pathlib import Path
 
@@ -25,11 +30,16 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+_DEFAULT_FEAT_SCALES = (
+    'down_blocks.0',
+    'down_blocks.1',
+    'up_blocks.1',
+)
+
 from param import (  # noqa: E402
     CLS_DIFFUSION_TIMESTEPS,
     CLS_TOKEN_DIM,
     DATA_DIR,
-    FEAT_SCALES,
     HR_TEACHER_INPUT_SIZE,
     PATCH_WINDOW_SIZE,
     RANDOM_SEED,
@@ -58,6 +68,12 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument('--out-train', type=str, default='', help='覆盖默认 train 输出路径')
     p.add_argument('--out-test', type=str, default='', help='覆盖默认 test 输出路径')
     p.add_argument('--device', type=str, default='cuda')
+    p.add_argument(
+        '--feat-layers',
+        type=str,
+        default=','.join(_DEFAULT_FEAT_SCALES),
+        help='逗号分隔 UNet 子模块名（与 diffusers UNet2DModel 一致），默认 down_blocks.0,down_blocks.1,up_blocks.1',
+    )
     return p.parse_args()
 
 
@@ -96,7 +112,9 @@ def main() -> None:
 
     n = len(labels)
     diffusion_ts = list(CLS_DIFFUSION_TIMESTEPS)
-    feat_names = list(FEAT_SCALES)
+    feat_names = [x.strip() for x in (args.feat_layers or '').split(',') if x.strip()]
+    if not feat_names:
+        raise ValueError('--feat-layers 解析为空，请传入逗号分隔层名，例如 down_blocks.0,down_blocks.1,up_blocks.1')
     num_tokens = len(diffusion_ts) * len(feat_names)
     d_model = int(CLS_TOKEN_DIM)
 

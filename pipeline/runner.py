@@ -38,6 +38,9 @@ from param import (
     RGB_DIFFUSION_TEACHER_CHECKPOINT,
     RGB_SOURCE,
     RGB_STUDENT_CHECKPOINT,
+    RGB_STUDENT_TEACHER_LOSS_COS_COEF,
+    RGB_STUDENT_TEACHER_LOSS_WEIGHT,
+    RGB_TEACHER_TOKEN_CACHE_TRAIN,
     SAVE_EVERY_EPOCH,
     STUDENT_NUM_TRAIN_TIMESTEPS,
     TB_LOG_ROOT,
@@ -82,6 +85,7 @@ from .loop import (
     train_one_epoch,
 )
 from .classification_metrics import accuracies
+from .rgb_teacher_cache import load_meta, mmap_tokens
 from .student_diffusion import StudentDiffusionWrapper
 
 CreateClassifierFn = Callable[[Any, Any], torch.nn.Module]
@@ -510,6 +514,50 @@ def run_training(
 
     log_model_and_training_detail(logger, writer, model, opt, clip_grad, diffusion)
 
+    rgb_teacher_mmap_train = None
+    _rs = getattr(model, 'rgb_student', None)
+    if float(RGB_STUDENT_TEACHER_LOSS_WEIGHT) > 0 and _rs is None:
+        logger.warning(
+            'MMDIFF_RGB_STUDENT_TEACHER_LOSS_WEIGHT>0 但模型无 rgb_student（非 student 分支），已忽略教师辅助损失'
+        )
+    elif float(RGB_STUDENT_TEACHER_LOSS_WEIGHT) > 0 and _rs is not None:
+        if getattr(model, 'rgb_source', '') != 'student' or not bool(getattr(model, 'use_rgb', False)):
+            logger.warning(
+                'MMDIFF_RGB_STUDENT_TEACHER_LOSS_WEIGHT>0 但当前模型未使用 rgb_source=student，已忽略教师辅助损失'
+            )
+        elif not USE_RGB_PATCHES:
+            logger.warning(
+                'MMDIFF_RGB_STUDENT_TEACHER_LOSS_WEIGHT>0 但 USE_RGB_PATCHES 为假，已忽略教师辅助损失'
+            )
+        elif not any(p.requires_grad for p in _rs.parameters()):
+            logger.warning(
+                'MMDIFF_RGB_STUDENT_TEACHER_LOSS_WEIGHT>0 但 rgb_student 已冻结，教师辅助损失不生效（请将权重置 0 或解冻 student）'
+            )
+        else:
+            ck_path = RGB_TEACHER_TOKEN_CACHE_TRAIN
+            if not ck_path.is_file():
+                raise FileNotFoundError(
+                    f'MMDIFF_RGB_STUDENT_TEACHER_LOSS_WEIGHT={RGB_STUDENT_TEACHER_LOSS_WEIGHT} 需要离线 teacher '
+                    f'缓存 {ck_path}，请先运行: python utils/precompute_rgb_teacher_tokens.py --split train'
+                )
+            rgb_teacher_mmap_train = mmap_tokens(ck_path)
+            meta_path = ck_path.with_suffix('.meta.json')
+            if meta_path.is_file():
+                meta = load_meta(meta_path)
+                dm = int(meta.get('d_model', -1))
+                ntok = int(meta.get('num_tokens', -1))
+                if dm != _rs.d_model or ntok != _rs.num_tokens:
+                    raise ValueError(
+                        f'teacher 缓存与当前 rgb_student 不一致: cache d_model={dm} num_tokens={ntok}, '
+                        f'model d_model={_rs.d_model} num_tokens={_rs.num_tokens}'
+                    )
+            logger.info(
+                'RGB student 教师监督: weight=%g cos_coef=%g cache=%s',
+                float(RGB_STUDENT_TEACHER_LOSS_WEIGHT),
+                float(RGB_STUDENT_TEACHER_LOSS_COS_COEF),
+                ck_path,
+            )
+
     best_acc = resume_best_acc
     best_epoch = resume_best_epoch
     global_step = resume_global_step
@@ -560,6 +608,7 @@ def run_training(
                 global_step=global_step,
                 clip_grad_norm=clip_grad,
                 lr_scheduler=lr_scheduler,
+                rgb_teacher_cache=rgb_teacher_mmap_train,
             )
             run_eval = epoch >= EVAL_VAL_START_EPOCH and selection_loader is not None
             run_selection = run_eval and train_acc >= EVAL_MIN_TRAIN_ACC

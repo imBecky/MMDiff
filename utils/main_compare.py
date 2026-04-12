@@ -71,13 +71,18 @@ def main():
     # 须在 import param / pipeline 之前设好环境变量
     from model.compare_model import create_compare_classifier
     from pipeline import TrainingRunOptions, run_training, verify_projection_gradients
+    from utils.training_control_variable_summary import emit_training_control_variable_summary
 
     def create_classifier(opt_cfg, diffusion):
         return create_compare_classifier(opt_cfg, diffusion)
 
     if args.verify_projection_grad:
+        from param import LOG_PATH
+
+        emit_training_control_variable_summary(no_artifacts=False, log_file=Path(LOG_PATH))
         verify_projection_gradients(create_classifier)
     else:
+        emit_training_control_variable_summary(no_artifacts=args.no_artifacts)
         run_training(
             create_classifier,
             TrainingRunOptions(

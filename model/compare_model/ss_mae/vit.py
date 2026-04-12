@@ -140,10 +140,12 @@ class VisionTransformer(nn.Module):
         self.cls_token_spa = nn.Parameter(torch.zeros(1, 1, embed_dim))
         self.cls_token_chan = nn.Parameter(torch.zeros(1, 1, embed_dim))
         
-        # 不在 __init__ 里 .to(cuda)：否则未调用 model.cuda() 时与 CPU 上的权重/输入混用会报错；随 model.to(device) 一并迁移即可。
+        # cosine 位置编码：必须用 register_buffer，否则 self.pos_embed_* 是裸 Tensor，model.to(cuda) 不会迁移。
         if pos_embed == "cosine":
-            self.pos_embed_spa = PositionEmbed(num_patches_spa, embed_dim, self.num_tokens)()
-            self.pos_embed_chan = PositionEmbed(num_patches_chan, embed_dim, self.num_tokens)()
+            _pe_spa = PositionEmbed(num_patches_spa, embed_dim, self.num_tokens)
+            _pe_chan = PositionEmbed(num_patches_chan, embed_dim, self.num_tokens)
+            self.register_buffer("pos_embed_spa", _pe_spa.pe)
+            self.register_buffer("pos_embed_chan", _pe_chan.pe)
         else:
             self.pos_embed_spa = nn.Parameter(torch.zeros(1, num_patches_spa + self.num_tokens, embed_dim))
             self.pos_embed_chan = nn.Parameter(torch.zeros(1, num_patches_chan + self.num_tokens, embed_dim))

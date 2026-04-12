@@ -1,4 +1,7 @@
-"""轻量 RGB patch 编码器：输出与 MultimodalClassifier 扩散分支一致的 token 序列。"""
+"""轻量 RGB patch 编码器：从 RGB patch 直接映射为与融合头维度一致的 token 序列。
+
+说明：类名/文件名中的 student 仅为历史命名；当前实现为独立轻量 CNN，不依赖教师网络或蒸馏监督。
+"""
 from __future__ import annotations
 
 import torch
@@ -7,8 +10,10 @@ import torch.nn as nn
 
 class LightweightRgbEncoder(nn.Module):
     """
-    输入 B×3×H×W（通常为 11×11 patch），输出 B×num_tokens×d_model，
-    与 len(diffusion_ts)×len(feat_scales) 个 RGB token 对齐。
+    输入 B×3×H×W（通常为 11×11 patch），输出 B×num_tokens×d_model。
+
+    结构：两层 Conv-BN-ReLU stem → 全局平均池化 → 线性层展开为 num_tokens 个 d_model 维 token。
+    num_tokens 由主模型配置为与多尺度/多时间步 RGB token 数量一致（与 feat_scales×diffusion_ts 对齐），非教师特征。
     """
 
     def __init__(

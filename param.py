@@ -12,7 +12,11 @@ import utils.logger as Logger
 # ---------------------------------------------------------------------------
 # 数据与训练（常用修改处）
 # ---------------------------------------------------------------------------
-# 直接 python main.py（无 MMDIFF_*）：采用当前文件中的默认实验设置。
+# 本地实验：优先改仓库根目录 run.sh 顶部「今晚实验」短名，由脚本映射为 MMDIFF_*；
+# 或直接 export MMDIFF_* 覆盖（见下方 _apply_mmdiff_env_overrides 文档字符串）。
+# ---------------------------------------------------------------------------
+# 直接 python main.py（无 MMDIFF_*）：默认对齐一次典型主实验（与 tf-logs 中 exp_se_cls_shallow 类配置一致，例如
+# lidar 48+2 残差、HSI 5×96+SE32+mean、cls token 320 / 头 320 / decoder 1×384、epochs=250、wd=2e-4、early_stop=20）。
 SCHED_STEP_RATIOS = [0.6, 0.7]
 SCHED_GAMMAS = [0.4, 0.1]
 SCHEDULER_NAME = 'cosine'
@@ -55,11 +59,11 @@ _apply_scheduler_env()
 CLIP_GRAD_NORM = 1.0
 EVAL_VAL_START_EPOCH = 20
 LEARNING_RATE = 8e-4
-WEIGHT_DECAY = 1e-4
+WEIGHT_DECAY = 2e-4
 NUM_WORKERS = 14
 BATCH_SIZE = 64
 CLS_TRANSFORMER_DROPOUT = 0.1
-NUM_EPOCHS = 300
+NUM_EPOCHS = 250
 # 续训时 LambdaLR 衰减边界用：与首次训练一致的总 step 数（通常由 checkpoint 自动写入；旧断点可 export MMDIFF_SCHEDULER_LR_TOTAL_STEPS）
 SCHEDULER_LR_TOTAL_STEPS = 0
 
@@ -172,13 +176,13 @@ DIFFUSION_NOISE_MODE = 'deterministic'
 DIFFUSION_NORMALIZE_INPUT = True
 
 # 本 epoch 训练准确率低于该值时不跑验证/选集 eval（0~1）；目标「先过拟合训练集」
-EVAL_MIN_TRAIN_ACC = 0
+EVAL_MIN_TRAIN_ACC = 0.99
 # 过门槛后每 N 个 epoch 跑一次 eval（test 集大时减少 eval 频率；0 表示每 epoch 都跑）
-EVAL_INTERVAL_EPOCHS = 5
+EVAL_INTERVAL_EPOCHS = 1
 
 # 早停：仅在「实际跑完验证集评估」时计数；连续 patience 次 OA 未严格超过历史最优则结束。0=关闭。
 # 环境变量：MMDIFF_EARLY_STOPPING_PATIENCE
-EARLY_STOPPING_PATIENCE = 15
+EARLY_STOPPING_PATIENCE = 10
 
 USE_CENTER_LOSS = True
 LOSS_WEIGHT_GLOBAL = 0.2
@@ -216,15 +220,14 @@ RGB_TO_LIDAR_GUIDANCE_MODE = _normalize_rgb_to_lidar_guidance(
 )
 
 # LiDAR 形态编码器 stem 隐藏通道（model/multimodal.py LidarMorphEncoder）
-LIDAR_PROJ_HIDDEN_CFG = 64
+LIDAR_PROJ_HIDDEN_CFG = 48
 # stem 之后在 feat_ch 上追加的空间残差块数（见 model/multimodal.py _LidarSpatialResidualBlock）
-# 0=仅 stem；默认 1（略浅于 2～3 块堆叠）
-LIDAR_EXTRA_BLOCKS_CFG = 3
-HSI_RESIDUAL_BLOCKS_CFG = 6
+LIDAR_EXTRA_BLOCKS_CFG = 2
+HSI_RESIDUAL_BLOCKS_CFG = 5
 HSI_CONV_HIDDEN_CFG = 96
-HSI_SE_RATIO_CFG = 16  # 0=关闭 SE；>0=开启并使用对应 squeeze ratio
-# HSI 3×3 空间聚合：mean | attn_pool（D1 可学习加权）| multi_token（D2 中心/四角/四边 三 token）
-HSI_AGG_MODE_CFG = 'attn_pool'
+HSI_SE_RATIO_CFG = 32  # 0=关闭 SE；>0=开启并使用对应 squeeze ratio
+# HSI 空间聚合：mean | attn_pool | multi_token
+HSI_AGG_MODE_CFG = 'mean'
 _EFFECTIVE_ABLATION_AXIS = None
 _EFFECTIVE_ABLATION_INDEX = None
 
@@ -292,7 +295,16 @@ RGB_TEACHER_TOKEN_CACHE_TRAIN = DATA_DIR / 'rgb_teacher_tokens_train_strict.npy'
 RGB_TEACHER_TOKEN_META_TRAIN = DATA_DIR / 'rgb_teacher_tokens_train_strict.meta.json'
 RGB_TEACHER_TOKEN_CACHE_TEST = DATA_DIR / 'rgb_teacher_tokens_test_strict.npy'
 RGB_TEACHER_TOKEN_META_TEST = DATA_DIR / 'rgb_teacher_tokens_test_strict.meta.json'
+_REPO_ROOT = Path(__file__).resolve().parent
+_DEFAULT_RGB_STUDENT_CKPT = _REPO_ROOT / 'model' / 'rgb_student_distill.pt'
 RGB_STUDENT_CHECKPOINT = (os.environ.get('MMDIFF_RGB_STUDENT_CHECKPOINT') or '').strip()
+if not RGB_STUDENT_CHECKPOINT:
+    RGB_STUDENT_CHECKPOINT = str(_DEFAULT_RGB_STUDENT_CKPT)
+
+# rgb_source=student 时可选：用离线扩散 teacher token 做辅助损失（须先 precompute train缓存）
+RGB_STUDENT_TEACHER_LOSS_WEIGHT = 0.0
+RGB_STUDENT_TEACHER_LOSS_COS_COEF = 0.1
+
 
 def _cls_diffusion_timesteps_from_env():
     """run.sh 可 export MMDIFF_DIFFUSION_TIMESTEPS=50,100,150,200（逗号分隔）覆盖默认。"""
@@ -312,11 +324,11 @@ CLS_INIT_TYPE = 'kaiming'
 CLS_INIT_SCALE = 0.1
 CLS_OUTPUT_CM_SIZE = 3
 # 多模态 Transformer 分类头（见 model/multimodal.py）
-CLS_TOKEN_DIM = 256
+CLS_TOKEN_DIM = 320
 CLS_TRANSFORMER_HEADS = 4
-CLS_TRANSFORMER_LAYERS = 2
-CLS_TRANSFORMER_FF_DIM = 512
-CLS_HEAD_HIDDEN = 128
+CLS_TRANSFORMER_LAYERS = 1
+CLS_TRANSFORMER_FF_DIM = 384
+CLS_HEAD_HIDDEN = 320
 
 
 def _train_scheduler_dict():
@@ -543,6 +555,9 @@ def _apply_mmdiff_env_overrides():
     MMDIFF_SCHEDULER_NAME / MMDIFF_SCHED_STEP_RATIOS / MMDIFF_SCHED_GAMMAS / MMDIFF_SCHED_COSINE_* → 见文件头 SCHEDULER_*
     （扩散 t 列表由模块加载时读取 MMDIFF_DIFFUSION_TIMESTEPS，见 _cls_diffusion_timesteps_from_env）
     MMDIFF_FREEZE_RGB_STUDENT=1 → rgb_source=student 时冻结轻量 RGB 编码器并重建优化器（续训 resume 时不走该分支）
+    MMDIFF_RANDOM_SEED → RANDOM_SEED（torch/np 与划分等）
+    MMDIFF_RGB_STUDENT_TEACHER_LOSS_WEIGHT → RGB_STUDENT_TEACHER_LOSS_WEIGHT（0=关闭；需 rgb_teacher_tokens_train_strict.npy）
+    MMDIFF_RGB_STUDENT_TEACHER_LOSS_COS_COEF → RGB_STUDENT_TEACHER_LOSS_COS_COEF（与 train_rgb_distill 中 mse+coef*cos 一致，默认 0.1）
     """
     g = globals()
 
@@ -570,6 +585,8 @@ def _apply_mmdiff_env_overrides():
             return
         g[key] = v.strip()
 
+    _float('MMDIFF_RGB_STUDENT_TEACHER_LOSS_WEIGHT', 'RGB_STUDENT_TEACHER_LOSS_WEIGHT')
+    _float('MMDIFF_RGB_STUDENT_TEACHER_LOSS_COS_COEF', 'RGB_STUDENT_TEACHER_LOSS_COS_COEF')
     _float('MMDIFF_LOSS_WEIGHT_GLOBAL', 'LOSS_WEIGHT_GLOBAL')
     _float('MMDIFF_LOSS_WEIGHT_CENTER', 'LOSS_WEIGHT_CENTER')
     _float('MMDIFF_SUPCON_WEIGHT', 'SUPCON_WEIGHT')
@@ -584,6 +601,7 @@ def _apply_mmdiff_env_overrides():
     _int('MMDIFF_HSI_SE_RATIO', 'HSI_SE_RATIO_CFG')
     _str_env('MMDIFF_HSI_AGG_MODE', 'HSI_AGG_MODE_CFG')
     _int('MMDIFF_BATCH_SIZE', 'BATCH_SIZE')
+    _int('MMDIFF_RANDOM_SEED', 'RANDOM_SEED')
     _int('MMDIFF_EARLY_STOPPING_PATIENCE', 'EARLY_STOPPING_PATIENCE')
     _int('MMDIFF_SCHEDULER_LR_TOTAL_STEPS', 'SCHEDULER_LR_TOTAL_STEPS')
     _int('MMDIFF_CLS_TOKEN_DIM', 'CLS_TOKEN_DIM')

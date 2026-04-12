@@ -88,7 +88,8 @@ class PositionEmbed(nn.Module):
         pe = pe.unsqueeze(0)
         self.register_buffer('pe', pe)
 
-    def __call__(self):
+    def forward(self):
+        """供 PositionEmbed(...)() 走 nn.Module.__call__ -> forward，勿覆写 __call__。"""
         return self.pe
 
 

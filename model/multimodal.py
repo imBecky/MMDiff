@@ -39,11 +39,12 @@ class ClassifierHead(nn.Module):
 
 
 
-def _crop_center_3x3(x: torch.Tensor) -> torch.Tensor:
-    """B,C,H,W -> B,C,3,3，不足则边缘复制 pad。"""
+def _hsi_crop_11x11(x: torch.Tensor) -> torch.Tensor:
+    """B,C,H,W -> B,C,11,11，不足则 replicate pad 再取中心 11×11。"""
+    ph, pw = 11, 11
     _, c, h, w = x.shape
-    need_y = max(0, 3 - h)
-    need_x = max(0, 3 - w)
+    need_y = max(0, ph - h)
+    need_x = max(0, pw - w)
     if need_y or need_x:
         pad_top = need_y // 2
         pad_bottom = need_y - pad_top
@@ -52,9 +53,9 @@ def _crop_center_3x3(x: torch.Tensor) -> torch.Tensor:
         x = F.pad(x, (pad_left, pad_right, pad_top, pad_bottom), mode='replicate')
         h, w = x.shape[2], x.shape[3]
     cy, cx = h // 2, w // 2
-    y0, y1 = cy - 1, cy + 2
-    x0, x1 = cx - 1, cx + 2
-    return x[:, :, y0:y1, x0:x1]
+    y0 = cy - ph // 2
+    x0 = cx - pw // 2
+    return x[:, :, y0 : y0 + ph, x0 : x0 + pw]
 
 
 class _HSISpectralResidualBlock(nn.Module):
@@ -75,15 +76,7 @@ class _HSISpectralResidualBlock(nn.Module):
 
 
 class HSICenterSpectralEncoder(nn.Module):
-    """
-    中心 3x3：9 个像素各做 1D 光谱卷积（沿波段维），stem 后经若干光谱残差块加深，
-    SE 通道门控（在光谱特征图上做 squeeze-excite），再全局池化、空间聚合，投影为 1 或多个 token。
-
-    agg_mode:
-      - mean: 9 位置特征算术平均 -> 1 token（原默认）
-      - attn_pool: 对 9 位置学 softmax 权重再加权求和 -> 1 token（D1）
-      - multi_token: 中心 / 四角均值 / 四边均值 -> 3 token（D2）
-    """
+    """HSI 固定 11×11：每位置 1D 光谱卷积 + SE + 空间聚合 -> token(s)。agg_mode: mean | attn_pool | multi_token。"""
     _AGG_MODES = frozenset({'mean', 'attn_pool', 'multi_token'})
 
     def __init__(
@@ -136,9 +129,10 @@ class HSICenterSpectralEncoder(nn.Module):
         return 3 if self.agg_mode == 'multi_token' else 1
 
     def forward(self, hsi: torch.Tensor) -> torch.Tensor:
-        patch = _crop_center_3x3(hsi)
+        patch = _hsi_crop_11x11(hsi)
         b, c, _, _ = patch.shape
-        x = patch.permute(0, 2, 3, 1).contiguous().view(b * 9, c).unsqueeze(1)
+        n = 121
+        x = patch.permute(0, 2, 3, 1).contiguous().view(b * n, c).unsqueeze(1)
         feat = self.stem(x)
         feat = self.res_blocks(feat)
 
@@ -147,12 +141,13 @@ class HSICenterSpectralEncoder(nn.Module):
             feat = feat * gate.unsqueeze(2)
 
         feat = self.pool(feat).squeeze(-1)
-        feat = feat.view(b, 9, -1)
+        feat = feat.view(b, n, -1)
 
         if self.agg_mode == 'multi_token':
-            center = feat[:, 4]
-            corner = feat[:, [0, 2, 6, 8]].mean(dim=1)
-            edge = feat[:, [1, 3, 5, 7]].mean(dim=1)
+            # 行主序 11×11：中心 60；四角 0,10,110,120；四边中 5,115,55,65
+            center = feat[:, 60]
+            corner = feat[:, [0, 10, 110, 120]].mean(dim=1)
+            edge = feat[:, [5, 115, 55, 65]].mean(dim=1)
             toks = torch.stack([center, corner, edge], dim=1)
             return self.proj(toks)
 
@@ -161,7 +156,7 @@ class HSICenterSpectralEncoder(nn.Module):
             w = F.softmax(self.spatial_attn(feat).squeeze(-1), dim=-1)
             feat = (feat * w.unsqueeze(-1)).sum(dim=1)
         else:
-            feat = feat.mean(dim=1)
+            feat = feat.mean(dim=1) # now use
 
         return self.proj(feat)
 
@@ -257,8 +252,8 @@ def _probe_diffusion_layer_channels(
 
 class MultimodalClassifier(nn.Module):
     """
-    HSI：中心 3x3，1D 光谱卷积 + SE；空间聚合可为 1 token（mean/attn_pool）或 3 token（multi_token）
-    RGB：默认冻结 UNet（rgb_source=diffusion）；可选轻量 student（rgb_source=student）或离线 teacher token（cached_teacher）
+    HSI：固定 11×11，每位置 1D 光谱卷积 + SE；聚合为 1 或 3 token
+    RGB：默认轻量 student（rgb_source=student）或离线 teacher token（cached_teacher）
     LiDAR：小 CNN（stem + 可选空间残差块）-> global + center 共 2 token
     融合：两枚可学习 CLS 为 query，模态 token 为 memory，TransformerDecoder（交叉注意力）
     双头：global_head(cls[0])，center_head(cls[1])
@@ -334,9 +329,6 @@ class MultimodalClassifier(nn.Module):
         hsi_residual_blocks = int(proj_cfg.get('hsi_residual_blocks') or 2)
         hsi_agg_mode = str(proj_cfg.get('hsi_agg_mode') or 'mean').strip().lower()
 
-        patch_h = int(ds_cfg.get('patch_size') or 11)
-        patch_w = patch_h
-
         self.rgb_projs = None
         self.rgb_student: Optional[LightweightRgbEncoder] = None
         if self.use_rgb and self.rgb_source == 'diffusion':
@@ -350,8 +342,8 @@ class MultimodalClassifier(nn.Module):
             n_rgb_tok = len(self.diffusion_ts) * len(self.feat_layer_names)
             self.rgb_student = LightweightRgbEncoder(
                 in_ch=3,
-                patch_h=patch_h,
-                patch_w=patch_w,
+                patch_h=11,
+                patch_w=11,
                 d_model=d_model,
                 num_tokens=n_rgb_tok,
             )
