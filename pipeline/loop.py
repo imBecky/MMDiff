@@ -13,8 +13,6 @@ from param import (
     EVAL_LOG_INTERVAL,
     LOSS_WEIGHT_CENTER,
     LOSS_WEIGHT_GLOBAL,
-    RGB_STUDENT_TEACHER_LOSS_COS_COEF,
-    RGB_STUDENT_TEACHER_LOSS_WEIGHT,
     SUPCON_TEMPERATURE,
     SUPCON_WEIGHT,
     TRAIN_LOG_INTERVAL,
@@ -24,7 +22,6 @@ from param import (
 )
 
 from .data import batch_to_dict
-from .rgb_teacher_cache import gather_tokens
 
 
 def _log_train_step_line(logger, msg: str) -> None:
@@ -127,25 +124,15 @@ def supervised_contrastive_loss(
     return -mean_log_prob_pos.mean()
 
 
-def _model_supports_rgb_student_teacher_loss(model: nn.Module) -> bool:
-    return (
-        bool(getattr(model, 'use_rgb', False))
-        and getattr(model, 'rgb_source', '') == 'student'
-        and getattr(model, 'rgb_student', None) is not None
-    )
-
-
 def compute_classification_loss(
     model,
     data_dict,
     labels,
     loss_fn,
-    rgb_teacher_cache=None,
 ):
     """
     训练用：可选 全局 + 中心 双项交叉熵（见 param.USE_CENTER_LOSS）。
     可选 SupCon：param.USE_SUPCON，在 c_rep 投影上监督对比，与 CE 相加。
-    rgb_teacher_cache：train 集 mmap 的 teacher token；与 rgb_source=student 且 MMDIFF_RGB_STUDENT_TEACHER_LOSS_WEIGHT>0 联用。
     loss_fn 与 MultimodalClassifier.loss_func 一致（CrossEntropyLoss）。
     返回的 logits 用于 train_acc 统计：若 USE_CENTER_LOSS 则用 logits_c，与 eval 保持一致。
     """
@@ -168,9 +155,6 @@ def compute_classification_loss(
         loss = loss_ce + SUPCON_WEIGHT * loss_s
         extra['ce'] = float(loss_ce.detach().item())
         extra['supcon'] = float(loss_s.detach().item())
-        loss, extra = _maybe_add_rgb_student_teacher_loss(
-            model, data_dict, labels, loss, extra, rgb_teacher_cache,
-        )
         return loss, logits, extra
 
     if USE_CENTER_LOSS:
@@ -179,41 +163,10 @@ def compute_classification_loss(
             LOSS_WEIGHT_GLOBAL * loss_fn(logits_g, labels)
             + LOSS_WEIGHT_CENTER * loss_fn(logits_c, labels)
         )
-        loss, extra = _maybe_add_rgb_student_teacher_loss(
-            model, data_dict, labels, loss, extra, rgb_teacher_cache,
-        )
         return loss, logits_c, extra
     logits = model(data_dict)
     loss = loss_fn(logits, labels)
-    loss, extra = _maybe_add_rgb_student_teacher_loss(
-        model, data_dict, labels, loss, extra, rgb_teacher_cache,
-    )
     return loss, logits, extra
-
-
-def _maybe_add_rgb_student_teacher_loss(model, data_dict, labels, loss, extra, rgb_teacher_cache):
-    w = float(RGB_STUDENT_TEACHER_LOSS_WEIGHT)
-    if w <= 0 or rgb_teacher_cache is None or not _model_supports_rgb_student_teacher_loss(model):
-        return loss, extra
-    rs = model.rgb_student
-    if rs is None or not any(p.requires_grad for p in rs.parameters()):
-        return loss, extra
-    if 'rgb' not in data_dict or 'global_row' not in data_dict or 'rot_k' not in data_dict:
-        return loss, extra
-    tgt = gather_tokens(rgb_teacher_cache, data_dict['global_row'], data_dict['rot_k']).to(
-        device=labels.device, dtype=torch.float32,
-    )
-    pred = rs(data_dict['rgb'])
-    mse = F.mse_loss(pred, tgt)
-    pred_n = F.normalize(pred, dim=-1)
-    tgt_n = F.normalize(tgt, dim=-1)
-    cos = 1.0 - (pred_n * tgt_n).sum(dim=-1).mean()
-    loss_t = mse + float(RGB_STUDENT_TEACHER_LOSS_COS_COEF) * cos
-    loss = loss + w * loss_t
-    extra['rgb_teacher'] = float((w * loss_t).detach().item())
-    extra['rgb_teacher_mse'] = float(mse.detach().item())
-    extra['rgb_teacher_cos'] = float(cos.detach().item())
-    return loss, extra
 
 
 def train_one_epoch(
@@ -228,7 +181,6 @@ def train_one_epoch(
     global_step=0,
     clip_grad_norm=0.0,
     lr_scheduler=None,
-    rgb_teacher_cache=None,
 ):
     """训练一个 epoch。"""
     use_rgb = USE_RGB_PATCHES
@@ -241,11 +193,12 @@ def train_one_epoch(
     progress_bar = tqdm(loader, desc='Train', leave=False, dynamic_ncols=True)
 
     for batch_idx, batch in enumerate(progress_bar, start=1):
+        # return 0, 1, 1
         data_dict, labels = batch_to_dict(batch, device, use_rgb, use_supcon)
 
         optimizer.zero_grad()
         loss, logits, extra = compute_classification_loss(
-            model, data_dict, labels, loss_fn, rgb_teacher_cache=rgb_teacher_cache,
+            model, data_dict, labels, loss_fn,
         )
         loss.backward()
         if CHECK_PROJECTION_GRAD and (
@@ -283,10 +236,6 @@ def train_one_epoch(
                 writer.add_scalar('train/step_supcon', extra['supcon'], global_step)
             if extra.get('ce') is not None:
                 writer.add_scalar('train/step_ce', extra['ce'], global_step)
-            if extra.get('rgb_teacher') is not None:
-                writer.add_scalar('train/step_rgb_teacher', extra['rgb_teacher'], global_step)
-            if extra.get('rgb_teacher_mse') is not None:
-                writer.add_scalar('train/step_rgb_teacher_mse', extra['rgb_teacher_mse'], global_step)
 
         if batch_idx % TRAIN_LOG_INTERVAL == 0 or batch_idx == len(loader):
             _log_train_step_line(
@@ -301,6 +250,7 @@ def train_one_epoch(
                     current_lr,
                 ),
             )
+        # break
 
     epoch_loss = running_loss / total
     epoch_acc = correct / total
@@ -365,6 +315,7 @@ def evaluate(
                         batch_acc,
                     ),
                 )
+            # break
 
     preds = np.concatenate(preds)
     targets = np.concatenate(targets)

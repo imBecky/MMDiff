@@ -59,3 +59,8 @@ compare_logs/
 
 # 多 Agent 协作上下文
 agent-collab/
+
+# 论文草稿（除本目录下 README 外均不入库）
+paper_drafts/*
+!paper_drafts/README.md
+

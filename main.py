@@ -16,7 +16,8 @@ from pipeline import TrainingRunOptions, run_training, verify_projection_gradien
 from utils.training_control_variable_summary import emit_training_control_variable_summary
 
 
-def create_classifier(opt_cfg, diffusion):
+def create_classifier(opt_cfg, diffusion=None):
+    """diffusion 参数已废弃，保留仅为与 runner 签名兼容。"""
     return Model.create_multimodal_classifier(opt_cfg, diffusion)
 
 

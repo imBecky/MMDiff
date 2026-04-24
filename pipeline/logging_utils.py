@@ -5,6 +5,7 @@ from datetime import datetime
 from pathlib import Path
 
 import numpy as np
+import torch
 import torch.nn as nn
 
 import math
@@ -15,8 +16,6 @@ from param import (
     CHECK_PROJECTION_GRAD,
     CLIP_GRAD_NORM,
     DATA_DIR,
-    DIFFUSION_NOISE_MODE,
-    DIFFUSION_NORMALIZE_INPUT,
     EVAL_INTERVAL_EPOCHS,
     EVAL_MIN_TRAIN_ACC,
     EVAL_VAL_START_EPOCH,
@@ -36,7 +35,6 @@ from param import (
     OPTIMIZER_BETAS,
     PATCH_WINDOW_SIZE,
     RANDOM_SEED,
-    RGB_DIFFUSION_TEACHER_CHECKPOINT,
     RGB_STUDENT_CHECKPOINT,
     RUN_NAME_PREFIX,
     SAVE_EVERY_EPOCH,
@@ -406,6 +404,114 @@ def log_config(
         )
 
 
+def log_module_structure(logger, model: nn.Module) -> None:
+    """将 nn.Module 的层级 repr 逐行写入日志（静态结构，与 print(model) 同源）。"""
+    try:
+        struct = str(model)
+    except Exception as exc:
+        logger.warning('模型 str() 失败: %s', exc)
+        return
+    if not struct:
+        return
+    logger.info('----- model structure (nn.Module repr,不随输入变化) -----')
+    for ln in struct.splitlines():
+        logger.info('%s', ln.rstrip('\r'))
+
+
+def maybe_attach_forward_dataflow_trace(logger, model: nn.Module) -> None:
+    """
+    按真实前向执行顺序记录子模块的输入/输出形状（随 batch、分支、arch_variant 而变）。
+    开启：MMDIFF_FORWARD_TRACE=1（或 MMDIFF_LOG_DATAFLOW=1）
+    可选：MMDIFF_FORWARD_TRACE_DEPTH（默认 3，模块名按 '.' 分段数，过深的子模块不打印）
+         MMDIFF_FORWARD_TRACE_MAX_FORWARDS（默认 1，只追踪前 N 次根 model.forward，防日志爆炸）
+    说明：hook 在子模块 forward **返回后**触发，故顺序为「先叶子/encoder 块，后含它们的父模块」，
+    与 PyTorch 调用栈一致；若要更粗只看顶层，把 DEPTH 设为 1。
+    """
+    raw = (
+        os.environ.get('MMDIFF_FORWARD_TRACE') or os.environ.get('MMDIFF_LOG_DATAFLOW') or ''
+    ).strip().lower()
+    if raw not in ('1', 'true', 'yes', 'y'):
+        return
+
+    try:
+        depth = max(1, int(os.environ.get('MMDIFF_FORWARD_TRACE_DEPTH') or '3'))
+    except ValueError:
+        depth = 3
+    try:
+        max_fwd = max(1, int(os.environ.get('MMDIFF_FORWARD_TRACE_MAX_FORWARDS') or '1'))
+    except ValueError:
+        max_fwd = 1
+
+    def shape_desc(x) -> str:
+        if isinstance(x, torch.Tensor):
+            return str(tuple(x.shape))
+        if isinstance(x, (list, tuple)):
+            parts = []
+            for t in x:
+                if isinstance(t, torch.Tensor):
+                    parts.append(str(tuple(t.shape)))
+                else:
+                    parts.append(type(t).__name__)
+            return '[' + ', '.join(parts) + ']'
+        if x is None:
+            return 'None'
+        return type(x).__name__
+
+    class _TraceCtx:
+        __slots__ = ('max_root', 'root_i', 'active', 'seq')
+
+        def __init__(self, mf: int):
+            self.max_root = mf
+            self.root_i = 0
+            self.active = False
+            self.seq = 0
+
+        def root_pre(self, *_a, **_k):
+            self.active = self.root_i < self.max_root
+            self.root_i += 1
+            self.seq = 0
+
+    ctx = _TraceCtx(max_fwd)
+    handles: list = []
+
+    def make_hook(full_name: str):
+        def _hook(_mod, inp, out):
+            if not ctx.active:
+                return
+            ctx.seq += 1
+            try:
+                ins = inp
+                if isinstance(inp, tuple) and len(inp) == 1:
+                    ins = inp[0]
+                logger.info(
+                    '[dataflow] %03d %s | in=%s out=%s',
+                    ctx.seq,
+                    full_name,
+                    shape_desc(ins),
+                    shape_desc(out),
+                )
+            except Exception as exc:
+                logger.info('[dataflow] %03d %s | (log err: %s)', ctx.seq, full_name, exc)
+
+        return _hook
+
+    handles.append(model.register_forward_pre_hook(ctx.root_pre))
+    for name, mod in model.named_modules():
+        if not name:
+            continue
+        if len(name.split('.')) > depth:
+            continue
+        handles.append(mod.register_forward_hook(make_hook(name)))
+
+    logger.info('========== Forward dataflow trace（动态，MMDIFF_FORWARD_TRACE=1）==========')
+    logger.info(
+        '本次 run将对前 %d 次根前向打点；模块名深度<=%d；'
+        '行序=各模块 forward 返回顺序（子模块通常先于父模块）',
+        max_fwd,
+        depth,
+    )
+
+
 def log_model_and_training_detail(
     logger,
     writer,
@@ -446,14 +552,20 @@ def log_model_and_training_detail(
         if n:
             logger.info('  submodule %-20s %9d params', name, n)
 
+    log_module_structure(logger, model)
+
     if hasattr(model, 'd_model') and not compare_run:
+        av = getattr(model, 'arch_variant', None)
+        if av is None:
+            av = '-'
+        mem = getattr(model, 'mem_len', '-') if hasattr(model, 'mem_len') else '-'
         logger.info(
-            'classifier layout | d_model=%s seq_len=%s num_classes=%s diffusion_ts=%s feat_layers=%s',
+            'classifier layout | d_model=%s mem_len=%s seq_len=%s num_classes=%s arch_variant=%s',
             getattr(model, 'd_model', '-'),
+            mem,
             getattr(model, 'seq_len', '-'),
             getattr(model, 'num_classes', '-'),
-            getattr(model, 'diffusion_ts', getattr(model, 'diffusion_t', '-')),
-            getattr(model, 'feat_layer_names', '-'),
+            av,
         )
 
     logger.info('========== Training / opt ==========')
@@ -512,12 +624,10 @@ def log_model_and_training_detail(
             mc.get('head_hidden'),
         )
         logger.info(
-            'model_cls | rgb_source=%s init_type=%s scale=%s feat_scales(t)=%s t=%s',
+            'model_cls | rgb_source=%s init_type=%s scale=%s',
             mc.get('rgb_source', 'student'),
             mc.get('init_type'),
             mc.get('scale'),
-            mc.get('feat_scales'),
-            mc.get('t'),
         )
         logger.info(
             'model_cls | rgb_to_lidar_guidance_mode=%s (none=关 film=RGB student FiLM→LiDAR token)',
@@ -536,13 +646,7 @@ def log_model_and_training_detail(
             mc3.get('hsi_se_ratio', HSI_SE_RATIO_CFG),
             mc3.get('hsi_agg_mode', HSI_AGG_MODE_CFG),
         )
-        logger.info(
-            'diffusion_teacher (param) | RGB_DIFFUSION_TEACHER_CHECKPOINT=%s STUDENT_SIZE=%s DIFFUSION_NOISE_MODE=%s NORMALIZE_INPUT=%s',
-            RGB_DIFFUSION_TEACHER_CHECKPOINT,
-            STUDENT_SIZE,
-            DIFFUSION_NOISE_MODE,
-            DIFFUSION_NORMALIZE_INPUT,
-        )
+        logger.info('legacy opt | STUDENT_SIZE=%s（占位 SR3 image_size，分类不加载扩散）', STUDENT_SIZE)
     logger.info(
         'checkpoint habit | SAVE_EVERY_EPOCH=%s periodic from epoch>=%d (1-based, last 20%% of NUM_EPOCHS) BEST=%s',
         SAVE_EVERY_EPOCH,
@@ -563,14 +667,6 @@ def log_model_and_training_detail(
                     unet_cfg.get('res_blocks'), unet_cfg.get('dropout'))
 
 
-    if diffusion is not None and not compare_run:
-        logger.info(
-            'diffusion wrapper | feat_layers=%s noise_mode=%s normalize_input=%s',
-            getattr(diffusion, 'feat_layers', None),
-            getattr(diffusion, 'noise_mode', None),
-            getattr(diffusion, 'normalize_diffusion_input', None),
-        )
-
     logger.info('========== (model / training detail end) ==========')
 
     if writer is None:
@@ -590,7 +686,6 @@ def log_model_and_training_detail(
         mod_lines.extend([
             f'd_model: {getattr(model, "d_model", None)}',
             f'seq_len: {getattr(model, "seq_len", None)}',
-            f'feat_layer_names: {getattr(model, "feat_layer_names", None)}',
         ])
     writer.add_text('config/model', '\n'.join(mod_lines))
 
@@ -622,14 +717,9 @@ def log_model_and_training_detail(
             f'model_cls: {mc}',
             f'module_cast3: {mc3}',
             f'dataset: {ds}',
-            f'RGB_DIFFUSION_TEACHER_CHECKPOINT: {RGB_DIFFUSION_TEACHER_CHECKPOINT}',
             f'STUDENT_SIZE: {STUDENT_SIZE}',
-            f'DIFFUSION_NOISE_MODE: {DIFFUSION_NOISE_MODE}',
-            f'DIFFUSION_NORMALIZE_INPUT: {DIFFUSION_NORMALIZE_INPUT}',
             f'SAVE_EVERY_EPOCH: {SAVE_EVERY_EPOCH}',
             f'periodic_ckpt_1based_min_epoch: {max(1, int(NUM_EPOCHS * 0.8) + 1)}',
             MULTIMODAL_ABLATION_LOG_LINE,
         ]
-        if diffusion is not None:
-            ext_lines.append(f'diffusion.feat_layers: {getattr(diffusion, "feat_layers", None)}')
     writer.add_text('config/train_extended', '\n'.join(ext_lines))

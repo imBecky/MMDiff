@@ -20,26 +20,28 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 
-def _run_single_eval(args: argparse.Namespace) -> int:
+def run_single_eval(
+    checkpoint: str,
+    *,
+    out_dir: str = "",
+    batch_size: Optional[int] = None,
+    num_workers: Optional[int] = None,
+    device_name: str = "cuda",
+) -> Dict[str, Any]:
     import numpy as np
     import torch
 
     import model as Model
     from param import (
         BATCH_SIZE,
-        DIFFUSION_NOISE_MODE,
-        DIFFUSION_NORMALIZE_INPUT,
-        FEAT_SCALES,
         NUM_CLASSES,
         RANDOM_SEED,
-        RGB_DIFFUSION_TEACHER_CHECKPOINT,
-        RGB_SOURCE,
-        STUDENT_NUM_TRAIN_TIMESTEPS,
         USE_CENTER_LOSS,
         USE_RGB_PATCHES,
         opt,
     )
     from pipeline.classification_metrics import accuracies
+    from pipeline import data as data_mod
     from pipeline.data import (
         build_test_loader,
         load_rgb_hr_meta,
@@ -49,14 +51,11 @@ def _run_single_eval(args: argparse.Namespace) -> int:
     )
     from pipeline.logging_utils import get_console_logger
     from pipeline.loop import evaluate
-    from pipeline.student_diffusion import StudentDiffusionWrapper
-
-    ckpt = Path(args.checkpoint).expanduser().resolve()
+    ckpt = Path(checkpoint).expanduser().resolve()
     if not ckpt.is_file():
-        print(f"[error] 找不到 checkpoint 文件: {ckpt}", file=sys.stderr)
-        return 2
+        raise FileNotFoundError(f"找不到 checkpoint 文件: {ckpt}")
 
-    device = torch.device(args.device if torch.cuda.is_available() else "cpu")
+    device = torch.device(device_name if torch.cuda.is_available() else "cpu")
     logger = get_console_logger()
 
     feats_vol, rgb_vol, _train_indices, label_shift = load_train_bundle()
@@ -70,7 +69,9 @@ def _run_single_eval(args: argparse.Namespace) -> int:
         hr_rw = int(_hr_meta["rw"])
 
     test_idx = load_test_indices_shifted(label_shift)
-    bs = int(args.batch_size) if args.batch_size is not None else int(BATCH_SIZE)
+    bs = int(batch_size) if batch_size is not None else int(BATCH_SIZE)
+    if num_workers is not None:
+        data_mod.NUM_WORKERS = max(0, int(num_workers))
 
     test_loader = build_test_loader(
         feats_vol,
@@ -83,25 +84,7 @@ def _run_single_eval(args: argparse.Namespace) -> int:
         hr_rw=hr_rw,
     )
 
-    def create_classifier(diffusion):
-        return Model.create_multimodal_classifier(opt, diffusion)
-
-    diffusion = None
-    rgb_src = (RGB_SOURCE or "student").strip().lower()
-    if rgb_src == "diffusion":
-        diffusion = StudentDiffusionWrapper(
-            RGB_DIFFUSION_TEACHER_CHECKPOINT,
-            STUDENT_NUM_TRAIN_TIMESTEPS,
-            noise_mode=DIFFUSION_NOISE_MODE,
-            noise_seed_base=RANDOM_SEED,
-            normalize_diffusion_input=DIFFUSION_NORMALIZE_INPUT,
-            feat_layers=FEAT_SCALES,
-        )
-    elif rgb_src not in ("student", "cached_teacher"):
-        print(f"[error] 无效 MMDIFF_RGB_SOURCE: {rgb_src!r}", file=sys.stderr)
-        return 2
-
-    model = create_classifier(diffusion).to(device)
+    model = Model.create_multimodal_classifier(opt, None).to(device)
     loss_fn = model.loss_func
 
     try:
@@ -162,13 +145,29 @@ def _run_single_eval(args: argparse.Namespace) -> int:
     }
 
     text = json.dumps(payload, indent=2, ensure_ascii=False) + "\n"
-    print(text)
-    if args.out_dir:
-        out = Path(args.out_dir).expanduser().resolve()
+    if out_dir:
+        out = Path(out_dir).expanduser().resolve()
         out.mkdir(parents=True, exist_ok=True)
         (out / "test_metrics.json").write_text(text, encoding="utf-8")
         logger.info("已写入 %s", out / "test_metrics.json")
 
+    return payload
+
+
+def _run_single_eval(args: argparse.Namespace) -> int:
+    try:
+        payload = run_single_eval(
+            args.checkpoint,
+            out_dir=args.out_dir,
+            batch_size=args.batch_size,
+            num_workers=args.num_workers,
+            device_name=args.device,
+        )
+    except FileNotFoundError as e:
+        print(f"[error] {e}", file=sys.stderr)
+        return 2
+    text = json.dumps(payload, indent=2, ensure_ascii=False) + "\n"
+    print(text)
     return 0
 
 
@@ -219,6 +218,7 @@ def main() -> int:
         help="写入 test_metrics.json 的目录（可选）",
     )
     p.add_argument("--batch-size", type=int, default=None)
+    p.add_argument("--num-workers", type=int, default=None)
     p.add_argument("--device", type=str, default="cuda")
     args = p.parse_args()
 

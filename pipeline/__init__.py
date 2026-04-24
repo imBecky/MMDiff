@@ -1,8 +1,9 @@
 """
-`pipeline/`：数据读取与 DataLoader、epoch 循环、验证/测试、checkpoint、学生扩散封装。
+`pipeline/`：数据读取与 DataLoader、epoch 循环、验证/测试、checkpoint。
 
 模型通过 `runner.run_training(create_classifier)` 注入，`create_classifier(opt, diffusion)` 返回
 具备 `loss_func`、`optimizer`、可选 `exp_lr_scheduler` 的 `nn.Module`（与当前 `MultimodalClassifier` 契约一致）。
+分类主流程中 `diffusion` 参数已废弃，请传 `None`。
 """
 
 from .checkpoint import (
@@ -24,11 +25,9 @@ from .data import (
 from .classification_metrics import accuracies
 from .loop import compute_classification_loss, evaluate, train_one_epoch
 from .runner import TrainingRunOptions, run_training, verify_projection_gradients
-from .student_diffusion import StudentDiffusionWrapper, normalize_student_checkpoint_dir
 
 __all__ = [
     'PatchDataset',
-    'StudentDiffusionWrapper',
     'accuracies',
     'batch_to_dict',
     'compute_classification_loss',
@@ -39,7 +38,6 @@ __all__ = [
     'build_test_loader',
     'load_test_indices_shifted',
     'load_train_bundle',
-    'normalize_student_checkpoint_dir',
     'TrainingRunOptions',
     'run_training',
     'save_classifier_checkpoint',

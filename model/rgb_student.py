@@ -13,7 +13,7 @@ class LightweightRgbEncoder(nn.Module):
     输入 B×3×H×W（通常为 11×11 patch），输出 B×num_tokens×d_model。
 
     结构：两层 Conv-BN-ReLU stem → 全局平均池化 → 线性层展开为 num_tokens 个 d_model 维 token。
-    num_tokens 由主模型配置为与多尺度/多时间步 RGB token 数量一致（与 feat_scales×diffusion_ts 对齐），非教师特征。
+    当前默认输出 1 个 RGB token；若教师缓存有多 token，会在上游做聚合后再监督/融合。
     """
 
     def __init__(
@@ -22,7 +22,7 @@ class LightweightRgbEncoder(nn.Module):
         patch_h: int = 11,
         patch_w: int = 11,
         d_model: int = 256,
-        num_tokens: int = 3,
+        num_tokens: int = 1,
         hidden: int = 128,
     ):
         super().__init__()

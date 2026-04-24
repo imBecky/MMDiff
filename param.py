@@ -22,8 +22,9 @@ SCHED_GAMMAS = [0.4, 0.1]
 SCHEDULER_NAME = 'cosine'
 # 仅 MMDIFF_SCHEDULER_NAME=cosine 时生效；warmup_ratio 为总 optimizer step 的占比（每 epoch 步数固定时等价于总轮数的相同比例）
 SCHEDULER_COSINE_ETA_MIN_RATIO = 0.01
-SCHEDULER_COSINE_WARMUP_RATIO = 0.05
+SCHEDULER_COSINE_WARMUP_RATIO = 0.1
 SCHEDULER_COSINE_WARMUP_STEPS = 0
+NUM_EPOCHS = 250
 
 
 def _apply_scheduler_env():
@@ -57,15 +58,14 @@ def _apply_scheduler_env():
 
 _apply_scheduler_env()
 CLIP_GRAD_NORM = 1.0
-EVAL_VAL_START_EPOCH = 20
-LEARNING_RATE = 8e-4
+EVAL_VAL_START_EPOCH = 120
+LEARNING_RATE = 1e-3
 WEIGHT_DECAY = 2e-4
-NUM_WORKERS = 14
+NUM_WORKERS = 10
 BATCH_SIZE = 64
 CLS_TRANSFORMER_DROPOUT = 0.1
-NUM_EPOCHS = 250
 # 续训时 LambdaLR 衰减边界用：与首次训练一致的总 step 数（通常由 checkpoint 自动写入；旧断点可 export MMDIFF_SCHEDULER_LR_TOTAL_STEPS）
-SCHEDULER_LR_TOTAL_STEPS = 0
+SCHEDULER_LR_TOTAL_STEPS = 0.2
 
 DATA_DIR = Path('../../autodl-fs/houston2018/prepared')
 # 由 data_prepare.py 生成：整幅 HSI+LiDAR / RGB + 像素索引表
@@ -138,7 +138,7 @@ MODEL_PATH = Path('./models/model.pt')
 # 训练断点根目录（每次运行会创建子目录 run_tag，内含 checkpoint-<epoch>、final、best_model.pt）
 CKPS_DIR = Path('../../autodl-tmp/classifier')
 # 每 N 个 epoch 保存一次断点；仅当 run_selection 为真（epoch>=EVAL_VAL_START_EPOCH、有 val、且 train_acc>=EVAL_MIN_TRAIN_ACC）时保存。0 表示不按间隔保存（仍会写 final）。若希望尽快只靠准确率门槛触发验证与断点，可将 EVAL_VAL_START_EPOCH 设为 0
-SAVE_EVERY_EPOCH = 5
+SAVE_EVERY_EPOCH = 1
 # 从断点恢复：指向某次 run 下的 checkpoint-<n>（1-based epoch）或 final；空字符串表示新训练
 # run.sh 可 export MMDIFF_RESUME_CHECKPOINT=绝对路径或相对仓库根的路径，覆盖本常量（便于 dep2/dep4 各用各的目录）
 RESUME_CHECKPOINT = ''
@@ -155,8 +155,7 @@ LOG_PATH = TB_LOG_ROOT / 'model.log'
 TRAIN_QUICK_VERIFY = False
 TRAIN_QUICK_VERIFY_SAMPLES_PER_CLASS = 150
 
-# Houston 默认 48 波段；SZUTree 等 98 波段数据请设环境变量 MMDIFF_HSI_CHANNELS=98
-HSI_CHANNELS = int((os.environ.get('MMDIFF_HSI_CHANNELS') or '48').strip() or '48')
+HSI_CHANNELS = 48
 LIDAR_CHANNELS = 1
 # Houston2018 前景地物类为 20；GT 中背景常为 0，patch 仅含 y>0 像素，标签平移后为 0....19。
 NUM_CLASSES = 20
@@ -164,7 +163,7 @@ NUM_CLASSES = 20
 RANDOM_SEED = 42
 OPTIMIZER_BETAS = (0.9, 0.999)
 TRAIN_LOG_INTERVAL = 20
-EVAL_LOG_INTERVAL = 20
+EVAL_LOG_INTERVAL = 10
 
 # 训练时检查各模态投影（HSI/LiDAR/RGB 等）在 backward 后是否有非零梯度；用于排查 no_grad 截断或未入图。
 # 为 True 时，在 backward 之后、clip 之前按间隔汇总范数并写日志（可选 TensorBoard）。
@@ -172,17 +171,14 @@ CHECK_PROJECTION_GRAD = False
 CHECK_PROJECTION_GRAD_INTERVAL = 10  # 每 N 个 batch；第 1 个与每 epoch 最后一个 batch 也会记录
 
 VAL_RATIO = 0.1
-DIFFUSION_NOISE_MODE = 'deterministic'
-DIFFUSION_NORMALIZE_INPUT = True
-
 # 本 epoch 训练准确率低于该值时不跑验证/选集 eval（0~1）；目标「先过拟合训练集」
-EVAL_MIN_TRAIN_ACC = 0.99
+EVAL_MIN_TRAIN_ACC = 0.0
 # 过门槛后每 N 个 epoch 跑一次 eval（test 集大时减少 eval 频率；0 表示每 epoch 都跑）
 EVAL_INTERVAL_EPOCHS = 1
 
 # 早停：仅在「实际跑完验证集评估」时计数；连续 patience 次 OA 未严格超过历史最优则结束。0=关闭。
 # 环境变量：MMDIFF_EARLY_STOPPING_PATIENCE
-EARLY_STOPPING_PATIENCE = 10
+EARLY_STOPPING_PATIENCE = 0
 
 USE_CENTER_LOSS = True
 LOSS_WEIGHT_GLOBAL = 0.2
@@ -196,7 +192,7 @@ SUPCON_TEMPERATURE = 0.07
 SUPCON_PROJ_DIM = 128
 
 # 清单实验：仅 center/global loss 权重对比；生效：MULTIMODAL_ABLATION_AXIS / INDEX 或 MMDIFF_ABLATION_* 环境变量
-CENTER_GLOBAL_ABLATION = ((0.2, 0.8), (0.3, 0.7))
+CENTER_GLOBAL_ABLATION = ((0.2, 0.8))
 MULTIMODAL_ABLATION_AXIS = None  # None | 'center_global'
 MULTIMODAL_ABLATION_INDEX = 0
 
@@ -227,7 +223,7 @@ HSI_RESIDUAL_BLOCKS_CFG = 5
 HSI_CONV_HIDDEN_CFG = 96
 HSI_SE_RATIO_CFG = 32  # 0=关闭 SE；>0=开启并使用对应 squeeze ratio
 # HSI 空间聚合：mean | attn_pool | multi_token
-HSI_AGG_MODE_CFG = 'mean'
+HSI_AGG_MODE_CFG = 'multi_token'
 _EFFECTIVE_ABLATION_AXIS = None
 _EFFECTIVE_ABLATION_INDEX = None
 
@@ -260,66 +256,23 @@ def _apply_multimodal_ablation():
 
 _apply_multimodal_ablation()
 
-# 256×256 DDPM 扩散教师（RGB）：knowledge_distill/train_teacher_256.py；diffusers 目录（UNet+scheduler）
-# 预计算 teacher token / rgb_source=diffusion 时加载；与 LightweightRgbEncoder 无关。
-# 覆盖：MMDIFF_RGB_DIFFUSION_TEACHER_CHECKPOINT
-_raw_rgb_diff_teacher = (os.environ.get('MMDIFF_RGB_DIFFUSION_TEACHER_CHECKPOINT') or '').strip()
-RGB_DIFFUSION_TEACHER_CHECKPOINT = (
-    Path(_raw_rgb_diff_teacher).expanduser()
-    if _raw_rgb_diff_teacher
-    else Path('../../autodl-fs/distill_t256_s128_260320_100630/checkpoint-25000')
-)
-STUDENT_CHECKPOINT = RGB_DIFFUSION_TEACHER_CHECKPOINT  # 旧名，同「扩散教师」权重目录
+# 与 opt['model'] 中 SR3/UNet 占位配置一致的历史字段（分类主流程不再加载扩散教师）
 STUDENT_SIZE = 256
 STUDENT_IN_CHANNELS = 3
 STUDENT_CHANNELS = (128, 256, 512, 512)
 STUDENT_LAYERS_PER_BLOCK = 2
-STUDENT_NUM_TRAIN_TIMESTEPS = 1000
-
-# 与 ../GFDiff/train_distill.py 中 DEFAULT_ALIGN_LAYERS 一致：UNet 子模块名（非整数下标）
-FEAT_SCALES = [
-    'down_blocks.1',
-    'mid_block',
-    'up_blocks.1',
-]
 
 # HR 严格视野（唯一 RGB 空间对齐）：需 data_prepare 生成 rgb_hr.npy + rgb_hr.meta.json
 TRAIN_RGB_HR_PATH = DATA_DIR / 'rgb_hr.npy'
 RGB_HR_META_PATH = DATA_DIR / 'rgb_hr.meta.json'
-HR_TEACHER_INPUT_SIZE = 256
 
-# RGB 分支：diffusion=在线冻结扩散教师 UNet；student=LightweightRgbEncoder；cached_teacher=离线 token
-_DEFAULT_RGB_SOURCE = 'student'
-RGB_SOURCE = (os.environ.get('MMDIFF_RGB_SOURCE') or _DEFAULT_RGB_SOURCE).strip().lower()
-RGB_TEACHER_TOKEN_CACHE_TRAIN = DATA_DIR / 'rgb_teacher_tokens_train_strict.npy'
-RGB_TEACHER_TOKEN_META_TRAIN = DATA_DIR / 'rgb_teacher_tokens_train_strict.meta.json'
-RGB_TEACHER_TOKEN_CACHE_TEST = DATA_DIR / 'rgb_teacher_tokens_test_strict.npy'
-RGB_TEACHER_TOKEN_META_TEST = DATA_DIR / 'rgb_teacher_tokens_test_strict.meta.json'
+# RGB：仅 LightweightRgbEncoder（patch CNN）；不再支持扩散 /离线 teacher token
+RGB_SOURCE = 'student'
 _REPO_ROOT = Path(__file__).resolve().parent
 _DEFAULT_RGB_STUDENT_CKPT = _REPO_ROOT / 'model' / 'rgb_student_distill.pt'
 RGB_STUDENT_CHECKPOINT = (os.environ.get('MMDIFF_RGB_STUDENT_CHECKPOINT') or '').strip()
 if not RGB_STUDENT_CHECKPOINT:
     RGB_STUDENT_CHECKPOINT = str(_DEFAULT_RGB_STUDENT_CKPT)
-
-# rgb_source=student 时可选：用离线扩散 teacher token 做辅助损失（须先 precompute train缓存）
-RGB_STUDENT_TEACHER_LOSS_WEIGHT = 0.0
-RGB_STUDENT_TEACHER_LOSS_COS_COEF = 0.1
-
-
-def _cls_diffusion_timesteps_from_env():
-    """run.sh 可 export MMDIFF_DIFFUSION_TIMESTEPS=50,100,150,200（逗号分隔）覆盖默认。"""
-    raw = (os.environ.get('MMDIFF_DIFFUSION_TIMESTEPS') or '').strip()
-    if not raw:
-        return [50]
-    ts = [int(x.strip()) for x in raw.split(',') if x.strip()]
-    if not ts:
-        raise ValueError(
-            'MMDIFF_DIFFUSION_TIMESTEPS 须为逗号分隔整数，例如 50,100,150,200'
-        )
-    return ts
-
-
-CLS_DIFFUSION_TIMESTEPS = _cls_diffusion_timesteps_from_env()
 CLS_INIT_TYPE = 'kaiming'
 CLS_INIT_SCALE = 0.1
 CLS_OUTPUT_CM_SIZE = 3
@@ -366,7 +319,7 @@ def build_opt():
             ('resolution', 3),
             ('patch_size', PATCH_WINDOW_SIZE),
             ('batch_size', BATCH_SIZE),
-            ('num_workers', 14),
+            ('num_workers', 12),
             ('use_shuffle', True),
             ('data_len', -1),
             ('n_cls', NUM_CLASSES),
@@ -440,12 +393,12 @@ def build_opt():
     )
     model_cls = OrderedDict(
         [
-            ('feat_scales', list(FEAT_SCALES)),
+            ('feat_scales', []),
             ('init_type', CLS_INIT_TYPE),
             ('scale', CLS_INIT_SCALE),
             ('out_channels', NUM_CLASSES),
             ('output_cm_size', CLS_OUTPUT_CM_SIZE),
-            ('t', list(CLS_DIFFUSION_TIMESTEPS)),
+            ('t', []),
             ('token_dim', CLS_TOKEN_DIM),
             ('transformer_heads', CLS_TRANSFORMER_HEADS),
             ('transformer_layers', CLS_TRANSFORMER_LAYERS),
@@ -459,7 +412,7 @@ def build_opt():
             ('resume_state', None),
             ('enabled_modalities', list(ENABLED_MODALITIES)),
             ('modality_combo', MODALITY_COMBO),
-            ('rgb_source', (os.environ.get('MMDIFF_RGB_SOURCE') or _DEFAULT_RGB_SOURCE).strip().lower()),
+            ('rgb_source', 'student'),
             ('rgb_student_checkpoint', RGB_STUDENT_CHECKPOINT or None),
             ('rgb_to_lidar_guidance_mode', RGB_TO_LIDAR_GUIDANCE_MODE),
         ]
@@ -553,11 +506,10 @@ def _apply_mmdiff_env_overrides():
     MMDIFF_RGB_TO_LIDAR_GUIDANCE → RGB_TO_LIDAR_GUIDANCE_MODE 与 opt['model_cls']['rgb_to_lidar_guidance_mode']（none|film）
     MMDIFF_SCHEDULER_LR_TOTAL_STEPS → opt['scheduler_lr_total_steps']（续训边界；旧 checkpoint 无该字段时手动设）
     MMDIFF_SCHEDULER_NAME / MMDIFF_SCHED_STEP_RATIOS / MMDIFF_SCHED_GAMMAS / MMDIFF_SCHED_COSINE_* → 见文件头 SCHEDULER_*
-    （扩散 t 列表由模块加载时读取 MMDIFF_DIFFUSION_TIMESTEPS，见 _cls_diffusion_timesteps_from_env）
-    MMDIFF_FREEZE_RGB_STUDENT=1 → rgb_source=student 时冻结轻量 RGB 编码器并重建优化器（续训 resume 时不走该分支）
+    MMDIFF_FREEZE_RGB_STUDENT=1 → 冻结轻量 RGB 编码器并重建优化器（续训 resume 时不走该分支）
     MMDIFF_RANDOM_SEED → RANDOM_SEED（torch/np 与划分等）
-    MMDIFF_RGB_STUDENT_TEACHER_LOSS_WEIGHT → RGB_STUDENT_TEACHER_LOSS_WEIGHT（0=关闭；需 rgb_teacher_tokens_train_strict.npy）
-    MMDIFF_RGB_STUDENT_TEACHER_LOSS_COS_COEF → RGB_STUDENT_TEACHER_LOSS_COS_COEF（与 train_rgb_distill 中 mse+coef*cos 一致，默认 0.1）
+    MMDIFF_FORWARD_TRACE / MMDIFF_LOG_DATAFLOW=1 → model.log 中按前向打印子模块 in/out 形状（动态数据流）
+    MMDIFF_FORWARD_TRACE_DEPTH（默认 3）MMDIFF_FORWARD_TRACE_MAX_FORWARDS（默认 1）
     """
     g = globals()
 
@@ -585,8 +537,6 @@ def _apply_mmdiff_env_overrides():
             return
         g[key] = v.strip()
 
-    _float('MMDIFF_RGB_STUDENT_TEACHER_LOSS_WEIGHT', 'RGB_STUDENT_TEACHER_LOSS_WEIGHT')
-    _float('MMDIFF_RGB_STUDENT_TEACHER_LOSS_COS_COEF', 'RGB_STUDENT_TEACHER_LOSS_COS_COEF')
     _float('MMDIFF_LOSS_WEIGHT_GLOBAL', 'LOSS_WEIGHT_GLOBAL')
     _float('MMDIFF_LOSS_WEIGHT_CENTER', 'LOSS_WEIGHT_CENTER')
     _float('MMDIFF_SUPCON_WEIGHT', 'SUPCON_WEIGHT')
@@ -622,7 +572,7 @@ def _apply_mmdiff_env_overrides():
     sr = int(g['HSI_SE_RATIO_CFG'])
     if sr < 0:
         raise ValueError(f'HSI_SE_RATIO_CFG / MMDIFF_HSI_SE_RATIO 须 >= 0，当前 {sr}')
-    agg = str(g.get('HSI_AGG_MODE_CFG') or 'mean').strip().lower()
+    agg = str(g.get('HSI_AGG_MODE_CFG') or 'multi_token').strip().lower()
     if agg not in ('mean', 'attn_pool', 'multi_token'):
         raise ValueError(
             f'HSI_AGG_MODE_CFG / MMDIFF_HSI_AGG_MODE 须为 mean|attn_pool|multi_token，当前 {agg!r}'
@@ -676,14 +626,6 @@ def _apply_mmdiff_env_overrides():
     opt['model_cls']['transformer_layers'] = n_layers
     opt['model_cls']['transformer_ff_dim'] = ff_dim
 
-    rs = (os.environ.get('MMDIFF_RGB_SOURCE') or '').strip().lower()
-    if rs:
-        if rs not in ('diffusion', 'student', 'cached_teacher'):
-            raise ValueError(
-                f'MMDIFF_RGB_SOURCE 须为 diffusion|student|cached_teacher，当前 {rs!r}'
-            )
-        g['RGB_SOURCE'] = rs
-        opt['model_cls']['rgb_source'] = rs
     rsc = (os.environ.get('MMDIFF_RGB_STUDENT_CHECKPOINT') or '').strip()
     if rsc:
         g['RGB_STUDENT_CHECKPOINT'] = rsc
