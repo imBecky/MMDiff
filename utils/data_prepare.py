@@ -1,5 +1,9 @@
 """
-从 houston2018.mat 生成「整幅归一化影像 + 像素索引」，显著小于逐 patch .npy。
+从 .mat 生成「整幅归一化影像 + 像素索引」，显著小于逐 patch .npy。
+
+输入为融合包（一次读入）：`szutree_r1.mat`（MAT v5 有单块约 4GB 上限）或由
+`extract_szutree_dataset.py --export` 在超大体积时改写的同茎 `szutree_r1.npz`。
+须能解析出 hsi, lidar, rgb, train, test（train/test 可为 CSR 分块）。
 
 输出（文件名与旧版一致，见 param）：
   train_patches.npy      (H,W,HSI+LiDAR) float16
@@ -12,18 +16,32 @@
 
 旋转增强改在训练时在线做（param.TRAIN_ROT_AUGMENT_FACTOR）。
 
+空间对齐：推荐由 `extract_szutree_dataset.py` 在导出时完成，本脚本默认**仅校验** hsi/lidar/rgb
+与 train 标签图同 (H,W)，不静默重采样。若需兼容旧数据并允许在 data_prepare 中重采样影像，
+请设置: MMDIFF_DATA_PREPARE_ALLOW_RESIZE=1
+
+**输出目录**由 `param.DATA_PREPARE_INPUT_MAT` 路径子串含 `szu` / `houston` 决定 `DATA_DIR`（见
+`param.py`）。`DATA_PREPARE_INPUT_MAT` 可**始终**指向约定文件名如 `szutree_r1.mat`：若大体积
+导出只生成了同茎的 `szutree_r1.npz`，本脚本会**自动**改读该 `.npz`，**无需**改 `param`。
+训练阶段只读 `param` 下 `.../prepared/*.npy`，与 .mat/.npz 无关。
+
 用法：python data_prepare.py
 """
 from __future__ import annotations
 
+import os
+import sys
 from os import makedirs
+from pathlib import Path
 import json
 import scipy.io as sio
 from scipy import sparse
+from scipy.ndimage import zoom
 import numpy as np
 
 from param import (
     DATA_DIR,
+    DATA_PREPARE_INPUT_MAT,
     HSI_CHANNELS,
     LABEL_SHIFT_PATH,
     LIDAR_CHANNELS,
@@ -38,11 +56,76 @@ from param import (
     TRAIN_RGB_PATCHES_PATH,
 )
 
-DATA_PATH = '../../autodl-fs/houston2018/houston2018.mat'
 SAVE_NORMALIZED_FEATURES = False
 PATCH_DTYPE = np.float16
 
 makedirs(DATA_DIR, exist_ok=True)
+
+
+def _resolve_fusion_input_path() -> str:
+    """
+    按 param 配置路径读取；若文件不存在，则尝试同目录同主文件名的 .mat <-> .npz。
+    这样大导出只落 .npz 时不必改 `DATA_PREPARE_INPUT_MAT`。
+    """
+    p = Path(DATA_PREPARE_INPUT_MAT)
+    if p.is_file():
+        return str(p.resolve())
+    suf = p.suffix.lower()
+    if suf == '.mat':
+        alt = p.with_suffix('.npz')
+    elif suf == '.npz':
+        alt = p.with_suffix('.mat')
+    else:
+        alt = p
+    if alt != p and alt.is_file():
+        print(
+            f'data_prepare: 未找到 {p}，改用 {alt}',
+            file=sys.stderr,
+        )
+        return str(alt.resolve())
+    msg = f'未找到融合包: {p}'
+    if alt != p:
+        msg += f' 与 {alt}'
+    raise FileNotFoundError(msg)
+
+
+def load_fusion_data(path: str) -> dict:
+    """
+    与 extract_szutree 导出一致：.mat 用 loadmat；.npz 为 hsi/lidar/rgb
+    与 train、test（稠密 或 CSR 分块）。
+    """
+    p = path.lower()
+    if p.endswith('.npz'):
+        z = np.load(path, allow_pickle=False)
+        out: dict = {
+            'hsi': z['hsi'],
+            'lidar': z['lidar'],
+            'rgb': z['rgb'],
+        }
+        if 'train_data' in z.files:
+            th, tw = int(z['train_shape'][0]), int(z['train_shape'][1])
+            out['train'] = sparse.csr_matrix(
+                (z['train_data'], z['train_indices'], z['train_indptr']),
+                shape=(th, tw),
+            )
+            t2h, t2w = int(z['test_shape'][0]), int(z['test_shape'][1])
+            out['test'] = sparse.csr_matrix(
+                (z['test_data'], z['test_indices'], z['test_indptr']),
+                shape=(t2h, t2w),
+            )
+        else:
+            out['train'] = z['train']
+            out['test'] = z['test']
+        return out
+    return sio.loadmat(path)
+
+
+def _allow_data_prepare_resize() -> bool:
+    return (os.environ.get('MMDIFF_DATA_PREPARE_ALLOW_RESIZE') or '').strip().lower() in (
+        '1',
+        'true',
+        'yes',
+    )
 
 
 def build_sorted_index(y):
@@ -137,20 +220,130 @@ def ensure_label_array(labels, name):
     return labels
 
 
+def _resize_spatial_hwc(vol_hwc: np.ndarray, out_h: int, out_w: int, order: int = 1) -> np.ndarray:
+    """
+    将 (H,W,C) 影像重采样到 (out_h,out_w)。标签栅格不改动，只用于对齐 HSI/LiDAR/RGB。
+    order=1 双线性（按轴分离），适合多通道强度图。
+    """
+    in_h, in_w, c = vol_hwc.shape[0], vol_hwc.shape[1], vol_hwc.shape[2]
+    if in_h == out_h and in_w == out_w:
+        return vol_hwc
+    z = np.ascontiguousarray(vol_hwc.astype(np.float32, copy=False))
+    zh = out_h / float(in_h)
+    zw = out_w / float(in_w)
+    y = zoom(z, (zh, zw, 1.0), order=order, mode='nearest')
+    y = y[:out_h, :out_w, :]
+    if y.shape[0] < out_h or y.shape[1] < out_w or y.shape[2] != c:
+        out = np.zeros((out_h, out_w, c), dtype=np.float32)
+        h0, w0 = min(y.shape[0], out_h), min(y.shape[1], out_w)
+        out[:h0, :w0, :] = y[:h0, :w0, :].astype(np.float32, copy=False)
+        y = out
+    return y.astype(np.float32, copy=False)
+
+
+def _align_hsi_lidar_to_label_grid(
+    hsi: np.ndarray,
+    lidar: np.ndarray,
+    ref_h: int,
+    ref_w: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    if hsi.shape[0] != lidar.shape[0] or hsi.shape[1] != lidar.shape[1]:
+        print(
+            f'[warn] HSI 空间 {hsi.shape[:2]} 与 LiDAR 空间 {lidar.shape[:2]} 不一致，'
+            f'将分别重采样到标签栅格 ({ref_h},{ref_w})。',
+        )
+    out_hsi = hsi
+    if (out_hsi.shape[0], out_hsi.shape[1]) != (ref_h, ref_w):
+        print(
+            f'[data_prepare] 将 HSI 从 {out_hsi.shape[:2]} 重采样到标签尺寸 ({ref_h},{ref_w})',
+        )
+        out_hsi = _resize_spatial_hwc(out_hsi, ref_h, ref_w, order=1)
+    out_lidar = lidar
+    if (out_lidar.shape[0], out_lidar.shape[1]) != (ref_h, ref_w):
+        print(
+            f'[data_prepare] 将 LiDAR 从 {out_lidar.shape[:2]} 重采样到标签尺寸 ({ref_h},{ref_w})',
+        )
+        out_lidar = _resize_spatial_hwc(out_lidar, ref_h, ref_w, order=1)
+    return out_hsi, out_lidar
+
+
+def _align_rgb_to_lr_for_hr(
+    rgb_raw: np.ndarray,
+    h_lr: int,
+    w_lr: int,
+) -> tuple[np.ndarray, int, int, int, int, np.ndarray]:
+    """
+    在 LR 为 (h_lr,w_lr) 时准备 HR 裁切块与下采样 LR，与未改前逻辑一致 but 在 RGB
+    小于 LR 时先上采样、非整比时先重采样，使 block mean 可执行。
+    返回: rgb 下采样 (h_lr,w_lr,3), rh, rw, h_crop, w_crop, rgb_hr_cropped
+    """
+    hh, ww, c = int(rgb_raw.shape[0]), int(rgb_raw.shape[1]), int(rgb_raw.shape[2])
+    r = np.ascontiguousarray(rgb_raw.astype(np.float32, copy=False))
+
+    if hh < h_lr or ww < w_lr:
+        th = max(hh, h_lr)
+        tw = max(ww, w_lr)
+        print(f'[data_prepare] RGB {hh}x{ww} 小于 LR {h_lr}x{w_lr}，上采样到 {th}x{tw}')
+        r = _resize_spatial_hwc(r, th, tw, order=1)
+        hh, ww = th, tw
+
+    rh = max(1, hh // h_lr)
+    rw = max(1, ww // w_lr)
+    h_crop = h_lr * rh
+    w_crop = w_lr * rw
+
+    if h_crop > hh or w_crop > ww:
+        th = max(hh, h_crop)
+        tw = max(ww, w_crop)
+        print(f'[data_prepare] 将 RGB 重采样以覆盖 HR 块 {h_crop}x{w_crop}（自 {hh}x{ww}）')
+        r = _resize_spatial_hwc(r, th, tw, order=1)
+
+    r = r[:h_crop, :w_crop, :]
+    rgb_hr_cropped = r
+    rh = h_crop // h_lr
+    rw = w_crop // w_lr
+    rgb_lr = downsample_rgb_to_match(rgb_hr_cropped, target_h=h_lr, target_w=w_lr)
+    return rgb_lr, int(rh), int(rw), int(h_crop), int(w_crop), rgb_hr_cropped
+
+
 def main():
-    data = sio.loadmat(DATA_PATH)
+    data = load_fusion_data(_resolve_fusion_input_path())
+    allow_resize = _allow_data_prepare_resize()
+    if not allow_resize:
+        print('data_prepare: 严格模式（默认）：影像须已与标签同尺寸。设置 MMDIFF_DATA_PREPARE_ALLOW_RESIZE=1 可恢复旧版重采样。')
+
+    train = ensure_label_array(data['train'], 'train')
+    test = ensure_label_array(data['test'], 'test')
+    if train.shape != test.shape:
+        raise ValueError(
+            f'train 与 test 标签图空间尺寸须一致: train.shape={train.shape} test.shape={test.shape}'
+        )
+    ref_h, ref_w = int(train.shape[0]), int(train.shape[1])
 
     hsi = ensure_hsi_channel_dim(data['hsi'])
     lidar = ensure_lidar_channel_dim(data['lidar'])
+    if allow_resize:
+        hsi, lidar = _align_hsi_lidar_to_label_grid(hsi, lidar, ref_h, ref_w)
+    else:
+        if (hsi.shape[0], hsi.shape[1]) != (ref_h, ref_w) or (lidar.shape[0], lidar.shape[1]) != (
+            ref_h,
+            ref_w,
+        ):
+            raise ValueError(
+                f'严格模式: HSI {hsi.shape[:2]} 与 LiDAR {lidar.shape[:2]} 须与标签 {ref_h}x{ref_w} 一致；'
+                f'请先用 extract_szutree_dataset 导出，或设 MMDIFF_DATA_PREPARE_ALLOW_RESIZE=1'
+            )
+
     rgb_raw = ensure_rgb_channel_dim(data['rgb'])
-    h_lr, w_lr = int(hsi.shape[0]), int(hsi.shape[1])
-    hh, ww, _ = rgb_raw.shape
-    rh = hh // h_lr
-    rw = ww // w_lr
-    h_crop = h_lr * rh
-    w_crop = w_lr * rw
-    rgb_hr_cropped = rgb_raw[:h_crop, :w_crop, :]
-    rgb = downsample_rgb_to_match(rgb_raw, target_h=h_lr, target_w=w_lr)
+    h_lr, w_lr = ref_h, ref_w
+    if not allow_resize and (rgb_raw.shape[0], rgb_raw.shape[1]) != (ref_h, ref_w):
+        raise ValueError(
+            f'严格模式: RGB(LR) {rgb_raw.shape[:2]} 须与标签 {ref_h}x{ref_w} 一致；'
+            f'或设 MMDIFF_DATA_PREPARE_ALLOW_RESIZE=1 允许在 data_prepare 中重采样'
+        )
+    rgb, rh, rw, h_crop, w_crop, rgb_hr_cropped = _align_rgb_to_lr_for_hr(
+        rgb_raw, h_lr, w_lr
+    )
 
     feats = np.concatenate([hsi, lidar], axis=2)
 
@@ -167,9 +360,6 @@ def main():
     rgb_norm = normalize_features(rgb)
     print('Normalizing HR RGB (aligned crop, strict-view distill)...')
     rgb_hr_norm = normalize_features(rgb_hr_cropped)
-
-    train = ensure_label_array(data['train'], 'train')
-    test = ensure_label_array(data['test'], 'test')
 
     print('Building train/test pixel indices...')
     train_idx = build_sorted_index(train)

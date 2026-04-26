@@ -8,7 +8,7 @@
 环境变量（可选）：
   MMDIFF_COMPARE_MODEL       与 --model 等价（一般无需单独设）
   MMDIFF_COMPARE_RUN_NAME_PREFIX  默认 cmp，影响 TB run 名前缀
-  MMDIFF_COMPARE_CKPS_DIR    覆盖断点根目录（默认仍用 param.CKPS_DIR）
+  MMDIFF_COMPARE_SAVE_CKPT   设 1/true 时写入 best/周期/final 等断点；默认对比跑法不写断点
   MMDIFF_EXPERIMENT_TAG      单次实验 tag
   MMDIFF_NUM_EPOCHS 等       与 main.py / param 一致
 """
