@@ -4,6 +4,11 @@
 
 | 最近更新 | 主题 | 一句话结果 | 详情 |
 |---------|------|------------|------|
+| 2026-04-26 | **MSDQ 论文重写 + 写作宝典** | 重构 Intro/Related Work/实验说明/表格分析；新增 `WRITING_GUIDE_MSDQ.md` 记录用户论文偏好、领域知识和后续写作规则 | [logs/2026-04-26-msdq-paper-rewrite-writing-guide.md](./logs/2026-04-26-msdq-paper-rewrite-writing-guide.md) |
+| 2026-04-26 | **基线 LR 依据 + 实验公平与科研严谨** | Two-branch/MACN 等与主模型调度差异的可核查依据（BUCT `models.py`）；全员提醒：设置公平、披露协议、可复现 | [logs/2026-04-26-baseline-lr-fairness-research-rigor.md](./logs/2026-04-26-baseline-lr-fairness-research-rigor.md) |
+| 2026-04-25 | **patience 扫描 + 论文草稿 + references 重排** | `MMDIFF_TB_LOG_ROOT`；`run.sh` 的 `patience_sweep` 与 `../../autodl-tf-logs/<ts>/`；`MSDQ_Draft.md` 中英稿；`references.md` 分节+表 | [logs/2026-04-25-patience-sweep-paper-drafts-references.md](./logs/2026-04-25-patience-sweep-paper-drafts-references.md) |
+| 2026-04-24 | **README：主模型结构与方法要点** | `README.md` 纠偏「扩散+主模型」表述；新增 `MultimodalClassifier` 三分支、融合、配置入口摘要 | [logs/2026-04-24-readme-multimodal-structure.md](./logs/2026-04-24-readme-multimodal-structure.md) |
+| 2026-04-24 | **严格 HR / eval 体检 / 数据报告脚本 / 全库风险 / 论文草稿目录** | `rh==rw` 与 strict+旋转；`eval_ckps` 过滤写死&危险默认；`verify_prepared_data`→`autodl-tmp`；param 依 cwd、VAL_RATIO=0 用 test 选优；`paper_drafts`+ignore | [logs/2026-04-24-cursor-tooling-strict-hr-eval-audit-drafts.md](./logs/2026-04-24-cursor-tooling-strict-hr-eval-audit-drafts.md) |
 | 2026-04-10 | **HSI：数据 patch vs 模型内 3×3** | `PATCH_WINDOW_SIZE` 管外层块；`HSICenterSpectralEncoder` 内 `_crop_center_3x3` 再取中心 3×3 做光谱编码；LiDAR 用整 patch | [logs/2026-04-10-multimodal-hsi-center-3x3-crop.md](./logs/2026-04-10-multimodal-hsi-center-3x3-crop.md) |
 | 2026-04-09 | **RGB(student)→LiDAR FiLM + fus.sh 覆盖** | 移除 LiDAR→HSI A/B/C；`MMDIFF_RGB_TO_LIDAR_GUIDANCE=none|film`；RGB token 均值 FiLM→`lidar_g/c`；`fus.sh` 仅 film+`train_exp` | [logs/2026-04-09-rgb-student-to-lidar-film-fus.md](./logs/2026-04-09-rgb-student-to-lidar-film-fus.md) |
 | 2026-04-07 | **对比基线 SS-MAE（TGRS 2023）** | 迁入 [summitgao/SS-MAE](https://github.com/summitgao/SS-MAE) `VisionTransfromers`；注册 `ss_mae`/`ssmae`；`crop_size`/PCA 环境变量；`compare.sh` 示例 `ss_mae:1e-4` | [logs/2026-04-07-compare-ss-mae.md](./logs/2026-04-07-compare-ss-mae.md) |
@@ -12,15 +17,6 @@
 | 2026-04-07 | **DFINet = formango 官方仓** | 已接 DFINet；新增注册别名 `formango_dfinet`/`hsi_msi_multisource`，`DFINET_PROTOCOL_COMPARE_NAMES` 统一走 `dfinet_protocol` | [logs/2026-04-07-dfinet-formango-registry-aliases.md](./logs/2026-04-07-dfinet-formango-registry-aliases.md) |
 | 2026-04-06 | **run.sh 精简 + HSI 48 + 融合仅 cross** | 根 `run.sh`：`bash "$RUN_SH"`、LF、**distill→grid**、无 precompute；`HSI_CHANNELS=48`/`MMDIFF_HSI_CHANNELS`；`load_train_bundle` 维校验；去掉 concat 与 `FUSION_MODE`；`mmdd-hhmm` | [logs/2026-04-06-runsh-slim-hsi48-cross-only.md](./logs/2026-04-06-runsh-slim-hsi48-cross-only.md) |
 | 2026-04-04 | **param 瘦身 + RGB 扩散教师** | 256 DDPM 默认路径、`rgb_source=student`、仅 HR+`*_strict` 缓存、减 env/减 `run.sh` 重复；原则见日志 | [logs/2026-04-04-param-slim-rgb-teacher.md](./logs/2026-04-04-param-slim-rgb-teacher.md) |
-| 2026-04-03 | **RGB 轻量 student：蒸馏 TB+早停、teacher 缓存与 run.sh 消融** | `rgb_teacher_cache`/`open_memmap`/`tempt.py`；`train_rgb_distill` 默认 100ep、**早停 15**、TensorBoard；**`MMDIFF_FREEZE_RGB_STUDENT`**；**`ablate_all`=先 distill 再 random/freeze/ft**；**`all`=precompute→ablate_all**（不重复 distill）；`run.sh` 不写本地 tee 日志 | [logs/2026-04-03-rgb-student-distill-ablation-and-cache.md](./logs/2026-04-03-rgb-student-distill-ablation-and-cache.md) |
-| 2026-04-03 | **run.sh 续训 exp3/4/5** | `exp3r`/`exp4r`/`exp5r` 从 `final` 续训；`resume345` 串行；`MMDIFF_RESUME_EXP*`/`RESUME_RUN_TS` 可覆盖；**exp5=piecewise** 对齐 best、非 cosine；runner 续训后 lr×0.5 | [logs/2026-04-03-runsh-resume-exp345-and-exp5-scheduler.md](./logs/2026-04-03-runsh-resume-exp345-and-exp5-scheduler.md) |
-| 2026-04-02 | **run.sh 主模型五组实验网格** | exp1=cosine+SupCon；exp2 关 SupCon；exp3/4=BS512 仅 WD 5e-4 vs 2e-4；exp5=piecewise 6e-4 无 SupCon；`all` 串行 1→5 | [logs/2026-04-02-runsh-exp-grid-five.md](./logs/2026-04-02-runsh-exp-grid-five.md) |
-| 2026-04-02 | **对比模型可复现 / 学术诚信（强制）** | 除统一数据+epoch/lr 等基础项外，对比须对齐**原论文方法**；Two-branch 三阶段；**DFINet**（联合损失+SGD，`dfinet_protocol`）与 **MACN**（Focal+Adam+无调度）已接；本机跑 Python 先 **`conda activate hbq`**（见 [`README`](./README.md)） | [logs/2026-04-02-compare-models-repro-integrity.md](./logs/2026-04-02-compare-models-repro-integrity.md) |
-| 2026-04-02 | 双分支 CNN 对比模型（BUCT Xu 2017） | PyTorch 接入；**已纠偏为三阶段协议**；旧日志中「端到端」表述过时，以 repro-integrity + `two_branch_protocol` 为准 | [logs/2026-04-02-two-branch-cnn-compare.md](./logs/2026-04-02-two-branch-cnn-compare.md) |
-| 2026-04-01 | `run.sh` 合并、`param` 环境覆盖、HSI sanity | 单脚本 baseline/exp1–3/all；`MMDIFF_LR/WD`；删 `run_experiments`/`run_all_overnight`；sanity 用 `no_grad` | [logs/2026-04-01-runsh-param-sanity.md](./logs/2026-04-01-runsh-param-sanity.md) |
-| 2026-04-01 | HSI `HSICenterSpectralEncoder` 顺序 | SE 前移到 pool 前：stem→res→gate→pool→spatial_agg→proj；见 `multimodal.py` | [logs/2026-04-01-hsi-se-gate-before-pool.md](./logs/2026-04-01-hsi-se-gate-before-pool.md) |
-| 2026-03-31 | F-GCN 对比、早停、run.sh 与全模态 | 仅保留 F-GCN；param 须含早停与 batch 覆盖；run.sh 默认 hsi+rgb+lidar | [logs/2026-03-31-fgcn-compare-earlystop-runsh.md](./logs/2026-03-31-fgcn-compare-earlystop-runsh.md) |
-| 2026-03-31 | 合并 stash + 服务器 HSI 配置 | 提交 a6d405a；stash 已 drop；保留 run.sh 网格与 param | [logs/2026-03-31-merge-stash-server.md](./logs/2026-03-31-merge-stash-server.md) |
 
 ---
 

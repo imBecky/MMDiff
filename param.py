@@ -67,7 +67,16 @@ CLS_TRANSFORMER_DROPOUT = 0.1
 # 续训时 LambdaLR 衰减边界用：与首次训练一致的总 step 数（通常由 checkpoint 自动写入；旧断点可 export MMDIFF_SCHEDULER_LR_TOTAL_STEPS）
 SCHEDULER_LR_TOTAL_STEPS = 0.2
 
-DATA_DIR = Path('../../autodl-fs/houston2018/prepared')
+# `data_prepare` 的输入融合包；若同目录仅有同茎 .npz 则由 data_prepare 自动选用。
+# 默认与 utils/extract_szutree_dataset.py 中 EXPORT_TOP_LEFT_QUARTER=True 一致：左上四分之一子集。
+# 恢复全幅：改 DATA_PREPARE_INPUT_MAT 为 ../../autodl-fs/szutree/szutree_r1.mat，并在 extract 脚本设
+# EXPORT_TOP_LEFT_QUARTER = False 后重新 --export 与 data_prepare。
+DATA_PREPARE_INPUT_MAT = Path('../../autodl-fs/szutree_tlq/szutree_r1.mat')
+_lp_input = str(DATA_PREPARE_INPUT_MAT).lower()
+if 'houston' in _lp_input:
+    DATA_DIR = Path('../../autodl-fs/houston2018/prepared')
+else:
+    DATA_DIR = DATA_PREPARE_INPUT_MAT.parent / 'prepared'
 # 由 data_prepare.py 生成：整幅 HSI+LiDAR / RGB + 像素索引表
 TRAIN_PATCHES_PATH = DATA_DIR / 'train_patches.npy'
 TEST_PATCHES_PATH = TRAIN_PATCHES_PATH
@@ -155,7 +164,7 @@ LOG_PATH = TB_LOG_ROOT / 'model.log'
 TRAIN_QUICK_VERIFY = False
 TRAIN_QUICK_VERIFY_SAMPLES_PER_CLASS = 150
 
-HSI_CHANNELS = 48
+HSI_CHANNELS = 98
 LIDAR_CHANNELS = 1
 # Houston2018 前景地物类为 20；GT 中背景常为 0，patch 仅含 y>0 像素，标签平移后为 0....19。
 NUM_CLASSES = 20
@@ -494,6 +503,7 @@ def _apply_mmdiff_env_overrides():
     MMDIFF_HSI_CONV_HIDDEN → HSI_CONV_HIDDEN_CFG 与 opt['module_cast3']
     MMDIFF_HSI_SE_RATIO → HSI_SE_RATIO_CFG 与 opt['module_cast3']
     MMDIFF_HSI_AGG_MODE → HSI_AGG_MODE_CFG 与 opt['module_cast3']（mean | attn_pool | multi_token）
+    MMDIFF_PATCH_WINDOW_SIZE → PATCH_WINDOW_SIZE 与 opt['dataset']['patch_size']（建议奇数）
     MMDIFF_BATCH_SIZE → BATCH_SIZE 与 opt['dataset']['batch_size']
     MMDIFF_LEARNING_RATE → LEARNING_RATE 与 opt['train']['optimizer']['lr']
     MMDIFF_WEIGHT_DECAY → WEIGHT_DECAY 与 opt['train']['optimizer']['weight_decay']
@@ -550,6 +560,7 @@ def _apply_mmdiff_env_overrides():
     _int('MMDIFF_HSI_CONV_HIDDEN', 'HSI_CONV_HIDDEN_CFG')
     _int('MMDIFF_HSI_SE_RATIO', 'HSI_SE_RATIO_CFG')
     _str_env('MMDIFF_HSI_AGG_MODE', 'HSI_AGG_MODE_CFG')
+    _int('MMDIFF_PATCH_WINDOW_SIZE', 'PATCH_WINDOW_SIZE')
     _int('MMDIFF_BATCH_SIZE', 'BATCH_SIZE')
     _int('MMDIFF_RANDOM_SEED', 'RANDOM_SEED')
     _int('MMDIFF_EARLY_STOPPING_PATIENCE', 'EARLY_STOPPING_PATIENCE')
@@ -596,6 +607,12 @@ def _apply_mmdiff_env_overrides():
     if bs < 1:
         raise ValueError(f'BATCH_SIZE / MMDIFF_BATCH_SIZE 须 >= 1，当前 {bs}')
     opt['dataset']['batch_size'] = bs
+    pws = int(g['PATCH_WINDOW_SIZE'])
+    if pws < 1:
+        raise ValueError(f'PATCH_WINDOW_SIZE / MMDIFF_PATCH_WINDOW_SIZE 须 >= 1，当前 {pws}')
+    if pws % 2 == 0:
+        raise ValueError(f'PATCH_WINDOW_SIZE / MMDIFF_PATCH_WINDOW_SIZE 须为奇数（中心像素对齐），当前 {pws}')
+    opt['dataset']['patch_size'] = pws
     slr_steps = int(g.get('SCHEDULER_LR_TOTAL_STEPS') or 0)
     if slr_steps > 0:
         opt['scheduler_lr_total_steps'] = slr_steps
@@ -639,6 +656,11 @@ def _apply_mmdiff_env_overrides():
     r2l = _normalize_rgb_to_lidar_guidance(_env_r2l or g.get('RGB_TO_LIDAR_GUIDANCE_MODE') or 'none')
     g['RGB_TO_LIDAR_GUIDANCE_MODE'] = r2l
     opt['model_cls']['rgb_to_lidar_guidance_mode'] = r2l
+
+    _tb_root_env = (os.environ.get('MMDIFF_TB_LOG_ROOT') or '').strip()
+    if _tb_root_env:
+        global TB_LOG_ROOT
+        TB_LOG_ROOT = Path(_tb_root_env)
 
 
 _apply_mmdiff_env_overrides()

@@ -21,6 +21,12 @@ Houston 兼容约定（同 `utils/extrac_dataset.py` 中最终 `houston2018.mat`
   python extract_szutree_dataset.py --inspect --inspect-detail
   set MMDIFF_HSI_CHANNELS=98
   python extract_szutree_dataset.py --export
+
+左上四分之一子数据集:
+  将 EXPORT_TOP_LEFT_QUARTER 置为 True 时，在重采样到标签栅格后对
+  label/HSI/LiDAR/RGB 做 [0:H//2, 0:W//2] 硬裁（无 halo），输出默认
+  ../../autodl-fs/szutree_tlq/szutree_r1.mat；置 False 则全幅导出到
+  ../../autodl-fs/szutree/szutree_r1.mat。须与 param.py 中 DATA_PREPARE_INPUT_MAT 一致。
 """
 from __future__ import annotations
 
@@ -38,6 +44,9 @@ from scipy import sparse
 from scipy.ndimage import zoom
 from tqdm import tqdm
 
+# True: 导出左上四分之一子数据集至 szutree_tlq（与 param 默认一致）；False: 全幅 szutree
+EXPORT_TOP_LEFT_QUARTER = True
+
 
 def _int_env(name: str, default: int) -> int:
     raw = (os.environ.get(name) or "").strip()
@@ -52,6 +61,8 @@ def _default_r1_dir() -> Path:
 
 def _default_out_mat() -> Path:
     here = Path(__file__).resolve().parent
+    if EXPORT_TOP_LEFT_QUARTER:
+        return (here / "../../autodl-fs/szutree_tlq/szutree_r1.mat").resolve()
     return (here / "../../autodl-fs/szutree/szutree_r1.mat").resolve()
 
 
@@ -398,6 +409,32 @@ def run_export(
     rgb_hw = _resize_spatial_hwc(
         rgb_hw_0, ref_h, ref_w, order=1
     )
+
+    if EXPORT_TOP_LEFT_QUARTER:
+        full_h, full_w = ref_h, ref_w
+        ch, cw = full_h // 2, full_w // 2
+        if ch < 1 or cw < 1:
+            raise ValueError(
+                f"左上四分之一裁剪后尺寸无效: full=({full_h},{full_w}) -> ({ch},{cw})"
+            )
+        meta["spatial_crop"] = {
+            "type": "top_left_quarter",
+            "full_label_shape": [full_h, full_w],
+            "crop_rows": [0, ch],
+            "crop_cols": [0, cw],
+            "no_halo": True,
+            "edge_note": "裁剪后边界由 pipeline/data.PatchDataset 零填充",
+        }
+        label_2d = np.ascontiguousarray(label_2d[:ch, :cw])
+        hsi = np.ascontiguousarray(hsi[:ch, :cw, :])
+        lidar = np.ascontiguousarray(lidar[:ch, :cw, :])
+        rgb_hw = np.ascontiguousarray(rgb_hw[:ch, :cw, :])
+        ref_h, ref_w = ch, cw
+        meta["label_shape"] = [ref_h, ref_w]
+        meta["hsi"]["out_shape"] = [ref_h, ref_w, hsi_bands]
+        meta["lidar"]["out_shape"] = [ref_h, ref_w, 1]
+        meta["rgb"]["out_shape"] = [3, ref_h, ref_w]
+
     rgb_out = _rgb_hwc_to_chw_u8(rgb_hw)
 
     train_sp, test_sp = build_train_test_sparse(
@@ -556,7 +593,7 @@ def main() -> None:
         "--out",
         type=Path,
         default=None,
-        help="输出 .mat 路径（默认 ../../autodl-fs/szutree/szutree_r1.mat）",
+        help="输出 .mat 路径（默认由 EXPORT_TOP_LEFT_QUARTER 决定 szutree_tlq 或 szutree）",
     )
     p.add_argument("--inspect", action="store_true", help="仅检查并打印信息")
     p.add_argument(
