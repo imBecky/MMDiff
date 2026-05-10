@@ -181,7 +181,19 @@ EARLY_STOPPING_PATIENCE = 30
 
 USE_CENTER_LOSS = True
 LOSS_WEIGHT_GLOBAL = 0.2
-LOSS_WEIGHT_CENTER = 0.8
+
+
+def _sync_loss_weights_from_global() -> None:
+    """LOSS_WEIGHT_CENTER 恒为 1-LOSS_WEIGHT_GLOBAL；仅以 GLOBAL 为唯一可调量。"""
+    global LOSS_WEIGHT_CENTER
+    wg = float(LOSS_WEIGHT_GLOBAL)
+    assert 0.0 < wg < 1.0, (
+        f'LOSS_WEIGHT_GLOBAL 须在区间 (0, 1)，当前 {wg!r}（不设 clamp，请先修正配置）'
+    )
+    LOSS_WEIGHT_CENTER = 1.0 - wg
+
+
+_sync_loss_weights_from_global()
 
 # 监督对比损失 SupCon（Khosla et al.）：在 c_rep 上接 projection，训练集双视图（独立随机旋转）
 # 需要 RGB+扩散特征；与 CE 联合：L = L_ce + SUPCON_WEIGHT * L_supcon
@@ -190,8 +202,8 @@ SUPCON_WEIGHT = 0.1
 SUPCON_TEMPERATURE = 0.07
 SUPCON_PROJ_DIM = 128
 
-# 清单实验：仅 center/global loss 权重对比；生效：MULTIMODAL_ABLATION_AXIS / INDEX 或 MMDIFF_ABLATION_* 环境变量
-CENTER_GLOBAL_ABLATION = ((0.2, 0.8))
+# 清单实验：每项为 (global, ...) 只看 global；第二项仅为兼容旧写法、会被忽略（CENTER 由 1-global 得出）。须为外层元组包住多行：( (0.2, 0.8), ) 勿写成 ((0.2,0.8))。生效：MULTIMODAL_ABLATION_AXIS / INDEX 或 MMDIFF_ABLATION_*。
+CENTER_GLOBAL_ABLATION = ((0.2, 0.8),)
 MULTIMODAL_ABLATION_AXIS = None  # None | 'center_global'
 MULTIMODAL_ABLATION_INDEX = 0
 
@@ -228,9 +240,8 @@ _EFFECTIVE_ABLATION_INDEX = None
 
 
 def _apply_multimodal_ablation():
-    """按轴覆盖 LOSS_WEIGHT_*；未选轴时保持上方默认值。"""
-    global LOSS_WEIGHT_GLOBAL, LOSS_WEIGHT_CENTER
-    global _EFFECTIVE_ABLATION_AXIS, _EFFECTIVE_ABLATION_INDEX
+    """按轴覆盖 LOSS_WEIGHT_GLOBAL（CENTER 由 _sync_loss_weights_from_global() 推导）。"""
+    global LOSS_WEIGHT_GLOBAL, _EFFECTIVE_ABLATION_AXIS, _EFFECTIVE_ABLATION_INDEX
     axis = (os.environ.get('MMDIFF_ABLATION_AXIS') or '').strip() or (MULTIMODAL_ABLATION_AXIS or '')
     axis = axis.strip() or None
     idx_raw = (os.environ.get('MMDIFF_ABLATION_INDEX') or '').strip()
@@ -245,7 +256,8 @@ def _apply_multimodal_ablation():
     _EFFECTIVE_ABLATION_AXIS = axis
     if axis == 'center_global':
         idx = max(0, min(idx, len(CENTER_GLOBAL_ABLATION) - 1))
-        LOSS_WEIGHT_GLOBAL, LOSS_WEIGHT_CENTER = CENTER_GLOBAL_ABLATION[idx]
+        row = CENTER_GLOBAL_ABLATION[idx]
+        LOSS_WEIGHT_GLOBAL = float(row[0] if isinstance(row, (tuple, list)) else row)
     else:
         raise ValueError(
             f'未知 MULTIMODAL_ABLATION_AXIS / MMDIFF_ABLATION_AXIS={axis!r}，应为 "center_global"'
@@ -254,6 +266,7 @@ def _apply_multimodal_ablation():
 
 
 _apply_multimodal_ablation()
+_sync_loss_weights_from_global()
 
 # 与 opt['model'] 中 SR3/UNet 占位配置一致的历史字段（分类主流程不再加载扩散教师）
 STUDENT_SIZE = 256
@@ -276,11 +289,13 @@ CLS_INIT_TYPE = 'kaiming'
 CLS_INIT_SCALE = 0.1
 CLS_OUTPUT_CM_SIZE = 3
 # 多模态 Transformer 分类头（见 model/multimodal.py）
-CLS_TOKEN_DIM = 320
+CLS_TOKEN_DIM = 192
 CLS_TRANSFORMER_HEADS = 4
 CLS_TRANSFORMER_LAYERS = 1
 CLS_TRANSFORMER_FF_DIM = 384
-CLS_HEAD_HIDDEN = 320
+CLS_HEAD_HIDDEN = 192
+# center query cross-attention：logits += -alpha * dist_to_center（线性欧氏距离，按 11×11 格）
+CENTER_DISTANCE_BIAS_ALPHA = 0.2
 
 
 def _train_scheduler_dict():
@@ -414,6 +429,7 @@ def build_opt():
             ('rgb_source', 'student'),
             ('rgb_student_checkpoint', RGB_STUDENT_CHECKPOINT or None),
             ('rgb_to_lidar_guidance_mode', RGB_TO_LIDAR_GUIDANCE_MODE),
+            ('center_distance_bias_alpha', CENTER_DISTANCE_BIAS_ALPHA),
         ]
     )
     path = OrderedDict(
@@ -478,12 +494,13 @@ opt['model_cls']['use_supcon'] = USE_SUPCON
 opt['model_cls']['supcon_weight'] = SUPCON_WEIGHT
 opt['model_cls']['supcon_temperature'] = SUPCON_TEMPERATURE
 opt['model_cls']['supcon_proj_dim'] = SUPCON_PROJ_DIM
+opt['model_cls']['center_distance_bias_alpha'] = float(CENTER_DISTANCE_BIAS_ALPHA)
 
 
 def _apply_mmdiff_env_overrides():
     """
     在 build_opt 之后覆盖 loss 与 LiDAR 投影宽度（与 LIDAR_PROJ_HIDDEN_CFG 一致）。
-    MMDIFF_LOSS_WEIGHT_GLOBAL / MMDIFF_LOSS_WEIGHT_CENTER
+    MMDIFF_LOSS_WEIGHT_GLOBAL（CENTER 始终为 1-GLOBAL；不再读取 MMDIFF_LOSS_WEIGHT_CENTER）
     MMDIFF_LIDAR_HIDDEN → LIDAR_PROJ_HIDDEN_CFG
     MMDIFF_LIDAR_EXTRA_BLOCKS → LIDAR_EXTRA_BLOCKS_CFG（LiDAR stem 后空间残差块数）
     MMDIFF_SUPCON_WEIGHT → SUPCON_WEIGHT
@@ -500,6 +517,7 @@ def _apply_mmdiff_env_overrides():
     MMDIFF_CLS_HEAD_HIDDEN → CLS_HEAD_HIDDEN 与 opt['model_cls']['head_hidden']
     MMDIFF_CLS_TRANSFORMER_LAYERS → CLS_TRANSFORMER_LAYERS 与 opt['model_cls']['transformer_layers']
     MMDIFF_CLS_TRANSFORMER_FF_DIM → CLS_TRANSFORMER_FF_DIM 与 opt['model_cls']['transformer_ff_dim']
+    MMDIFF_CENTER_DISTANCE_BIAS_ALPHA → CENTER_DISTANCE_BIAS_ALPHA 与 opt['model_cls']['center_distance_bias_alpha']
     MMDIFF_EARLY_STOPPING_PATIENCE → EARLY_STOPPING_PATIENCE（0=关闭早停）
     MMDIFF_RESUME_CHECKPOINT → 覆盖 RESUME_CHECKPOINT
     MMDIFF_RGB_TO_LIDAR_GUIDANCE → RGB_TO_LIDAR_GUIDANCE_MODE 与 opt['model_cls']['rgb_to_lidar_guidance_mode']（none|film）
@@ -537,10 +555,11 @@ def _apply_mmdiff_env_overrides():
         g[key] = v.strip()
 
     _float('MMDIFF_LOSS_WEIGHT_GLOBAL', 'LOSS_WEIGHT_GLOBAL')
-    _float('MMDIFF_LOSS_WEIGHT_CENTER', 'LOSS_WEIGHT_CENTER')
+    _sync_loss_weights_from_global()
     _float('MMDIFF_SUPCON_WEIGHT', 'SUPCON_WEIGHT')
     _float('MMDIFF_LEARNING_RATE', 'LEARNING_RATE')
     _float('MMDIFF_WEIGHT_DECAY', 'WEIGHT_DECAY')
+    _float('MMDIFF_CENTER_DISTANCE_BIAS_ALPHA', 'CENTER_DISTANCE_BIAS_ALPHA')
     _bool_env('MMDIFF_USE_SUPCON', 'USE_SUPCON')
     _int('MMDIFF_LIDAR_HIDDEN', 'LIDAR_PROJ_HIDDEN_CFG')
     _int('MMDIFF_LIDAR_EXTRA_BLOCKS', 'LIDAR_EXTRA_BLOCKS_CFG')
@@ -625,6 +644,13 @@ def _apply_mmdiff_env_overrides():
     opt['model_cls']['transformer_layers'] = n_layers
     opt['model_cls']['transformer_ff_dim'] = ff_dim
 
+    cba = float(g['CENTER_DISTANCE_BIAS_ALPHA'])
+    if cba < 0.0:
+        raise ValueError(
+            f'CENTER_DISTANCE_BIAS_ALPHA / MMDIFF_CENTER_DISTANCE_BIAS_ALPHA 须 >= 0，当前 {cba}'
+        )
+    opt['model_cls']['center_distance_bias_alpha'] = cba
+
     rsc = (os.environ.get('MMDIFF_RGB_STUDENT_CHECKPOINT') or '').strip()
     if rsc:
         g['RGB_STUDENT_CHECKPOINT'] = rsc
@@ -657,5 +683,6 @@ MULTIMODAL_ABLATION_LOG_LINE = (
     f"hsi_se_ratio={HSI_SE_RATIO_CFG} hsi_agg_mode={HSI_AGG_MODE_CFG} | "
     f"rgb_to_lidar_guidance={RGB_TO_LIDAR_GUIDANCE_MODE} | "
     f"loss_global/center={LOSS_WEIGHT_GLOBAL}/{LOSS_WEIGHT_CENTER} | "
-    f"use_supcon={USE_SUPCON} supcon_w={SUPCON_WEIGHT} tau={SUPCON_TEMPERATURE}"
+    f"use_supcon={USE_SUPCON} supcon_w={SUPCON_WEIGHT} tau={SUPCON_TEMPERATURE} | "
+    f"center_dist_bias_a={CENTER_DISTANCE_BIAS_ALPHA}"
 )

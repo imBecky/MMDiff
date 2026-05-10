@@ -48,18 +48,17 @@ if TYPE_CHECKING:
 
 
 class AttnGrabber:
-    """临时替换 MultiheadAttention.forward，强制返回注意力权重。"""
+    """临时替换 CrossAttentionWithLogitBias.forward，强制返回注意力权重。"""
 
-    def __init__(self, mha: nn.MultiheadAttention):
-        self.mha = mha
-        self._orig = mha.forward
+    def __init__(self, cross: nn.Module):
+        self.cross = cross
+        self._orig = cross.forward
         self.last: Optional[torch.Tensor] = None
-        mha.forward = self._wrapped  # type: ignore[assignment]
+        cross.forward = self._wrapped  # type: ignore[assignment]
 
     def _wrapped(self, *args, **kwargs):
         kwargs = dict(kwargs)
         kwargs["need_weights"] = True
-        kwargs["average_attn_weights"] = False
         out = self._orig(*args, **kwargs)
         if isinstance(out, tuple) and len(out) >= 2:
             w = out[1]
@@ -68,7 +67,7 @@ class AttnGrabber:
         return out
 
     def restore(self) -> None:
-        self.mha.forward = self._orig  # type: ignore[assignment]
+        self.cross.forward = self._orig  # type: ignore[assignment]
 
 
 def _resolve_ckpt_path(ckpt_dir: Path) -> Path:
@@ -106,12 +105,13 @@ def peek_pos_embed_mem_len(ckpt_file: Path) -> Optional[int]:
 
 def _apply_modality_env_for_mem_len(mem_len: int) -> str:
     """
-    根据 MultimodalClassifier.mem_len 与 param 中 modality/hsi_agg 的常见组合反推
-    MMDIFF_MODALITY_COMBO（默认 multi_token 时 HSI=3 token）。
-    mem_len=3 仍可能是 (HSI mean + RGB + LiDAR)；无法区分时以「仅 HSI multi_token」为先，
-    若仍 load 失败请用户显式传 --modality-combo / --hsi-agg-mode。
+    根据 pos_embed_mem 列数反推 MMDIFF_MODALITY_COMBO。
+    含：空间融合 121×K；旧版少量 token。
     """
     m = {
+        363: "hsi+rgb+lidar",
+        242: "hsi+lidar",
+        121: "hsi",
         5: "hsi+rgb+lidar",
         4: "hsi+lidar",
         3: "hsi",
@@ -230,6 +230,63 @@ def _hsi_mem_slice(model) -> Optional[slice]:
         return None
     n = int(getattr(model.hsi_encoder, "n_output_tokens", 1))
     return slice(0, n)
+
+
+def _is_spatial_fusion_model(model: torch.nn.Module) -> bool:
+    ml = int(getattr(model, "mem_len", 0))
+    return ml >= 121 and ml % 121 == 0
+
+
+def _spatial_modality_slices(model: torch.nn.Module) -> List[Tuple[str, slice]]:
+    n = 121
+    parts: List[Tuple[str, slice]] = []
+    off = 0
+    if getattr(model, "use_hsi", False):
+        parts.append(("HSI", slice(off, off + n)))
+        off += n
+    if getattr(model, "use_rgb", False):
+        parts.append(("RGB", slice(off, off + n)))
+        off += n
+    if getattr(model, "use_lidar", False):
+        parts.append(("LiDAR", slice(off, off + n)))
+        off += n
+    return parts
+
+
+def _plot_spatial_modalities_grids(
+    mean_g: np.ndarray,
+    mean_c: np.ndarray,
+    model: torch.nn.Module,
+    out_png: Path,
+    out_pdf: Path,
+) -> None:
+    """每模态一个 11×11：左 Global 右 Center。"""
+    import matplotlib.pyplot as plt
+
+    parts = _spatial_modality_slices(model)
+    nmod = len(parts)
+    fig, axes = plt.subplots(nmod, 2, figsize=(7.5, 2.8 * max(nmod, 1)))
+    if nmod == 1:
+        axes = np.array([axes])
+    for mi, (name, sl) in enumerate(parts):
+        gg = mean_g[sl].reshape(11, 11)
+        gc = mean_c[sl].reshape(11, 11)
+        axes[mi, 0].imshow(gg, cmap="viridis", interpolation="nearest")
+        axes[mi, 0].set_title(f"{name}: Global → 11×11")
+        axes[mi, 0].set_xticks(np.arange(11))
+        axes[mi, 0].set_yticks(np.arange(11))
+        im = axes[mi, 1].imshow(gc, cmap="viridis", interpolation="nearest")
+        axes[mi, 1].set_title(f"{name}: Center → 11×11")
+        axes[mi, 1].set_xticks(np.arange(11))
+        axes[mi, 1].set_yticks(np.arange(11))
+        plt.colorbar(im, ax=axes[mi, 1], fraction=0.046)
+    fig.suptitle(
+        "Cross-attn over spatial memory tokens (per modality 121 cells, row-major 11×11)"
+    )
+    fig.tight_layout()
+    fig.savefig(out_png, dpi=200, bbox_inches="tight")
+    fig.savefig(out_pdf, bbox_inches="tight")
+    plt.close(fig)
 
 
 def _aggregate_across_layers(
@@ -597,11 +654,11 @@ def main() -> None:
     model.eval()
 
     qk = int(getattr(model, "query_tokens_per_query", 4))
-    dec: nn.TransformerDecoder = model.decoder  # type: ignore[assignment]
+    dec = model.decoder
     grabbers: List[AttnGrabber] = []
     try:
         for layer in dec.layers:
-            g = AttnGrabber(layer.multihead_attn)
+            g = AttnGrabber(layer.cross_attn)
             grabbers.append(g)
 
         from pipeline.data import batch_to_dict  # noqa: WPS433
@@ -634,55 +691,88 @@ def main() -> None:
         mean_g = (sum_g / float(n_samples)).cpu().numpy()
         mean_c = (sum_c / float(n_samples)).cpu().numpy()
         mat = np.stack([mean_g, mean_c], axis=0)
+        spatial_fusion = _is_spatial_fusion_model(model)
 
-        colnames = _memory_column_labels(model)
-        if mat.shape[1] != len(colnames):
-            raise RuntimeError(
-                f"列数 {mat.shape[1]} 与标签数 {len(colnames)} 不一致；"
-                f"mem_len={getattr(model, 'mem_len', '?')}"
-            )
+        if spatial_fusion:
+            parts = _spatial_modality_slices(model)
+            col_agg = [p[0] + "_mean121" for p in parts]
+            agg_g = np.array([mean_g[sl].mean() for _, sl in parts])
+            agg_c = np.array([mean_c[sl].mean() for _, sl in parts])
+            mat_agg = np.stack([agg_g, agg_c], axis=0)
+            png_a = out_dir / "attention_modalities_mean.png"
+            pdf_a = out_dir / "attention_modalities_mean.pdf"
+            _plot_modal_heatmap(mat_agg, ["Global", "Center"], col_agg, png_a, pdf_a)
+            png_sp = out_dir / "attention_spatial_modalities.png"
+            pdf_sp = out_dir / "attention_spatial_modalities.pdf"
+            _plot_spatial_modalities_grids(mean_g, mean_c, model, png_sp, pdf_sp)
 
-        row_labels = ["Global", "Center"]
-        png_a = out_dir / "attention_modal_tokens.png"
-        pdf_a = out_dir / "attention_modal_tokens.pdf"
-        _plot_modal_heatmap(mat, row_labels, colnames, png_a, pdf_a)
-
-        agg_mode = str(getattr(model.hsi_encoder, "agg_mode", ""))
-        hsi_sl = _hsi_mem_slice(model)
-
-        summary_lines = [
-            f"ckpt_file={ckpt_file}",
-            f"MMDIFF_MODALITY_COMBO={os.environ.get('MMDIFF_MODALITY_COMBO', '')}",
-            f"MMDIFF_HSI_AGG_MODE={os.environ.get('MMDIFF_HSI_AGG_MODE', param.HSI_AGG_MODE_CFG)}",
-            f"split={args.split} seed={seed}",
-            f"num_batches_cap={args.num_batches} samples_used={n_samples}",
-            f"all_layers={bool(args.all_layers)}",
-            f"mem_len={getattr(model, 'mem_len', None)} qk={qk}",
-            f"hsi_agg_mode={agg_mode}",
-            f"memory_columns={colnames}",
-            "",
-            "mean Global weights:",
-            "  " + " | ".join(f"{c}:{v:.6f}" for c, v in zip(colnames, mean_g)),
-            "mean Center weights:",
-            "  " + " | ".join(f"{c}:{v:.6f}" for c, v in zip(colnames, mean_c)),
-            "",
-        ]
-        if "HSI-center" in colnames:
-            i = colnames.index("HSI-center")
-            dg = float(mean_g[i] - mean_c[i])
-            summary_lines.append(f"diff Global-Center on HSI-center column: {dg:.6f}")
-
-        if agg_mode == "multi_token" and hsi_sl is not None:
-            g_grid = _fill_patch_grid_from_hsi_tokens(mean_g, hsi_sl, agg_mode)
-            c_grid = _fill_patch_grid_from_hsi_tokens(mean_c, hsi_sl, agg_mode)
-            png_b = out_dir / "attention_patch_grid.png"
-            pdf_b = out_dir / "attention_patch_grid.pdf"
-            _plot_patch_grids(g_grid, c_grid, png_b, pdf_b)
-            summary_lines.append(f"patch_grid_saved={png_b}")
+            summary_lines = [
+                f"ckpt_file={ckpt_file}",
+                f"MMDIFF_MODALITY_COMBO={os.environ.get('MMDIFF_MODALITY_COMBO', '')}",
+                f"MMDIFF_HSI_AGG_MODE={os.environ.get('MMDIFF_HSI_AGG_MODE', param.HSI_AGG_MODE_CFG)}",
+                f"center_distance_bias_alpha={getattr(model, 'center_distance_bias_alpha', '')}",
+                f"split={args.split} seed={seed}",
+                f"num_batches_cap={args.num_batches} samples_used={n_samples}",
+                f"all_layers={bool(args.all_layers)}",
+                f"mem_len={getattr(model, 'mem_len', None)} qk={qk}",
+                f"spatial_fusion=121xmodalities token_dim={getattr(model, 'd_model', '')}",
+                "",
+                "mean attention per modality (121 spatial tokens averaged):",
+                "  Global: " + " | ".join(f"{lab}:{v:.6f}" for lab, v in zip(col_agg, agg_g)),
+                "  Center: " + " | ".join(f"{lab}:{v:.6f}" for lab, v in zip(col_agg, agg_c)),
+                "",
+                f"figures: {png_a}, {png_sp}",
+                "",
+            ]
         else:
-            summary_lines.append(
-                "patch_grid: skipped (need hsi_agg_mode=multi_token with use_hsi)"
-            )
+            colnames = _memory_column_labels(model)
+            if mat.shape[1] != len(colnames):
+                raise RuntimeError(
+                    f"列数 {mat.shape[1]} 与标签数 {len(colnames)} 不一致；"
+                    f"mem_len={getattr(model, 'mem_len', '?')}"
+                )
+
+            row_labels = ["Global", "Center"]
+            png_a = out_dir / "attention_modal_tokens.png"
+            pdf_a = out_dir / "attention_modal_tokens.pdf"
+            _plot_modal_heatmap(mat, row_labels, colnames, png_a, pdf_a)
+
+            agg_mode = str(getattr(model.hsi_encoder, "agg_mode", ""))
+            hsi_sl = _hsi_mem_slice(model)
+
+            summary_lines = [
+                f"ckpt_file={ckpt_file}",
+                f"MMDIFF_MODALITY_COMBO={os.environ.get('MMDIFF_MODALITY_COMBO', '')}",
+                f"MMDIFF_HSI_AGG_MODE={os.environ.get('MMDIFF_HSI_AGG_MODE', param.HSI_AGG_MODE_CFG)}",
+                f"split={args.split} seed={seed}",
+                f"num_batches_cap={args.num_batches} samples_used={n_samples}",
+                f"all_layers={bool(args.all_layers)}",
+                f"mem_len={getattr(model, 'mem_len', None)} qk={qk}",
+                f"hsi_agg_mode={agg_mode}",
+                f"memory_columns={colnames}",
+                "",
+                "mean Global weights:",
+                "  " + " | ".join(f"{c}:{v:.6f}" for c, v in zip(colnames, mean_g)),
+                "mean Center weights:",
+                "  " + " | ".join(f"{c}:{v:.6f}" for c, v in zip(colnames, mean_c)),
+                "",
+            ]
+            if "HSI-center" in colnames:
+                i = colnames.index("HSI-center")
+                dg = float(mean_g[i] - mean_c[i])
+                summary_lines.append(f"diff Global-Center on HSI-center column: {dg:.6f}")
+
+            if agg_mode == "multi_token" and hsi_sl is not None:
+                g_grid = _fill_patch_grid_from_hsi_tokens(mean_g, hsi_sl, agg_mode)
+                c_grid = _fill_patch_grid_from_hsi_tokens(mean_c, hsi_sl, agg_mode)
+                png_b = out_dir / "attention_patch_grid.png"
+                pdf_b = out_dir / "attention_patch_grid.pdf"
+                _plot_patch_grids(g_grid, c_grid, png_b, pdf_b)
+                summary_lines.append(f"patch_grid_saved={png_b}")
+            else:
+                summary_lines.append(
+                    "patch_grid: skipped (need hsi_agg_mode=multi_token with use_hsi)"
+                )
 
         summary_path = out_dir / "summary.txt"
         summary_text = "\n".join(summary_lines) + "\n"
