@@ -10,50 +10,25 @@ cd "$ROOT"
 # arch_then_compare：架构消融（可选）→ 对比试验按 SEEDS 各跑一遍（main_compare）
 # modality：主模型 main.py 仅 ABLATION_SEED（单种子模态消融）
 # modality_multiseed：主模型 main.py 对 SEEDS 中每个种子各跑一遍模态消融（论文五种子）
-# arch_ablation | modality | modality_multiseed | compare | all | arch_then_compare | patience_sweep | hparam_reco
+# arch_ablation | modality | modality_multiseed | compare | all | arch_then_compare | patience_sweep
 RUN_MODE="${RUN_MODE:-compare}"
 
-EXP_TAG=""
+EXP_TAG="Szutree_"
 # 与 param.RANDOM_SEED 对齐；架构消融固定为 ABLATION_SEED
-RANDOM_SEED="84"
+RANDOM_SEED="42"
 ABLATION_SEED="${ABLATION_SEED:-42}"
 
 # 对比试验：42、42×2、×4、×8、×16（与论文五种子一致）；架构消融不使用本列表
 BASE_SEED="${BASE_SEED:-42}"
 SEEDS=(
-  "13"
   "42"
-  "1024"
-  "2026"
-  "4399"
+  # "13"
+  # "2026"
+  # "4399"
 )
 PATIENCE_VALUES=(15 20 25 30)
-HPARAM_SWEEP_MULTI_SEED="${HPARAM_SWEEP_MULTI_SEED:-0}"  # 0: 仅 ABLATION_SEED；1: 使用 SEEDS 全部
-HPARAM_RECO_MODALITY="${HPARAM_RECO_MODALITY:-hsi+rgb+lidar}"
 FREEZE_RGB_STUDENT="0"
 RGB_STUDENT_CKPT="${ROOT}/model/rgb_student_distill.pt"
-
-# 超参数推荐组（用于 RUN_MODE=hparam_reco）
-# 1) Patch size：围绕论文默认 11 做邻域探索
-HPARAM_PATCH_GROUPS=(
-  "patch_p09|9"
-  "patch_p11|11"
-  "patch_p13|13"
-)
-
-# 2) 双头损失权重：围绕论文默认 0.2/0.8 做邻域探索
-HPARAM_LOSS_GROUPS=(
-  "loss_g01_c09|0.1|0.9"
-  "loss_g02_c08|0.2|0.8"
-  "loss_g03_c07|0.3|0.7"
-)
-
-# 3) 共享嵌入维度 / token hidden dimension：token_dim 与 head_hidden 联动
-HPARAM_EMBED_GROUPS=(
-  "embed_t256_h256|256|256"
-  "embed_t320_h320|320|320"
-  "embed_t384_h384|384|384"
-)
 
 # HSI：SE 挤压比、残差深度、conv 宽、空间聚合（对齐 exp_se_cls_shallow：5×96+SE32+mean）
 HSI_SE_RATIO="32"
@@ -266,95 +241,6 @@ PYEOF
   return "$final_ec"
 }
 
-_clear_hparam_env() {
-  unset \
-    MMDIFF_PATCH_WINDOW_SIZE \
-    MMDIFF_LOSS_WEIGHT_GLOBAL \
-    MMDIFF_LOSS_WEIGHT_CENTER \
-    MMDIFF_CLS_TOKEN_DIM \
-    MMDIFF_CLS_HEAD_HIDDEN \
-    MMDIFF_MODALITY_COMBO \
-    2>/dev/null || true
-}
-
-_run_hparam_case() {
-  local tag="$1"
-  shift
-  local ec=0
-  _clear_hparam_env
-  export MMDIFF_MODALITY_COMBO="${HPARAM_RECO_MODALITY}"
-  while [ "$#" -gt 0 ]; do
-    export "$1"
-    shift
-  done
-  export MMDIFF_EXPERIMENT_TAG="${EXP_TAG}${tag}"
-  export MMDIFF_RUN_TIMESTAMP="$(date +%m%d-%H%M)"
-  echo "========== 超参数实验: TAG=${MMDIFF_EXPERIMENT_TAG} =========="
-  apply_experiment_env
-  python main.py || ec=$?
-  if [ "$ec" -ne 0 ]; then
-    echo "========== 本组训练非零退出: ${ec}（继续下一组） ==========" >&2
-  fi
-  return "$ec"
-}
-
-run_hparam_recommendations() {
-  local final_ec ec seed
-  local -a run_seeds
-  final_ec=0
-  if [ "${HPARAM_SWEEP_MULTI_SEED}" = "1" ]; then
-    run_seeds=("${SEEDS[@]}")
-  else
-    run_seeds=("${ABLATION_SEED}")
-  fi
-
-  echo "#####################################################################"
-  echo "# 超参数推荐实验: seeds=(${run_seeds[*]}) modality=${HPARAM_RECO_MODALITY}"
-  echo "# 组别: patch_size / loss_weight / embed_dim"
-  echo "#####################################################################"
-
-  for seed in "${run_seeds[@]}"; do
-    local item tag patch wg wc token_dim head_hidden
-    RANDOM_SEED="${seed}"
-    export MMDIFF_RANDOM_SEED="${seed}"
-    EXP_TAG="hp_s${seed}_"
-    echo "==================== 当前种子: ${seed} ===================="
-
-    for item in "${HPARAM_PATCH_GROUPS[@]}"; do
-      IFS="|" read -r tag patch <<< "${item}"
-      ec=0
-      _run_hparam_case "${tag}" \
-        "MMDIFF_PATCH_WINDOW_SIZE=${patch}" || ec=$?
-      if [ "$ec" -ne 0 ]; then
-        final_ec="$ec"
-      fi
-    done
-
-    for item in "${HPARAM_LOSS_GROUPS[@]}"; do
-      IFS="|" read -r tag wg wc <<< "${item}"
-      ec=0
-      _run_hparam_case "${tag}" \
-        "MMDIFF_LOSS_WEIGHT_GLOBAL=${wg}" \
-        "MMDIFF_LOSS_WEIGHT_CENTER=${wc}" || ec=$?
-      if [ "$ec" -ne 0 ]; then
-        final_ec="$ec"
-      fi
-    done
-
-    for item in "${HPARAM_EMBED_GROUPS[@]}"; do
-      IFS="|" read -r tag token_dim head_hidden <<< "${item}"
-      ec=0
-      _run_hparam_case "${tag}" \
-        "MMDIFF_CLS_TOKEN_DIM=${token_dim}" \
-        "MMDIFF_CLS_HEAD_HIDDEN=${head_hidden}" || ec=$?
-      if [ "$ec" -ne 0 ]; then
-        final_ec="$ec"
-      fi
-    done
-  done
-  return "$final_ec"
-}
-
 do_shutdown() {
   sleep 3
   local _i
@@ -370,10 +256,10 @@ run_compare() {
   local s="${MMDIFF_RANDOM_SEED:-${RANDOM_SEED:-42}}"
   export MMDIFF_RANDOM_SEED="${s}"
   RANDOM_SEED="${s}"
-  EXP_TAG="test_es"
-  echo "========== 对比试验  SEED=${s}  TAG_PREFIX=${EXP_TAG} =========="
+  EXP_TAG=""
+  echo "========== 对比试验  SEED=${s}  =========="
   for entry in "${MODELS[@]}"; do
-      export MMDIFF_RUN_TIMESTAMP="cmp_s${s}_$(date +%m%d_%H%M)"
+      export MMDIFF_RUN_TIMESTAMP="$(date +%m%d_%H%M)"
       IFS=":" read -r model lr <<< "$entry"
       echo "===> seed=${s}  ${model}  LR=$lr"
       export MMDIFF_EXPERIMENT_TAG="${model}_s${s}"
@@ -474,9 +360,6 @@ main() {
     patience_sweep)
       run_patience_sweep
       ;;
-    hparam_reco)
-      run_hparam_recommendations
-      ;;
     all)
       RANDOM_SEED="${ABLATION_SEED}"
       export MMDIFF_RANDOM_SEED="${ABLATION_SEED}"
@@ -487,7 +370,7 @@ main() {
       run_compare
       ;;
     *)
-      echo "未知 RUN_MODE=${RUN_MODE}，应为 arch_then_compare|arch_ablation|modality|modality_multiseed|compare|patience_sweep|hparam_reco|all" >&2
+      echo "未知 RUN_MODE=${RUN_MODE}，应为 arch_then_compare|arch_ablation|modality|modality_multiseed|compare|patience_sweep|all" >&2
       return 2 ;;
   esac
 }

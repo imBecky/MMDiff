@@ -132,11 +132,6 @@ def _is_compare_run() -> bool:
     return (os.environ.get('MMDIFF_COMPARE_RUN') or '').strip().lower() in ('1', 'true', 'yes')
 
 
-def _compare_run_saves_checkpoints() -> bool:
-    """对比实验是否写磁盘断点。默认否；设 MMDIFF_COMPARE_SAVE_CKPT=1 时与主训练一致落盘。"""
-    return (os.environ.get('MMDIFF_COMPARE_SAVE_CKPT') or '').strip().lower() in ('1', 'true', 'yes')
-
-
 def _normalize_resume_path(resume_checkpoint: str) -> str:
     s = (resume_checkpoint or '').strip()
     if not s:
@@ -357,20 +352,11 @@ def run_training(
     )
 
     if not no_artifacts:
-        if compare_run and not _compare_run_saves_checkpoints():
-            run_ckps_dir_str = ''
-            logger.info(
-                '对比实验：不保存 classifier 断点（best/周期/final/协议侧权重）；'
-                '若需落盘请设 MMDIFF_COMPARE_SAVE_CKPT=1'
-            )
-        elif not run_ckps_dir_str:
+        if not run_ckps_dir_str:
             CKPS_DIR.mkdir(parents=True, exist_ok=True)
             run_ckps_dir_str = str(CKPS_DIR / run_dir.name)
-            os.makedirs(run_ckps_dir_str, exist_ok=True)
-            logger.info('Checkpoint 目录: %s', run_ckps_dir_str)
-        else:
-            os.makedirs(run_ckps_dir_str, exist_ok=True)
-            logger.info('Checkpoint 目录: %s', run_ckps_dir_str)
+        os.makedirs(run_ckps_dir_str, exist_ok=True)
+        logger.info('Checkpoint 目录: %s', run_ckps_dir_str)
     else:
         logger.info('无文件产物模式（--no-artifacts）：不创建 TB/断点目录，不写 TensorBoard、周期断点、final')
 
@@ -518,7 +504,7 @@ def run_training(
     best_state_dict = None
 
     # 周期性 checkpoint-<n> 仅从总 epoch 数的后 20% 起写（epoch 为 0-based）；best / final 仍照常
-    periodic_ckpt_min_epoch = max(0, int(NUM_EPOCHS * 0.5))
+    periodic_ckpt_min_epoch = max(0, int(NUM_EPOCHS * 0.4))
 
     epoch_bar = tqdm(range(start_epoch, NUM_EPOCHS), desc='Epochs')
     last_epoch_0based = start_epoch - 1

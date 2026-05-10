@@ -25,7 +25,6 @@ def run_single_eval(
     *,
     out_dir: str = "",
     batch_size: Optional[int] = None,
-    num_workers: Optional[int] = None,
     device_name: str = "cuda",
 ) -> Dict[str, Any]:
     import numpy as np
@@ -41,7 +40,6 @@ def run_single_eval(
         opt,
     )
     from pipeline.classification_metrics import accuracies
-    from pipeline import data as data_mod
     from pipeline.data import (
         build_test_loader,
         load_rgb_hr_meta,
@@ -70,8 +68,6 @@ def run_single_eval(
 
     test_idx = load_test_indices_shifted(label_shift)
     bs = int(batch_size) if batch_size is not None else int(BATCH_SIZE)
-    if num_workers is not None:
-        data_mod.NUM_WORKERS = max(0, int(num_workers))
 
     test_loader = build_test_loader(
         feats_vol,
@@ -160,7 +156,6 @@ def _run_single_eval(args: argparse.Namespace) -> int:
             args.checkpoint,
             out_dir=args.out_dir,
             batch_size=args.batch_size,
-            num_workers=args.num_workers,
             device_name=args.device,
         )
     except FileNotFoundError as e:
@@ -218,7 +213,6 @@ def main() -> int:
         help="写入 test_metrics.json 的目录（可选）",
     )
     p.add_argument("--batch-size", type=int, default=None)
-    p.add_argument("--num-workers", type=int, default=None)
     p.add_argument("--device", type=str, default="cuda")
     args = p.parse_args()
 

@@ -181,7 +181,7 @@ def main() -> int:
     parser.add_argument(
         "--run-dir",
         type=str,
-        default="",
+        default="../../autodl-tmp/classifier/exp_0422-1422_exp_esmod_hsi_rgb_lidar",
         help="训练 run 目录，会自动使用 <run-dir>/eval_all_checkpoints",
     )
     parser.add_argument("--eval-dir", type=str, default="", help="eval_ckps.py 的输出目录")

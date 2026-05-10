@@ -1,100 +1,58 @@
 """
-从 SZUTreeData_R1_2.0 生成与 Houston/本仓库兼容的 `szutree_r1.mat`（无 PCA，HSI 默认 98 波段）；
-体积极大时 `savemat` 可能因 MAT v5 单块 ≤4GB 而失败，此时自动改存同茎名 `szutree_r1.npz` 并在 meta 中注明。
+从 SZUTreeData_R1_2.0 多个 .mat 生成与 Houston 流程兼容的总 houston2018.mat（无 PCA，HSI 保留 98 波段）。
 
-Houston 兼容约定（同 `utils/extrac_dataset.py` 中最终 `houston2018.mat` 键）:
-  hsi, lidar, rgb, train, test
-- hsi: float32, (H,W, D_hsi)
-- lidar: float32, (H, W, 1)
-- rgb: uint8, (3, H, W)
-- train / test: 二维稀疏或稠密，非零为类别 id；与 hsi 同 (H,W)
+必需键：hsi, lidar, rgb, train, test
+- hsi: float32，形状 (H_lr, W_lr, 98)，与 LiDAR/标签低分辨率网格一致
+- lidar: float32，形状 (H_lr, W_lr, 1)
+- rgb: uint8，形状 (3, H_hr, W_hr)
+- train / test: 二维稀疏或稠密标签图，非零为类别 id（1..20），与 hsi 同空间尺寸
 
-论文级数据协议:
-- `label.mat` 的 `data` 为唯一监督栅格：不转置、不插值、不众数、不裁切；仅按类划分得到 train/test 稀疏图。
-- HSI、LiDAR、RGB 若与标签空间尺寸不同，仅对影像重采样到 label 的 (H,W)，并记录 `szutree_r1.meta.json`。
+标签：5cm label.mat 通过 2×2 块众数下采样到 10cm，与 HSI/LiDAR 对齐。
 
-环境变量:
-  MMDIFF_HSI_CHANNELS=98  （与 param / data_prepare 一致）
-
-用法:
+用法：
   python extract_szutree_dataset.py --inspect
-  python extract_szutree_dataset.py --inspect --inspect-detail
   set MMDIFF_HSI_CHANNELS=98
   python extract_szutree_dataset.py --export
+  python data_prepare.py
 
-左上四分之一子数据集:
-  将 EXPORT_TOP_LEFT_QUARTER 置为 True 时，在重采样到标签栅格后对
-  label/HSI/LiDAR/RGB 做 [0:H//2, 0:W//2] 硬裁（无 halo），输出默认
-  ../../autodl-fs/szutree_tlq/szutree_r1.mat；置 False 则全幅导出到
-  ../../autodl-fs/szutree/szutree_r1.mat。须与 param.py 中 DATA_PREPARE_INPUT_MAT 一致。
+Windows PowerShell:
+  $env:MMDIFF_HSI_CHANNELS=98
 """
 from __future__ import annotations
 
 import argparse
-import json
 import os
 import sys
 from pathlib import Path
-from typing import Any
 
 import h5py
 import numpy as np
 import scipy.io as sio
 from scipy import sparse
-from scipy.ndimage import zoom
+from scipy.stats import mode as scipy_mode
 from tqdm import tqdm
-
-# True: 导出左上四分之一子数据集至 szutree_tlq（与 param 默认一致）；False: 全幅 szutree
-EXPORT_TOP_LEFT_QUARTER = True
-
-
-def _int_env(name: str, default: int) -> int:
-    raw = (os.environ.get(name) or "").strip()
-    if not raw:
-        return int(default)
-    return int(raw)
 
 
 def _default_r1_dir() -> Path:
-    return Path(r"../../autodl-fs/szutree")
+    return Path(r"E:\autodl-fs\SZUTreeData2.0\SZUTreeData_R1_2.0")
 
 
 def _default_out_mat() -> Path:
     here = Path(__file__).resolve().parent
-    if EXPORT_TOP_LEFT_QUARTER:
-        return (here / "../../autodl-fs/szutree_tlq/szutree_r1.mat").resolve()
-    return (here / "../../autodl-fs/szutree/szutree_r1.mat").resolve()
+    return (here / "../../autodl-fs/houston2018/houston2018.mat").resolve()
 
 
-def _resize_spatial_hwc(
-    vol_hwc: np.ndarray, out_h: int, out_w: int, *, order: int = 1
-) -> np.ndarray:
-    in_h, in_w, c = vol_hwc.shape[0], vol_hwc.shape[1], vol_hwc.shape[2]
-    if in_h == out_h and in_w == out_w:
-        return vol_hwc
-    z = np.ascontiguousarray(vol_hwc.astype(np.float32, copy=False))
-    zh, zw = out_h / float(in_h), out_w / float(in_w)
-    y = zoom(z, (zh, zw, 1.0), order=order, mode="nearest")
-    y = y[:out_h, :out_w, :]
-    if y.shape[0] < out_h or y.shape[1] < out_w or y.shape[2] != c:
-        out = np.zeros((out_h, out_w, c), dtype=np.float32)
-        h0, w0 = min(y.shape[0], out_h), min(y.shape[1], out_w)
-        out[:h0, :w0, :] = y[:h0, :w0, :].astype(np.float32, copy=False)
-        y = out
-    return y.astype(np.float32, copy=False)
-
-
-def load_hsi_h5(
-    path: Path, *, hsi_bands: int, show_progress: bool = True, band_chunk: int = 8
-) -> np.ndarray:
+def load_hsi_h5(path: Path, *, show_progress: bool = True, band_chunk: int = 8) -> np.ndarray:
+    """返回 float32，形状 (H, W, 98)，空间维与 LiDAR (3085, 2405) 一致。"""
     with h5py.File(path, "r") as f:
         if "hyperspectral_data_98bands" not in f:
             raise KeyError(f"{path} 中缺少 hyperspectral_data_98bands")
         ds = f["hyperspectral_data_98bands"]
         shp = ds.shape
-        if show_progress and len(shp) == 3 and shp[0] == hsi_bands:
+        # 沿波段维分块读，便于大文件时显示进度
+        if show_progress and len(shp) == 3 and shp[0] == 98:
             parts: list[np.ndarray] = []
-            it = range(0, hsi_bands, band_chunk)
+            it = range(0, 98, band_chunk)
             for i in tqdm(
                 it,
                 desc="读取 HSI 波段",
@@ -102,19 +60,18 @@ def load_hsi_h5(
                 leave=False,
                 dynamic_ncols=True,
             ):
-                sl = slice(i, min(i + band_chunk, hsi_bands))
+                sl = slice(i, min(i + band_chunk, 98))
                 parts.append(np.asarray(ds[sl], dtype=np.float32))
             x = np.concatenate(parts, axis=0)
         else:
             x = np.asarray(ds[:], dtype=np.float32)
-    if x.shape[0] == hsi_bands:
+    # HDF5: (98, 3085, 2405) -> (3085, 2405, 98)
+    if x.shape[0] == 98:
         x = np.transpose(x, (1, 2, 0))
-    elif x.shape[-1] == hsi_bands:
+    elif x.shape[-1] == 98:
         pass
     else:
-        raise ValueError(
-            f"无法识别 HSI 形状: {x.shape}（期望首维或末维为 {hsi_bands} 个波段）"
-        )
+        raise ValueError(f"无法识别 HSI 形状: {x.shape}")
     return x
 
 
@@ -124,9 +81,7 @@ def load_lidar_h5(path: Path, *, show_progress: bool = True) -> np.ndarray:
             raise KeyError(f"{path} 中缺少 chm")
         ds = f["chm"]
         if show_progress:
-            with tqdm(
-                total=1, desc="读取 LiDAR", leave=False, dynamic_ncols=True
-            ) as pbar:
+            with tqdm(total=1, desc="读取 LiDAR", leave=False, dynamic_ncols=True) as pbar:
                 z = np.asarray(ds[:], dtype=np.float32)
                 pbar.update(1)
         else:
@@ -138,9 +93,7 @@ def load_lidar_h5(path: Path, *, show_progress: bool = True) -> np.ndarray:
 
 def load_rgb_mat(path: Path, *, show_progress: bool = True) -> np.ndarray:
     if show_progress:
-        with tqdm(
-            total=1, desc="读取 RGB.mat", leave=False, dynamic_ncols=True
-        ) as pbar:
+        with tqdm(total=1, desc="读取 RGB.mat", leave=False, dynamic_ncols=True) as pbar:
             d = sio.loadmat(path)
             pbar.update(1)
     else:
@@ -152,9 +105,7 @@ def load_rgb_mat(path: Path, *, show_progress: bool = True) -> np.ndarray:
 
 def load_label_mat(path: Path, *, show_progress: bool = True) -> np.ndarray:
     if show_progress:
-        with tqdm(
-            total=1, desc="读取 label.mat", leave=False, dynamic_ncols=True
-        ) as pbar:
+        with tqdm(total=1, desc="读取 label.mat", leave=False, dynamic_ncols=True) as pbar:
             d = sio.loadmat(path)
             pbar.update(1)
     else:
@@ -164,49 +115,45 @@ def load_label_mat(path: Path, *, show_progress: bool = True) -> np.ndarray:
     return np.asarray(d["data"])
 
 
-def _rgb_to_hwc(rgb: np.ndarray) -> np.ndarray:
-    if rgb.ndim != 3:
-        raise ValueError(f"RGB 期望 3D，得到 {rgb.shape}")
-    if rgb.shape[0] == 3:
-        return np.ascontiguousarray(np.transpose(rgb, (1, 2, 0)))
-    if rgb.shape[-1] == 3:
-        return np.ascontiguousarray(rgb)
-    raise ValueError(
-        f"无法识别 RGB 布局: {rgb.shape}，期望 (3,H,W) 或 (H,W,3)"
-    )
+def downsample_label_hr_to_lr(
+    label_hr: np.ndarray, *, show_progress: bool = True
+) -> np.ndarray:
+    """HR (2*H, 2*W) -> LR (H,W)，2×2 众数。"""
+    if show_progress:
+        tqdm.write("标签 HR→LR (2×2 众数)…", file=sys.stderr)
+    h_hr, w_hr = label_hr.shape
+    if h_hr % 2 != 0 or w_hr % 2 != 0:
+        raise ValueError(f"HR 标签高宽须为偶数，当前 {label_hr.shape}")
+    h_lr, w_lr = h_hr // 2, w_hr // 2
+    blocks = label_hr.reshape(h_lr, 2, w_lr, 2).transpose(0, 2, 1, 3)
+    flat = blocks.reshape(h_lr, w_lr, 4)
+    lr = scipy_mode(flat, axis=2, keepdims=False).mode
+    if lr.ndim > 2:
+        lr = np.squeeze(lr, axis=-1)
+    return lr.astype(np.uint8, copy=False)
 
 
-def _rgb_hwc_to_chw_u8(hw: np.ndarray) -> np.ndarray:
-    x = hw.astype(np.float32, copy=False)
-    if x.size and float(np.nanmax(x)) <= 1.5:
-        x = np.clip(x * 255.0, 0.0, 255.0)
-    x = np.clip(np.rint(x), 0, 255).astype(np.uint8, copy=False)
-    return np.ascontiguousarray(np.transpose(x, (2, 0, 1)))
-
-
-def _validate_label_values(
-    label_2d: np.ndarray, num_classes: int, *, fail_on_unseen: bool
-) -> list[int]:
-    """返回前景中出现且不在 1..num_classes 的类别值（去重）。"""
-    u = np.unique(label_2d)
-    u_int = u.astype(np.int64, copy=False)
-    bad: list[int] = []
-    for v in u_int.tolist():
-        if v == 0:
-            continue
-        if v < 1 or v > num_classes:
-            bad.append(int(v))
-    if bad and fail_on_unseen:
-        raise ValueError(
-            f"label 中出现前景类别 {bad!r}，与 --num-classes={num_classes} 不一致"
-        )
-    if bad:
+def align_lr_label_to_hsi_spatial(
+    lr: np.ndarray, hsi_hw: tuple[int, int]
+) -> np.ndarray:
+    """
+    将下采样后的 LR 标签与 HSI 空间维对齐。
+    SZUTree 中 label 与 HSI 的 H/W 轴约定可能互为转置，此时仅对标签转置即可。
+    """
+    h, w = int(hsi_hw[0]), int(hsi_hw[1])
+    if lr.shape == (h, w):
+        return lr
+    if lr.shape == (w, h):
         print(
-            f"[WARN] label 中出现 num_classes 范围外的前景值 {bad!r}；"
-            f"这些像素仍保留，但 build_train_test 仅遍历 1..{num_classes}。",
+            "[INFO] LR 标签与 HSI 空间维为转置关系，已对标签转置以与 HSI/LiDAR 对齐。",
             file=sys.stderr,
         )
-    return bad
+        return np.ascontiguousarray(lr.T)
+    print(
+        f"[WARN] LR 标签 {lr.shape} 与 HSI {(h, w)} 仍不一致，保留原标签；若训练异常请检查坐标系。",
+        file=sys.stderr,
+    )
+    return lr
 
 
 def build_train_test_sparse(
@@ -217,6 +164,10 @@ def build_train_test_sparse(
     *,
     show_progress: bool = True,
 ) -> tuple[sparse.csr_matrix, sparse.csr_matrix]:
+    """
+    对每个类别 c，从该类像素中随机抽取约 train_percent% 进入 train，其余进入 test。
+    train_percent 为「百分数」，例如 1.0 表示 1%。
+    """
     rng = np.random.default_rng(seed)
     h, w = label_lr.shape
     train_r: list[np.ndarray] = []
@@ -255,8 +206,7 @@ def build_train_test_sparse(
             test_v.append(np.full(te.shape[0], c, dtype=np.int32))
 
     if not train_r:
-        raise RuntimeError("train 为空，请检查标签与 train_percent / num_classes")
-
+        raise RuntimeError("train 为空，请检查标签与 train_percent")
     tr_rows = np.concatenate(train_r)
     tr_cols = np.concatenate(train_c)
     tr_data = np.concatenate(train_v)
@@ -275,22 +225,6 @@ def build_train_test_sparse(
         ).tocsr()
 
     return train_mat, test_mat
-
-
-def _per_class_counts(
-    label_2d: np.ndarray, train_sp: sparse.csr_matrix, test_sp: sparse.csr_matrix, num_classes: int
-) -> dict[str, Any]:
-    out: dict[str, Any] = {}
-    for c in range(1, num_classes + 1):
-        n_full = int(np.sum(label_2d == c))
-        n_tr = int(np.sum(train_sp.data == c)) if train_sp.nnz else 0
-        n_te = int(np.sum(test_sp.data == c)) if test_sp.nnz else 0
-        out[str(c)] = {
-            "label_pixels": n_full,
-            "train_sparse_pixels": n_tr,
-            "test_sparse_pixels": n_te,
-        }
-    return out
 
 
 def run_inspect(r1_dir: Path, detail: bool = False) -> None:
@@ -316,7 +250,7 @@ def run_inspect(r1_dir: Path, detail: bool = False) -> None:
                     print("  keys:", list(f.keys()))
                     ds = f["hyperspectral_data_98bands"]
                     print("  hyperspectral_data_98bands shape:", ds.shape, ds.dtype)
-            except OSError as e:
+            except Exception as e:
                 print("  h5py 读取失败:", e)
         elif name == "LiDAR.mat":
             try:
@@ -324,24 +258,26 @@ def run_inspect(r1_dir: Path, detail: bool = False) -> None:
                     print("  keys:", list(f.keys()))
                     ds = f["chm"]
                     print("  chm shape:", ds.shape, ds.dtype)
-            except OSError as e:
+            except Exception as e:
                 print("  h5py 读取失败:", e)
         else:
             try:
                 info = sio.whosmat(str(p))
                 print("  whosmat:", info)
-            except OSError as e:
+            except Exception as e:
                 print("  whosmat 失败:", e)
 
     if lab_p.is_file() and not detail:
-        print("\n提示: 加 --inspect-detail 可加载整幅 label 并统计（较慢）")
+        print("\n提示: 加 --inspect-detail 可加载整幅 label 并统计 LR（较慢）")
     elif lab_p.is_file() and detail:
         y = load_label_mat(lab_p, show_progress=False)
         u, _cnt = np.unique(y, return_counts=True)
         print("\n[label.mat] 详细统计")
-        print("  shape:", y.shape, y.dtype)
+        print("  HR shape:", y.shape)
         print("  唯一值数量:", len(u), "min/max:", int(u.min()), int(u.max()))
-        print("  前景像素 (label>0):", int((y > 0).sum()))
+        lr = downsample_label_hr_to_lr(y, show_progress=False)
+        print("  LR (2×2 众数) shape:", lr.shape)
+        print("  LR 前景类像素 (label>0):", int((lr > 0).sum()))
 
 
 def run_export(
@@ -350,111 +286,52 @@ def run_export(
     train_percent: float,
     seed: int,
     num_classes: int,
-    hsi_bands: int,
     save_train_test_dense: bool,
-    fail_on_unseen_label_class: bool,
     *,
     show_progress: bool = True,
 ) -> None:
-    label_raw = load_label_mat(r1_dir / "label.mat", show_progress=show_progress)
-    if label_raw.ndim != 2:
-        raise ValueError(f"label 须为 2D，得到 shape={label_raw.shape}")
-    if not np.isfinite(label_raw).all():
-        raise ValueError("label 含 NaN/Inf")
-    label_2d = label_raw.astype(np.int32, copy=False)
-    ref_h, ref_w = int(label_2d.shape[0]), int(label_2d.shape[1])
+    hsi = load_hsi_h5(r1_dir / "HSI.mat", show_progress=show_progress)
+    lidar = load_lidar_h5(r1_dir / "LiDAR.mat", show_progress=show_progress)
+    rgb = load_rgb_mat(r1_dir / "RGB.mat", show_progress=show_progress)
+    label_hr = load_label_mat(r1_dir / "label.mat", show_progress=show_progress)
 
-    hsi_0 = load_hsi_h5(
-        r1_dir / "HSI.mat", hsi_bands=hsi_bands, show_progress=show_progress
-    )
-    if hsi_0.shape[2] != hsi_bands:
-        raise ValueError(f"HSI 波段数 {hsi_0.shape[2]} 与 hsi_bands={hsi_bands} 不一致")
-    lidar_0 = load_lidar_h5(r1_dir / "LiDAR.mat", show_progress=show_progress)
-    rgb_0 = load_rgb_mat(r1_dir / "RGB.mat", show_progress=show_progress)
-    rgb_in_layout = "CHW" if rgb_0.ndim == 3 and rgb_0.shape[0] == 3 else "HWC"
-    rgb_hw_0 = _rgb_to_hwc(rgb_0)
-
-    meta: dict[str, Any] = {
-        "schema": "szutree_r1",
-        "interpolation": "scipy.ndimage.zoom order=1, mode=nearest; labels untouched",
-        "label_shape": [ref_h, ref_w],
-        "hsi": {
-            "in_shape": list(hsi_0.shape),
-            "out_shape": [ref_h, ref_w, hsi_bands],
-            "resampled": [hsi_0.shape[0], hsi_0.shape[1]] != [ref_h, ref_w],
-        },
-        "lidar": {
-            "in_shape": list(lidar_0.shape),
-            "out_shape": [ref_h, ref_w, 1],
-            "resampled": [lidar_0.shape[0], lidar_0.shape[1]] != [ref_h, ref_w],
-        },
-        "rgb": {
-            "in_shape": list(rgb_0.shape),
-            "in_layout": rgb_in_layout,
-            "out_shape": [3, ref_h, ref_w],
-            "resampled": [rgb_hw_0.shape[0], rgb_hw_0.shape[1]] != [ref_h, ref_w],
-        },
-    }
-
-    _validate_label_values(
-        label_2d, num_classes, fail_on_unseen=fail_on_unseen_label_class
-    )
-
-    hsi = _resize_spatial_hwc(
-        hsi_0, ref_h, ref_w, order=1
-    ).astype(np.float32, copy=False)
-    lidar = _resize_spatial_hwc(
-        lidar_0, ref_h, ref_w, order=1
-    ).astype(np.float32, copy=False)
-    rgb_hw = _resize_spatial_hwc(
-        rgb_hw_0, ref_h, ref_w, order=1
-    )
-
-    if EXPORT_TOP_LEFT_QUARTER:
-        full_h, full_w = ref_h, ref_w
-        ch, cw = full_h // 2, full_w // 2
-        if ch < 1 or cw < 1:
-            raise ValueError(
-                f"左上四分之一裁剪后尺寸无效: full=({full_h},{full_w}) -> ({ch},{cw})"
-            )
-        meta["spatial_crop"] = {
-            "type": "top_left_quarter",
-            "full_label_shape": [full_h, full_w],
-            "crop_rows": [0, ch],
-            "crop_cols": [0, cw],
-            "no_halo": True,
-            "edge_note": "裁剪后边界由 pipeline/data.PatchDataset 零填充",
-        }
-        label_2d = np.ascontiguousarray(label_2d[:ch, :cw])
-        hsi = np.ascontiguousarray(hsi[:ch, :cw, :])
-        lidar = np.ascontiguousarray(lidar[:ch, :cw, :])
-        rgb_hw = np.ascontiguousarray(rgb_hw[:ch, :cw, :])
-        ref_h, ref_w = ch, cw
-        meta["label_shape"] = [ref_h, ref_w]
-        meta["hsi"]["out_shape"] = [ref_h, ref_w, hsi_bands]
-        meta["lidar"]["out_shape"] = [ref_h, ref_w, 1]
-        meta["rgb"]["out_shape"] = [3, ref_h, ref_w]
-
-    rgb_out = _rgb_hwc_to_chw_u8(rgb_hw)
+    if lidar.shape[:2] != hsi.shape[:2]:
+        raise ValueError(f"HSI 与 LiDAR 空间尺寸不一致: hsi {hsi.shape[:2]} vs lidar {lidar.shape[:2]}")
+    lr_ds = downsample_label_hr_to_lr(label_hr, show_progress=show_progress)
+    lr_before = lr_ds.shape
+    lr = align_lr_label_to_hsi_spatial(lr_ds, hsi.shape[:2])
+    if lr.shape != hsi.shape[:2]:
+        raise ValueError(
+            f"LR 标签 {lr_before} 对齐后 {lr.shape}，仍与 HSI {hsi.shape[:2]} 不一致"
+            "（需为同一形状或互为转置）"
+        )
+    # 仅当 LR 标签下采样后与 HSI 互为转置、经 align 后已对齐时，对 RGB 做 (3,H,W)->(3,W,H)
+    if lr_before != hsi.shape[:2] and lr.shape == hsi.shape[:2]:
+        rgb = np.ascontiguousarray(np.transpose(rgb, (0, 2, 1)))
+        print(
+            "[INFO] 已对 RGB 作空间维转置，使 HR 行/列 = 2×HSI 行/列。",
+            file=sys.stderr,
+        )
 
     train_sp, test_sp = build_train_test_sparse(
-        label_2d,
+        lr,
         train_percent,
         seed,
         num_classes,
         show_progress=show_progress,
     )
 
-    meta["train_test_split"] = {
-        "seed": int(seed),
-        "train_percent_per_class": float(train_percent),
-        "per_class": _per_class_counts(label_2d, train_sp, test_sp, num_classes),
-    }
-    meta["train_nnz"] = int(train_sp.nnz)
-    meta["test_nnz"] = int(test_sp.nnz)
+    if rgb.ndim != 3 or rgb.shape[0] != 3:
+        raise ValueError(f"RGB 期望 (3,H,W)，得到 {rgb.shape}")
+    rh, rw = int(rgb.shape[1]), int(rgb.shape[2])
+    if rh != lr.shape[0] * 2 or rw != lr.shape[1] * 2:
+        print(
+            f"[WARN] RGB {rh}x{rw} 与 LR×2 {lr.shape[0]*2}x{lr.shape[1]*2} 不完全一致，"
+            "data_prepare 会按块均值对齐到 LR。",
+            file=sys.stderr,
+        )
 
     out_mat.parent.mkdir(parents=True, exist_ok=True)
-    meta_path = out_mat.with_name(out_mat.stem + ".meta.json")
 
     if save_train_test_dense:
         if show_progress:
@@ -464,125 +341,42 @@ def run_export(
             )
         train_arr = train_sp.toarray()
         test_arr = test_sp.toarray()
-        payload: dict[str, Any] = {
-            "hsi": hsi,
-            "lidar": lidar,
-            "rgb": rgb_out,
+        payload = {
+            "hsi": hsi.astype(np.float32, copy=False),
+            "lidar": lidar.astype(np.float32, copy=False),
+            "rgb": rgb.astype(np.uint8, copy=False),
             "train": train_arr,
             "test": test_arr,
         }
     else:
-        train_arr = None
-        test_arr = None
         payload = {
-            "hsi": hsi,
-            "lidar": lidar,
-            "rgb": rgb_out,
+            "hsi": hsi.astype(np.float32, copy=False),
+            "lidar": lidar.astype(np.float32, copy=False),
+            "rgb": rgb.astype(np.uint8, copy=False),
             "train": train_sp,
             "test": test_sp,
         }
 
-    if save_train_test_dense and train_arr is not None and test_arr is not None:
-        est_b = int(
-            hsi.nbytes
-            + lidar.nbytes
-            + rgb_out.nbytes
-            + train_arr.nbytes
-            + test_arr.nbytes
-        )
-    else:
-        est_b = int(
-            hsi.nbytes
-            + lidar.nbytes
-            + rgb_out.nbytes
-            + train_sp.data.nbytes
-            + train_sp.indices.nbytes
-            + train_sp.indptr.nbytes
-            + test_sp.data.nbytes
-            + test_sp.indices.nbytes
-            + test_sp.indptr.nbytes
-        )
-    meta["est_payload_bytes"] = est_b
-
-    out_written: Path
-    try:
-        if show_progress:
-            with tqdm(
-                total=1,
-                desc=f"写入 {out_mat.name}",
-                dynamic_ncols=True,
-            ) as pbar:
-                sio.savemat(str(out_mat), payload, do_compression=True)
-                pbar.update(1)
-        else:
-            print(f"写入 {out_mat} ...")
+    if show_progress:
+        with tqdm(
+            total=1,
+            desc=f"写入 {out_mat.name}",
+            dynamic_ncols=True,
+        ) as pbar:
             sio.savemat(str(out_mat), payload, do_compression=True)
-        meta["storage"] = "mat_v5"
-        meta["output_file"] = str(out_mat.resolve())
-        out_written = out_mat
-    except OverflowError:
-        out_npz = out_mat.with_suffix(".npz")
-        if show_progress:
-            tqdm.write(
-                f"MAT v5 单块 ≤4GB 限制，改存 {out_npz.name}（NumPy 压缩包）…",
-                file=sys.stderr,
-            )
-        else:
-            print(
-                f"savemat 超出 MAT v5 单块限制，改存 {out_npz} …",
-                file=sys.stderr,
-            )
-        if save_train_test_dense and train_arr is not None and test_arr is not None:
-            np.savez_compressed(
-                out_npz,
-                hsi=hsi,
-                lidar=lidar,
-                rgb=rgb_out,
-                train=train_arr,
-                test=test_arr,
-            )
-        else:
-            np.savez_compressed(
-                out_npz,
-                hsi=hsi,
-                lidar=lidar,
-                rgb=rgb_out,
-                train_data=train_sp.data,
-                train_indices=train_sp.indices,
-                train_indptr=train_sp.indptr,
-                train_shape=np.asarray(train_sp.shape, dtype=np.int64),
-                test_data=test_sp.data,
-                test_indices=test_sp.indices,
-                test_indptr=test_sp.indptr,
-                test_shape=np.asarray(test_sp.shape, dtype=np.int64),
-            )
-        meta["storage"] = "npz"
-        meta["output_file"] = str(out_npz.resolve())
-        out_written = out_npz
-        if out_mat.exists():
-            out_mat.unlink()
-
-    meta["output_mat"] = str(out_mat.resolve())
-    meta_path.write_text(
-        json.dumps(meta, indent=2, ensure_ascii=False) + "\n",
-        encoding="utf-8",
-    )
-
+            pbar.update(1)
+    else:
+        print(f"写入 {out_mat} ...")
+        sio.savemat(str(out_mat), payload, do_compression=True)
     print(
-        f"完成: {out_written}\n  meta: {meta_path}\n"
-        f"  HSI 波段数={hsi_bands}，请同步 param / data_prepare 的 HSI_CHANNELS。\n"
-        f"  train 非零: {train_sp.nnz}, test 非零: {test_sp.nnz}"
+        "完成。HSI 为 98 波段、无 PCA。"
+        " 运行 data_prepare 与训练前请设置: MMDIFF_HSI_CHANNELS=98"
     )
-    print(
-        f"  最终: hsi {hsi.shape} lidar {lidar.shape} rgb {rgb_out.shape} "
-        f"label {label_2d.shape}"
-    )
+    print(f"  train 非零: {train_sp.nnz}, test 非零: {test_sp.nnz}")
 
 
 def main() -> None:
-    p = argparse.ArgumentParser(
-        description="SZUTree R1 -> szutree_r1.mat（标签栅格不动，仅重采样影像）"
-    )
+    p = argparse.ArgumentParser(description="SZUTree R1 -> houston2018 兼容 .mat（无 PCA）")
     p.add_argument(
         "--r1-dir",
         type=Path,
@@ -593,47 +387,35 @@ def main() -> None:
         "--out",
         type=Path,
         default=None,
-        help="输出 .mat 路径（默认由 EXPORT_TOP_LEFT_QUARTER 决定 szutree_tlq 或 szutree）",
+        help="输出 houston2018.mat 路径（默认 autodl-fs/houston2018/houston2018.mat）",
     )
-    p.add_argument("--inspect", action="store_true", help="仅检查并打印信息")
+    p.add_argument("--inspect", action="store_true", help="仅检查并打印信息（快速，不加载整幅标签）")
     p.add_argument(
         "--inspect-detail",
         action="store_true",
-        help="与 --inspect 合用：加载整幅 label 并统计",
+        help="与 --inspect 合用：加载 label 并做 LR 统计（较慢）",
     )
-    p.add_argument("--export", action="store_true", help="导出总 .mat + .meta.json")
+    p.add_argument("--export", action="store_true", help="导出总 .mat")
     p.add_argument(
         "--train-percent-per-class",
         type=float,
         default=1.0,
-        help="每类训练像素占该类总像素的百分比，例如 1.0 表示 1%%",
+        help="每类抽取训练像素占该类总像素的百分比，例如 1.0 表示 1%%",
     )
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--num-classes", type=int, default=20)
     p.add_argument(
-        "--hsi-bands",
-        type=int,
-        default=None,
-        help="HSI 波段数；默认 MMDIFF_HSI_CHANNELS 或 98",
-    )
-    p.add_argument(
-        "--fail-on-unseen-label",
-        action="store_true",
-        help="若 label 前景值不在 1..num_classes 则直接报错",
-    )
-    p.add_argument(
         "--train-test-dense",
         action="store_true",
-        help="train/test 以稠密保存（大；默认稀疏）",
+        help="train/test 以稠密矩阵保存（文件更大；默认稀疏）",
     )
     p.add_argument(
         "--no-progress",
         action="store_true",
-        help="关闭 tqdm 进度条",
+        help="关闭 tqdm 进度条（日志/重定向时更干净）",
     )
     args = p.parse_args()
     out_path = args.out if args.out is not None else _default_out_mat()
-    hsi_b = args.hsi_bands if args.hsi_bands is not None else _int_env("MMDIFF_HSI_CHANNELS", 98)
 
     if args.inspect:
         run_inspect(args.r1_dir, detail=args.inspect_detail)
@@ -645,9 +427,7 @@ def main() -> None:
             train_percent=args.train_percent_per_class,
             seed=args.seed,
             num_classes=args.num_classes,
-            hsi_bands=hsi_b,
             save_train_test_dense=args.train_test_dense,
-            fail_on_unseen_label_class=bool(args.fail_on_unseen_label),
             show_progress=not args.no_progress,
         )
         return

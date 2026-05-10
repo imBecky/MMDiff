@@ -35,8 +35,8 @@ def _discover_checkpoints(run_dir: Path) -> List[Tuple[int, Path]]:
             continue
         
         step = int(m.group(1))
-        if step < 150 and step > 210:
-            continue
+        # if step < 150 or step > 210:
+        #     continue
         
         rows.append((step, ckpt_file))
     rows.sort(key=lambda x: x[0])

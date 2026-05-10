@@ -269,6 +269,10 @@ class MultimodalClassifier(nn.Module):
         hsi_residual_blocks = int(proj_cfg.get('hsi_residual_blocks') or 2)
         hsi_agg_mode = str(proj_cfg.get('hsi_agg_mode') or 'multi_token').strip().lower()
 
+        # ====== 写死 Query 容量 ======
+        self.query_tokens_per_query = 4          # 每个 query 由 4 个 token 组成
+        qk = self.query_tokens_per_query
+
         self.rgb_num_tokens = 1 if self.use_rgb else 0
         self.rgb_student: Optional[LightweightRgbEncoder] = None
         if self.use_rgb:
@@ -330,11 +334,12 @@ class MultimodalClassifier(nn.Module):
         )
         n_lidar = 1 if self.use_lidar else 0
         self.mem_len = n_hsi + n_rgb + n_lidar  # 启用模态 token 拼接长度
-        self.seq_len = 2 + self.mem_len
+        self.seq_len = 2 * qk + self.mem_len     # 更新总长度
         self.pos_embed_mem = nn.Parameter(torch.randn(1, self.mem_len, d_model))
-        self.global_cls = nn.Parameter(torch.randn(1, 1, d_model))
-        self.center_cls = nn.Parameter(torch.randn(1, 1, d_model))
-        self.pos_embed_tgt = nn.Parameter(torch.randn(1, 2, d_model))
+        # 多 token 的 query 参数
+        self.global_cls = nn.Parameter(torch.randn(1, qk, d_model))
+        self.center_cls = nn.Parameter(torch.randn(1, qk, d_model))
+        self.pos_embed_tgt = nn.Parameter(torch.randn(1, 2 * qk, d_model))
         dec_layer = nn.TransformerDecoderLayer(
             d_model=d_model,
             nhead=nhead,
@@ -479,12 +484,18 @@ class MultimodalClassifier(nn.Module):
         if memory.shape[1] != self.mem_len:
             raise RuntimeError(f'memory 长度 {memory.shape[1]} 与预期 {self.mem_len} 不一致')
         memory = memory + self.pos_embed_mem
-        g_cls = self.global_cls.expand(b, -1, -1)
-        c_cls = self.center_cls.expand(b, -1, -1)
-        tgt = torch.cat([g_cls, c_cls], dim=1)
+
+        qk = self.query_tokens_per_query
+        g_tokens = self.global_cls.expand(b, -1, -1)   # (B, qk, d)
+        c_tokens = self.center_cls.expand(b, -1, -1)   # (B, qk, d)
+        tgt = torch.cat([g_tokens, c_tokens], dim=1)    # (B, 2*qk, d)
         tgt = tgt + self.pos_embed_tgt
-        out = self.decoder(tgt, memory)
-        return out[:, 0], out[:, 1]
+
+        out = self.decoder(tgt, memory)                 # (B, 2*qk, d)
+
+        global_rep = out[:, :qk, :].mean(dim=1)         # 平均池化 global 的 token
+        center_rep = out[:, qk:, :].mean(dim=1)         # 平均池化 center 的 token
+        return global_rep, center_rep
 
     def forward(
         self,

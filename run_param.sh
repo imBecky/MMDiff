@@ -21,21 +21,13 @@ LIDAR_EXTRA_BLOCKS="2"
 CLS_TRANSFORMER_LAYERS="1"
 CLS_TRANSFORMER_FF_DIM="384"
 
-# 只保留三组超参数实验
-PATCH_CASES=(
-  "patch_p09|9"
-  "patch_p11|11"
-  "patch_p13|13"
-)
+# 只保留 Loss 权重消融：中心权重=0.66/0.68/0.72/0.74/0.76，全局=1-中心
 LOSS_CASES=(
-  "loss_g01_c09|0.1|0.9"
-  "loss_g02_c08|0.2|0.8"
-  "loss_g03_c07|0.3|0.7"
-)
-EMBED_CASES=(
-  "embed_t256_h256|256|256"
-  "embed_t320_h320|320|320"
-  "embed_t384_h384|384|384"
+  "loss_g034_c066|0.34|0.66"
+  "loss_g032_c068|0.32|0.68"
+  "loss_g028_c072|0.28|0.72"
+  "loss_g026_c074|0.26|0.74"
+  "loss_g024_c076|0.24|0.76"
 )
 
 clear_case_env() {
@@ -63,6 +55,17 @@ set_fixed_env() {
   export MMDIFF_CLS_TRANSFORMER_FF_DIM="${CLS_TRANSFORMER_FF_DIM}"
 }
 
+do_shutdown() {
+  sleep 3
+  local _i
+  curl "https://sctapi.ftqq.com/SCT313662TGZ7JRPbisBQfDZbabO1Kmmdt.send?title=训练完成&desp=Python脚本已执行完毕channel=9"
+  for _i in 1 2 3 4 5 6 7 8 9; do
+    /usr/bin/shutdown
+    sleep 3
+  done
+  curl -fsS "https://sctapi.ftqq.com/SCT313662TGZ7JRPbisBQfDZbabO1Kmmdt.send?title=服务器关闭失败&desp=服务器关闭失败channel=9"
+}
+
 run_case() {
   local seed="$1"
   local tag="$2"
@@ -81,30 +84,18 @@ run_case() {
 }
 
 main() {
-  local seed item tag p wg wc td hh
-  echo "========== 仅超参数实验：patch / loss / embed =========="
+  local seed item tag wg wc
+  echo "========== 仅 Loss 权重消融（全局=1-中心） =========="
   for seed in "${SEEDS[@]}"; do
     echo "==================== seed=${seed} ===================="
-
-    for item in "${PATCH_CASES[@]}"; do
-      IFS="|" read -r tag p <<< "${item}"
-      run_case "${seed}" "${tag}" "MMDIFF_PATCH_WINDOW_SIZE=${p}"
-    done
-
     for item in "${LOSS_CASES[@]}"; do
       IFS="|" read -r tag wg wc <<< "${item}"
       run_case "${seed}" "${tag}" \
         "MMDIFF_LOSS_WEIGHT_GLOBAL=${wg}" \
         "MMDIFF_LOSS_WEIGHT_CENTER=${wc}"
     done
-
-    for item in "${EMBED_CASES[@]}"; do
-      IFS="|" read -r tag td hh <<< "${item}"
-      run_case "${seed}" "${tag}" \
-        "MMDIFF_CLS_TOKEN_DIM=${td}" \
-        "MMDIFF_CLS_HEAD_HIDDEN=${hh}"
-    done
   done
 }
 
 main
+do_shutdown

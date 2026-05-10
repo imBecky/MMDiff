@@ -2,10 +2,6 @@
 """
 对 prepared 数据做快速体检：形状/类型/范围/标签分布，并输出预览图。
 
-HSI 预览为「假彩」：`train_patches` 里光谱已按 `data_prepare` 做**逐通道** min-max，
-不是物理反射率；颜色取决于 `--hsi-bands` 三波段如何映射到 RGB。树种在自然 RGB 下偏绿，
-请对照 `fig01`/`fig02` 右侧或 `train_rgb_patches`（光学 RGB），勿仅凭假彩判断数据错误。
-
 默认将报告与图保存到与 param 中 autodl 路径风格一致的 ../../autodl-tmp/data_report_prepared。
 
 用法（仓库根目录）:
@@ -74,21 +70,6 @@ def _safe_stat(name: str, arr: np.ndarray, max_sample: int) -> Dict[str, Any]:
         "std": float(np.std(sample)),
         "subsampled": n > max_sample,
     }
-
-
-def _check_index_bounds(
-    labels: np.ndarray, grid_h: int, grid_w: int, name: str
-) -> Optional[str]:
-    """row/col 须在 [0,H), [0,W)。"""
-    if labels.size == 0:
-        return None
-    rmin, rmax = int(labels[:, 1].min()), int(labels[:, 1].max())
-    cmin, cmax = int(labels[:, 2].min()), int(labels[:, 2].max())
-    if rmin < 0 or cmin < 0 or rmax >= grid_h or cmax >= grid_w:
-        return (
-            f"{name}: row in [{rmin},{rmax}] col in [{cmin},{cmax}] 与栅格 (H,W)=({grid_h},{grid_w}) 不兼容"
-        )
-    return None
 
 
 def _label_report(labels: np.ndarray, num_classes: int, name: str) -> Dict[str, Any]:
@@ -164,7 +145,6 @@ def _fig_patches(
     window: int,
     n_show: int,
     seed: int,
-    band_triplet: Tuple[int, int, int],
     out_path: Path,
 ) -> None:
     import matplotlib
@@ -184,7 +164,7 @@ def _fig_patches(
     fig, axes = plt.subplots(m, m, figsize=(2.2 * m, 2.2 * m))
     axes = np.atleast_2d(axes)
     flat = axes.ravel()
-    b0, b1, b2 = [min(max(0, b), hsi_ch - 1) for b in band_triplet]
+    t0, t1, t2 = hsi_ch // 4, hsi_ch // 2, (3 * hsi_ch) // 4
 
     for k in range(m * m):
         ax = flat[k]
@@ -197,18 +177,14 @@ def _fig_patches(
         r0, r1 = max(0, row - half), min(h, row + half + 1)
         c0, c1 = max(0, col - half), min(w, col + half + 1)
         ph = feats_hwc[r0:r1, c0:c1, :hsi_ch]
-        patch = np.stack([ph[:, :, b2], ph[:, :, b1], ph[:, :, b0]], axis=2)
+        patch = np.stack([ph[:, :, t2], ph[:, :, t1], ph[:, :, t0]], axis=2)
         pu = _to_uint8_image(patch)
         pad = np.zeros((window, window, 3), dtype=np.uint8)
         pad[: pu.shape[0], : pu.shape[1], :] = pu
         ax.imshow(pad)
         ax.set_title(f"cls {lab} @({row},{col})", fontsize=7)
         ax.axis("off")
-    plt.suptitle(
-        f"随机 {n} 个像元: HSI 假彩 {window}×{window} patch "
-        f"(R,G,B←band {b0},{b1},{b2}；与 fig01 一致；非真彩色)",
-        fontsize=9,
-    )
+    plt.suptitle(f"随机 {n} 个像元: HSI 假彩 {window}×{window} patch", fontsize=10)
     plt.tight_layout()
     fig.savefig(out_path, dpi=120, bbox_inches="tight")
     plt.close(fig)
@@ -237,7 +213,7 @@ def main() -> int:
     parser.add_argument(
         "--data-dir",
         type=str,
-        default="",
+        default="../../autodl-fs/houston2018/prepared",
         help="prepared 目录；默认同 param.DATA_DIR 或环境变量 MMDIFF_DATA_DIR",
     )
     parser.add_argument(
@@ -252,7 +228,7 @@ def main() -> int:
         "--hsi-bands",
         type=str,
         default="29,19,9",
-        help="HSI 假彩三波段 (b0,b1,b2)，逗号分隔；fig01 与 fig02 patch 均用此组合（须在 [0,HSI-1]）",
+        help="整幅 HSI 假彩三波段索引，逗号分隔，须在 [0, HSI-1]",
     )
     args = parser.parse_args()
 
@@ -330,7 +306,7 @@ def main() -> int:
         report[key] = _label_report(lab, param.NUM_CLASSES, key)
         text.append(
             f"[OK] {key}: n={report[key]['n']} 类数(出现)={len(report[key]['per_class_count'])} "
-            f"row{report[key]['row_range']} col{report[key].get('col_range', 'n/a')}"
+            f"row{report[key]['row_range']}"
         )
 
     if param.LABEL_SHIFT_PATH.is_file():
@@ -346,36 +322,6 @@ def main() -> int:
         report["rgb_hr_meta"] = json.loads(param.RGB_HR_META_PATH.read_text(encoding="utf-8"))
         m = report["rgb_hr_meta"]
         text.append(f"[OK] rgb_hr meta: rh={m.get('rh')} rw={m.get('rw')}")
-
-    if tp.is_file() and tr.is_file() and param.TRAIN_LABELS_PATH.is_file() and param.TEST_LABELS_PATH.is_file():
-        mm0 = open_mmap(tp)
-        g_h, g_w = int(mm0.shape[0]), int(mm0.shape[1])
-        rgw = open_mmap(tr)
-        if (rgw.shape[0], rgw.shape[1]) != (g_h, g_w):
-            msg = (
-                f"[FAIL] train_patches 空间 {g_h}x{g_w} 与 train_rgb {rgw.shape[0]}x{rgw.shape[1]} 不一致"
-            )
-            text.append(msg)
-            report["shape_check"] = msg
-        else:
-            text.append(
-                f"[OK] 空间一致: train_patches 与 train_rgb 均为 (H,W,*) = ({g_h},{g_w},*)"
-            )
-            report["grid_hw"] = [g_h, g_w]
-        for key, pth in (("train_labels", param.TRAIN_LABELS_PATH), ("test_labels", param.TEST_LABELS_PATH)):
-            lab = np.load(str(pth))
-            err = _check_index_bounds(lab, g_h, g_w, key)
-            if err:
-                text.append(f"[FAIL] {err}")
-                report[f"{key}_bounds"] = err
-            else:
-                text.append(
-                    f"[OK] {key} 坐标在栅格内: H={g_h} W={g_w} "
-                    f"row{[int(lab[:,1].min()), int(lab[:,1].max())]} col{[int(lab[:,2].min()), int(lab[:,2].max())]}"
-                )
-                report[f"{key}_bounds"] = "ok"
-    else:
-        text.append("[跳过] 越界/一致检查: 需 train_patches、train_rgb、train_labels、test_labels 均存在")
 
     text.extend(
         [
@@ -419,7 +365,6 @@ def main() -> int:
             int(param.PATCH_WINDOW_SIZE),
             9,
             0,
-            band_triplet,
             out / "fig02_sample_patches_hsi.png",
         )
         print(f"作图: {out / 'fig02_sample_patches_hsi.png'}")
