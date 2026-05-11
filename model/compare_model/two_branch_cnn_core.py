@@ -169,10 +169,7 @@ class TwoBranchHSIStage(nn.Module):
         self,
         data_dict: dict,
         return_center_logits: bool = False,
-        return_supcon_proj: bool = False,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        if return_supcon_proj:
-            raise RuntimeError('Two-branch HSI 阶段未启用 SupCon')
         hsi = data_dict['hsi']
         _, _, h, w = hsi.shape
         cy, cx = h // 2, w // 2
@@ -204,10 +201,7 @@ class TwoBranchLiDARStage(nn.Module):
         self,
         data_dict: dict,
         return_center_logits: bool = False,
-        return_supcon_proj: bool = False,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        if return_supcon_proj:
-            raise RuntimeError('Two-branch LiDAR 阶段未启用 SupCon')
         x = self.lidar_net(data_dict['lidar'])
         x = self.drop(x)
         logits = self.fc(x)

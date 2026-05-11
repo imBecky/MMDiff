@@ -300,6 +300,13 @@ class MultimodalClassifier(nn.Module):
         self.center_distance_bias_alpha = float(
             cls_cfg.get("center_distance_bias_alpha") or 0.2
         )
+        self.center_distance_bias_tau = float(
+            cls_cfg.get("center_distance_bias_tau") or 2.0
+        )
+        if self.center_distance_bias_tau <= 0.0:
+            raise ValueError(
+                f"center_distance_bias_tau 须 > 0，当前 {self.center_distance_bias_tau}"
+            )
 
         lidar_hidden = int(proj_cfg.get("lidar_hidden") or 16)
         lidar_extra_blocks = int(proj_cfg.get("lidar_extra_blocks") or 0)
@@ -406,25 +413,12 @@ class MultimodalClassifier(nn.Module):
         self.global_head = ClassifierHead(d_model, head_hidden, self.num_classes)
         self.center_head = ClassifierHead(d_model, head_hidden, self.num_classes)
 
-        self.use_supcon = bool(cls_cfg.get("use_supcon", False))
-        supcon_dim = int(cls_cfg.get("supcon_proj_dim") or 128)
-        if self.use_supcon:
-            self.supcon_proj = nn.Sequential(
-                nn.Linear(d_model, d_model),
-                nn.ReLU(inplace=True),
-                nn.Linear(d_model, supcon_dim),
-            )
-        else:
-            self.supcon_proj = None
-
         proj_dict = {
             "hsi": self.hsi_encoder,
             "lidar": self.lidar_encoder,
         }
         if self.use_rgb:
             proj_dict["rgb"] = self.rgb_student
-        if self.use_supcon and self.supcon_proj is not None:
-            proj_dict["supcon"] = self.supcon_proj
         self.projections = nn.ModuleDict(proj_dict)
 
         self._init_weights(
@@ -446,11 +440,15 @@ class MultimodalClassifier(nn.Module):
         return self.spatial_bn_up(x)
 
     def _build_cross_attn_logit_bias(self, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
-        """(1,1,Lq,mem_len)，仅 center query 行非零。"""
+        """(1,1,Lq,mem_len)，仅 center query 行非零。
+
+        bias = alpha * exp(-dist / tau)
+        含义：中心处获得最大 logit 奖励 alpha，随距离指数衰减；tau 越大衰减越慢。
+        """
         qk = self.query_tokens_per_query
         mem_len = self.mem_len
         dist = self._spatial_dist_mem.to(device=device, dtype=dtype)
-        b1d = -self.center_distance_bias_alpha * dist
+        b1d = self.center_distance_bias_alpha * torch.exp(-dist / self.center_distance_bias_tau)
         m = torch.zeros(2 * qk, mem_len, device=device, dtype=dtype)
         m[qk : 2 * qk, :] = b1d.unsqueeze(0).expand(qk, -1)
         return m.unsqueeze(0).unsqueeze(0)
@@ -572,27 +570,12 @@ class MultimodalClassifier(nn.Module):
         self,
         data_dict: Dict[str, torch.Tensor],
         return_center_logits: bool = False,
-        return_supcon_proj: bool = False,
-    ) -> Union[
-        torch.Tensor,
-        Tuple[torch.Tensor, torch.Tensor],
-        Tuple[torch.Tensor, torch.Tensor, torch.Tensor],
-    ]:
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         g_rep, c_rep = self._forward_tokens(data_dict)
         logits_g = self.global_head(g_rep)
         logits_c = self.center_head(c_rep)
-        z = None
-        if return_supcon_proj:
-            if self.supcon_proj is None:
-                raise RuntimeError("return_supcon_proj=True 但 model_cls.use_supcon 未启用")
-            z = self.supcon_proj(c_rep)
-
         if return_center_logits:
-            if return_supcon_proj:
-                return logits_g, logits_c, z
             return logits_g, logits_c
-        if return_supcon_proj:
-            return logits_c, z
         return logits_c
 
 

@@ -39,8 +39,6 @@ from param import (
     RUN_NAME_PREFIX,
     SAVE_EVERY_EPOCH,
     STUDENT_SIZE,
-    SUPCON_TEMPERATURE,
-    SUPCON_WEIGHT,
     TB_LOG_ROOT,
     TEST_LABELS_PATH,
     TEST_PATCHES_PATH,
@@ -51,7 +49,6 @@ from param import (
     TRAIN_ROT_AUGMENT_FACTOR,
     USE_CENTER_LOSS,
     USE_RGB_PATCHES,
-    USE_SUPCON,
     VAL_RATIO,
     WEIGHT_DECAY,
     opt,
@@ -387,9 +384,6 @@ def log_config(
                 f'USE_CENTER_LOSS: {USE_CENTER_LOSS}',
                 f'LOSS_WEIGHT_GLOBAL: {LOSS_WEIGHT_GLOBAL}',
                 f'LOSS_WEIGHT_CENTER: {LOSS_WEIGHT_CENTER}',
-                f'USE_SUPCON: {USE_SUPCON}',
-                f'SUPCON_WEIGHT: {SUPCON_WEIGHT}',
-                f'SUPCON_TEMPERATURE: {SUPCON_TEMPERATURE}',
                 f'EVAL_MIN_TRAIN_ACC: {EVAL_MIN_TRAIN_ACC}',
                 f'EVAL_INTERVAL_EPOCHS: {EVAL_INTERVAL_EPOCHS}',
                 f'EVAL_VAL_START_EPOCH: {EVAL_VAL_START_EPOCH}',
@@ -593,14 +587,11 @@ def log_model_and_training_detail(
         optim_cfg.get('betas'),
     )
     logger.info(
-        'effective clip_grad (runner)=%s | center_loss=%s w_global=%s w_center=%s supcon=%s supcon_w=%s tau=%s',
+        'effective clip_grad (runner)=%s | center_loss=%s w_global=%s w_center=%s',
         clip_grad_norm,
         USE_CENTER_LOSS,
         LOSS_WEIGHT_GLOBAL,
         LOSS_WEIGHT_CENTER,
-        USE_SUPCON,
-        SUPCON_WEIGHT,
-        SUPCON_TEMPERATURE,
     )
     logger.info('lr_scheduler (opt train.scheduler)=%s', sched_cfg)
     logger.info(

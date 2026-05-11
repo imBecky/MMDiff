@@ -1,5 +1,5 @@
 """
-对比实验入口：与主训练隔离，仅通过环境变量 MMDIFF_COMPARE_RUN=1 关闭 SupCon / 双头 CE。
+对比实验入口：与主训练隔离，仅通过环境变量 MMDIFF_COMPARE_RUN=1 进入对比流程。
 
 用法（仓库根目录）：
   python utils/main_compare.py --model fgcnn
@@ -32,7 +32,6 @@ if not _omp.isdigit() or int(_omp) <= 0:
 
 def _bootstrap_env():
     os.environ['MMDIFF_COMPARE_RUN'] = '1'
-    os.environ.setdefault('MMDIFF_USE_SUPCON', '0')
 
 
 def main():

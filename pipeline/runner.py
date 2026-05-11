@@ -40,7 +40,6 @@ from param import (
     TRAIN_QUICK_VERIFY_SAMPLES_PER_CLASS,
     USE_CENTER_LOSS,
     USE_RGB_PATCHES,
-    USE_SUPCON,
     VAL_RATIO,
     opt,
 )
@@ -926,7 +925,7 @@ def verify_projection_gradients(create_classifier: CreateClassifierFn) -> None:
     optimizer = model.optimizer
     model.train()
     batch = next(iter(train_loader))
-    data_dict, labels = batch_to_dict(batch, device, USE_RGB_PATCHES, USE_SUPCON)
+    data_dict, labels = batch_to_dict(batch, device, USE_RGB_PATCHES)
     optimizer.zero_grad()
     loss, _, _ = compute_classification_loss(model, data_dict, labels, loss_fn)
     loss.backward()

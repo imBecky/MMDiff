@@ -15,7 +15,7 @@ class CompareClassifierBase(nn.Module):
     """
     对比实验用分类器基类。
     - 仅使用 HSI + LiDAR（忽略 RGB / 扩散，diffusion 参数保留以匹配 create_classifier 签名）。
-    - forward 支持 return_center_logits / return_supcon_proj（对比跑法下 pipeline 不会启用）。
+    - forward 支持 return_center_logits（对比跑法下 pipeline 不会启用）。
     """
 
     def __init__(self, opt: Any, diffusion: Any = None):
@@ -69,6 +69,5 @@ class CompareClassifierBase(nn.Module):
         self,
         data_dict: Dict[str, torch.Tensor],
         return_center_logits: bool = False,
-        return_supcon_proj: bool = False,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, ...]]:
         raise NotImplementedError

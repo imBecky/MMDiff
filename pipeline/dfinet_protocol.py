@@ -31,7 +31,6 @@ from param import (
     NUM_CLASSES,
     NUM_EPOCHS,
     USE_RGB_PATCHES,
-    USE_SUPCON,
     opt,
 )
 from model.compare_model.dfinet_loss import dfinet_calc_loss
@@ -130,7 +129,7 @@ def run_dfinet_protocol_if_needed(
 
         inner = tqdm(train_loader, desc='Train', leave=False, dynamic_ncols=True)
         for batch in inner:
-            data_dict, labels = batch_to_dict(batch, device, USE_RGB_PATCHES, USE_SUPCON)
+            data_dict, labels = batch_to_dict(batch, device, USE_RGB_PATCHES)
             optimizer.zero_grad()
             f1, f2, h1, l1, logits = model(data_dict, return_aux=True)
             loss = dfinet_calc_loss(f1, f2, h1, l1, logits, labels, n_cls, alpha, beta)

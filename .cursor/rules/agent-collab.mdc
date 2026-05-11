@@ -1,0 +1,14 @@
+---
+description: 多 Agent / Colab 协作前必读协作资料与工作日志约定
+alwaysApply: true
+---
+
+# Agent 协作上下文
+
+在开始**实质性改动代码、跑实验或改训练配置**前：
+
+1. **阅读**仓库根 [`README.md`](../../README.md)：入口脚本、`MMDIFF_*`、`param.py`/`pipeline/` 边界、路径与安全注意事项。
+2. **若存在**根目录 **`agent-collab/README.md`**：先读协作说明与当前关注点（若有）。
+3. **若没有** `agent-collab/`：将 [**`contrib/agent-collab-bootstrap/`**](../../contrib/agent-collab-bootstrap/) **复制到**仓库根并重命名为 **`agent-collab/`**，再继续。
+4. **会话结束前**：在 **`agent-collab/worklog/`** 按 [`contrib/agent-collab-bootstrap/worklog/README.md`](../../contrib/agent-collab-bootstrap/worklog/README.md) 的约定追加条目（做了什么、未完成、下一步、关键 `MMDIFF_*`/路径）；若本地已有 **`agent-collab/worklog/`** 则用同目录规则。
+5. **禁止**：在任意可提交的协作文档中写入**密钥**、数据集访问口令、个人隐私；`run.sh` 类脚本中的 webhook 请勿复制到公开场合。

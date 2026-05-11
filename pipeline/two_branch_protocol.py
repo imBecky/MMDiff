@@ -50,7 +50,7 @@ class _FinetuneForward(nn.Module):
         super().__init__()
         self.net = net
 
-    def forward(self, data_dict: dict, return_center_logits: bool = False, return_supcon_proj: bool = False):
+    def forward(self, data_dict: dict, return_center_logits: bool = False):
         logits = self.net(data_dict['hsi'], data_dict['lidar'])
         if return_center_logits:
             return logits, logits

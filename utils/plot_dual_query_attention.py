@@ -672,7 +672,7 @@ def main() -> None:
         for bi, batch in enumerate(loader):
             if bi >= int(args.num_batches):
                 break
-            dd, _labels = batch_to_dict(batch, device, USE_RGB_PATCHES, use_supcon=False)
+            dd, _labels = batch_to_dict(batch, device, USE_RGB_PATCHES)
             w = _forward_and_capture(
                 model,
                 dd,

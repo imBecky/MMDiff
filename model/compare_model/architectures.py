@@ -51,14 +51,11 @@ class FusAtNetClassifier(CompareClassifierBase):
         self,
         data_dict: Dict[str, torch.Tensor],
         return_center_logits: bool = False,
-        return_supcon_proj: bool = False,
     ):
         hsi, lidar = self._hsi_lidar(data_dict)
         logits = self.net(hsi, lidar)
         if return_center_logits:
             return logits, logits
-        if return_supcon_proj:
-            raise RuntimeError('对比模型未启用 SupCon')
         return logits
 
 
@@ -99,14 +96,11 @@ class ExViTClassifier(CompareClassifierBase):
         self,
         data_dict: Dict[str, torch.Tensor],
         return_center_logits: bool = False,
-        return_supcon_proj: bool = False,
     ):
         hsi, lidar = self._hsi_lidar(data_dict)
         logits = self.net(hsi, lidar)
         if return_center_logits:
             return logits, logits
-        if return_supcon_proj:
-            raise RuntimeError('对比模型未启用 SupCon')
         return logits
 
 
@@ -228,10 +222,7 @@ class SSMAEClassifier(CompareClassifierBase):
         self,
         data_dict: Dict[str, torch.Tensor],
         return_center_logits: bool = False,
-        return_supcon_proj: bool = False,
     ):
-        if return_supcon_proj:
-            raise RuntimeError('对比模型未启用 SupCon')
         hsi, lidar = self._hsi_lidar(data_dict)
         hsi = self._resize_to_crop(hsi)
         lidar = self._resize_to_crop(lidar)
@@ -277,14 +268,11 @@ class TwoBranchCNNClassifier(CompareClassifierBase):
         self,
         data_dict: Dict[str, torch.Tensor],
         return_center_logits: bool = False,
-        return_supcon_proj: bool = False,
     ):
         hsi, lidar = self._hsi_lidar(data_dict)
         logits = self.net(hsi, lidar)
         if return_center_logits:
             return logits, logits
-        if return_supcon_proj:
-            raise RuntimeError('对比模型未启用 SupCon')
         return logits
 
 
@@ -317,7 +305,6 @@ class DFINetClassifier(CompareClassifierBase):
         self,
         data_dict: Dict[str, torch.Tensor],
         return_center_logits: bool = False,
-        return_supcon_proj: bool = False,
         return_aux: bool = False,
     ):
         hsi, lidar = self._hsi_lidar(data_dict)
@@ -326,8 +313,6 @@ class DFINetClassifier(CompareClassifierBase):
         logits = self.net(hsi, lidar)
         if return_center_logits:
             return logits, logits
-        if return_supcon_proj:
-            raise RuntimeError('对比模型未启用 SupCon')
         return logits
 
 
@@ -377,14 +362,11 @@ class MACNClassifier(CompareClassifierBase):
         self,
         data_dict: Dict[str, torch.Tensor],
         return_center_logits: bool = False,
-        return_supcon_proj: bool = False,
     ):
         hsi, lidar = self._hsi_lidar(data_dict)
         logits = self.net(hsi, lidar)
         if return_center_logits:
             return logits, logits
-        if return_supcon_proj:
-            raise RuntimeError('对比模型未启用 SupCon')
         return logits
 
 
@@ -528,7 +510,6 @@ class FGCNNClassifier(CompareClassifierBase):
         self,
         data_dict: Dict[str, torch.Tensor],
         return_center_logits: bool = False,
-        return_supcon_proj: bool = False,
     ):
         hsi, lidar = self._hsi_lidar(data_dict)
         B = hsi.shape[0]
@@ -551,6 +532,4 @@ class FGCNNClassifier(CompareClassifierBase):
 
         if return_center_logits:
             return logits, logits
-        if return_supcon_proj:
-            raise RuntimeError('对比模型未启用 SupCon')
         return logits
