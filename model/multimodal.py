@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import warnings
 from typing import Dict, List, Optional, Tuple, Union
 
@@ -10,21 +11,40 @@ import torch.nn.functional as F
 from pipeline.train_scheduler import build_lr_scheduler
 
 from model.rgb_student import LightweightRgbEncoder
-from model.spatial_fusion_decoder import build_spatial_fusion_decoder
+from model.spatial_fusion_decoder import (
+    SpatialFusionDecoder,
+    SpatialFusionDecoderLayer,
+)
 
 
 class ClassifierHead(nn.Module):
-    def __init__(self, in_channels: int, hidden_channels: int, num_classes: int, dropout: float = 0.2):
+    def __init__(
+        self,
+        in_channels: int,
+        hidden_channels: int,
+        num_classes: int,
+        dropout: float = 0.2,
+        num_hidden_layers: int = 2,
+    ):
         super().__init__()
-        self.net = nn.Sequential(
+        nl = int(num_hidden_layers)
+        if nl < 1:
+            raise ValueError(f"num_hidden_layers 须 >= 1，当前 {num_hidden_layers!r}")
+        parts: List[nn.Module] = [
             nn.Linear(in_channels, hidden_channels),
             nn.ReLU(inplace=True),
             nn.Dropout(p=dropout),
-            nn.Linear(hidden_channels, hidden_channels),
-            nn.ReLU(inplace=True),
-            nn.Dropout(p=dropout),
-            nn.Linear(hidden_channels, num_classes),
-        )
+        ]
+        for _ in range(nl - 1):
+            parts.extend(
+                [
+                    nn.Linear(hidden_channels, hidden_channels),
+                    nn.ReLU(inplace=True),
+                    nn.Dropout(p=dropout),
+                ]
+            )
+        parts.append(nn.Linear(hidden_channels, num_classes))
+        self.net = nn.Sequential(*parts)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.net(x)
@@ -248,6 +268,88 @@ def _make_spatial_distance_vector(num_modalities: int) -> torch.Tensor:
     return dist.repeat(int(num_modalities))
 
 
+def _env_int(name: str, default: int) -> int:
+    v = os.environ.get(name)
+    if v is None or str(v).strip() == "":
+        return int(default)
+    return int(v)
+
+
+class DualQueryCouplingSpatialFusionDecoderLayer(SpatialFusionDecoderLayer):
+    """在 self-attention 子块后：用对组池化向量经 MLP 作为残差耦合到另一 query 组。"""
+
+    def __init__(
+        self,
+        d_model: int,
+        nhead: int,
+        dim_feedforward: int,
+        dropout: float,
+        activation: str = "gelu",
+        *,
+        global_query_tokens: int,
+        center_query_tokens: int,
+    ) -> None:
+        super().__init__(d_model, nhead, dim_feedforward, dropout, activation=activation)
+        self.global_query_tokens = int(global_query_tokens)
+        self.center_query_tokens = int(center_query_tokens)
+        if self.global_query_tokens <= 0 or self.center_query_tokens <= 0:
+            raise ValueError(
+                f"global/center query 须为正数，当前 g={self.global_query_tokens} c={self.center_query_tokens}"
+            )
+        factor = max(1, _env_int("MMDIFF_COUPLING_HIDDEN_FACTOR", 4))
+        hid = max(64, d_model // factor)
+        self.sa_couple_g2c = nn.Sequential(
+            nn.Linear(d_model, hid),
+            nn.GELU(),
+            nn.Linear(hid, d_model),
+        )
+        self.sa_couple_c2g = nn.Sequential(
+            nn.Linear(d_model, hid),
+            nn.GELU(),
+            nn.Linear(hid, d_model),
+        )
+
+    def _sa_block(self, x: torch.Tensor) -> torch.Tensor:
+        out, _ = self.self_attn(x, x, x, need_weights=False)
+        g_qk = self.global_query_tokens
+        c_qk = self.center_query_tokens
+        split = g_qk + c_qk
+        g = out[:, :g_qk]
+        c = out[:, g_qk:split]
+        g_ctx = g.mean(dim=1)
+        c_ctx = c.mean(dim=1)
+        c = c + self.sa_couple_g2c(g_ctx).unsqueeze(1)
+        g = g + self.sa_couple_c2g(c_ctx).unsqueeze(1)
+        out = torch.cat([g, c], dim=1)
+        return self.dropout1(out)
+
+
+def build_spatial_fusion_decoder_with_dual_query_coupling(
+    *,
+    global_query_tokens: int,
+    center_query_tokens: int,
+    d_model: int,
+    nhead: int,
+    num_layers: int,
+    dim_feedforward: int,
+    dropout: float,
+    activation: str = "gelu",
+) -> SpatialFusionDecoder:
+    layers = [
+        DualQueryCouplingSpatialFusionDecoderLayer(
+            d_model,
+            nhead,
+            dim_feedforward,
+            dropout,
+            activation=activation,
+            global_query_tokens=global_query_tokens,
+            center_query_tokens=center_query_tokens,
+        )
+        for _ in range(num_layers)
+    ]
+    return SpatialFusionDecoder(layers)
+
+
 class MultimodalClassifier(nn.Module):
     """
     空间融合：各模态保留 11×11 特征，对齐到 d_model 后经共享瓶颈，拼为 memory。
@@ -316,8 +418,16 @@ class MultimodalClassifier(nn.Module):
         hsi_residual_blocks = int(proj_cfg.get("hsi_residual_blocks") or 2)
         hsi_agg_mode = str(proj_cfg.get("hsi_agg_mode") or "multi_token").strip().lower()
 
-        self.query_tokens_per_query = 4
-        qk = self.query_tokens_per_query
+        g_qk = _env_int("MMDIFF_GLOBAL_QUERY_TOKENS", 4)
+        c_qk = _env_int("MMDIFF_CENTER_QUERY_TOKENS", 4)
+        if g_qk <= 0 or c_qk <= 0:
+            raise ValueError("MMDIFF_GLOBAL_QUERY_TOKENS / MMDIFF_CENTER_QUERY_TOKENS 须为正整数")
+        self.global_query_tokens = g_qk
+        self.center_query_tokens = c_qk
+        # 旧脚本/工具曾假设两侧对称；若 g≠c，请用 global_query_tokens / center_query_tokens
+        self.query_tokens_per_query = g_qk
+
+        head_layers = _env_int("MMDIFF_CLS_HEAD_LAYERS", 2)
 
         self.rgb_student: Optional[LightweightRgbEncoder] = None
         if self.use_rgb:
@@ -394,11 +504,13 @@ class MultimodalClassifier(nn.Module):
         self.spatial_bn_up = nn.Conv2d(self._bottleneck_dim, d_model, kernel_size=1, bias=True)
 
         self.pos_embed_mem = nn.Parameter(torch.randn(1, self.mem_len, d_model))
-        self.global_cls = nn.Parameter(torch.randn(1, qk, d_model))
-        self.center_cls = nn.Parameter(torch.randn(1, qk, d_model))
-        self.pos_embed_tgt = nn.Parameter(torch.randn(1, 2 * qk, d_model))
+        self.global_cls = nn.Parameter(torch.randn(1, g_qk, d_model))
+        self.center_cls = nn.Parameter(torch.randn(1, c_qk, d_model))
+        self.pos_embed_tgt = nn.Parameter(torch.randn(1, g_qk + c_qk, d_model))
 
-        self.decoder = build_spatial_fusion_decoder(
+        self.decoder = build_spatial_fusion_decoder_with_dual_query_coupling(
+            global_query_tokens=g_qk,
+            center_query_tokens=c_qk,
             d_model=d_model,
             nhead=nhead,
             num_layers=n_tx,
@@ -410,8 +522,12 @@ class MultimodalClassifier(nn.Module):
         nm = sum([self.use_hsi, self.use_rgb, self.use_lidar])
         self.register_buffer("_spatial_dist_mem", _make_spatial_distance_vector(nm))
 
-        self.global_head = ClassifierHead(d_model, head_hidden, self.num_classes)
-        self.center_head = ClassifierHead(d_model, head_hidden, self.num_classes)
+        self.global_head = ClassifierHead(
+            d_model, head_hidden, self.num_classes, num_hidden_layers=head_layers
+        )
+        self.center_head = ClassifierHead(
+            d_model, head_hidden, self.num_classes, num_hidden_layers=head_layers
+        )
 
         proj_dict = {
             "hsi": self.hsi_encoder,
@@ -440,17 +556,25 @@ class MultimodalClassifier(nn.Module):
         return self.spatial_bn_up(x)
 
     def _build_cross_attn_logit_bias(self, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
-        """(1,1,Lq,mem_len)，仅 center query 行非零。
+        """(1,1,Lq,mem_len)。
 
-        bias = alpha * exp(-dist / tau)
-        含义：中心处获得最大 logit 奖励 alpha，随距离指数衰减；tau 越大衰减越慢。
+        center 行：bias = alpha * exp(-dist / tau)
+        global 行（可选）：-MMDIFF_GLOBAL_ANTICENTER_BIAS * exp(-dist/tau)，与 center 反号拉大分工。
         """
-        qk = self.query_tokens_per_query
+        g_qk = self.global_query_tokens
+        c_qk = self.center_query_tokens
+        total_q = g_qk + c_qk
         mem_len = self.mem_len
         dist = self._spatial_dist_mem.to(device=device, dtype=dtype)
         b1d = self.center_distance_bias_alpha * torch.exp(-dist / self.center_distance_bias_tau)
-        m = torch.zeros(2 * qk, mem_len, device=device, dtype=dtype)
-        m[qk : 2 * qk, :] = b1d.unsqueeze(0).expand(qk, -1)
+        m = torch.zeros(total_q, mem_len, device=device, dtype=dtype)
+        m[g_qk : total_q, :] = b1d.unsqueeze(0).expand(c_qk, -1)
+
+        g_ac = float(os.environ.get("MMDIFF_GLOBAL_ANTICENTER_BIAS") or 0.0)
+        if g_ac != 0.0:
+            neg = -g_ac * torch.exp(-dist / self.center_distance_bias_tau)
+            m[:g_qk, :] = neg.unsqueeze(0).expand(g_qk, -1)
+
         return m.unsqueeze(0).unsqueeze(0)
 
     def refresh_optimizer_after_param_freeze(self) -> None:
@@ -553,7 +677,8 @@ class MultimodalClassifier(nn.Module):
             )
         memory = memory + self.pos_embed_mem
 
-        qk = self.query_tokens_per_query
+        g_qk = self.global_query_tokens
+        c_qk = self.center_query_tokens
         g_tokens = self.global_cls.expand(b, -1, -1)
         c_tokens = self.center_cls.expand(b, -1, -1)
         tgt = torch.cat([g_tokens, c_tokens], dim=1)
@@ -562,8 +687,8 @@ class MultimodalClassifier(nn.Module):
         cross_bias = self._build_cross_attn_logit_bias(tgt.device, tgt.dtype)
         out, _ = self.decoder(tgt, memory, cross_logit_bias=cross_bias, need_attn_weights=False)
 
-        global_rep = out[:, :qk, :].mean(dim=1)
-        center_rep = out[:, qk:, :].mean(dim=1)
+        global_rep = out[:, :g_qk, :].mean(dim=1)
+        center_rep = out[:, g_qk : g_qk + c_qk, :].mean(dim=1)
         return global_rep, center_rep
 
     def forward(

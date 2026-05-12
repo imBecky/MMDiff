@@ -458,8 +458,6 @@ def run_training(
             if ck_path.is_file():
                 sd = torch.load(str(ck_path), map_location=device)
                 _load_rgb_student_checkpoint_filtered(model, sd, logger, ck_path)
-            else:
-                logger.warning('MMDIFF_RGB_STUDENT_CHECKPOINT 不存在: %s', ck_path)
         else:
             logger.info('MMDIFF_RGB_STUDENT_CHECKPOINT 未设置：RGB student 保持随机初始化（消融 random）')
 
