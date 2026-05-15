@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+# Memory 压缩实验 — with center-token；末尾通知 + 关机（适合无人值守主机）
+# 与 run1.sh 并行时：仅本脚本关机，run1 不关机。
+
+set -euo pipefail
 
 do_shutdown() {
   sleep 3
@@ -10,10 +14,9 @@ do_shutdown() {
   done
   curl -fsS "https://sctapi.ftqq.com/SCT313662TGZ7JRPbisBQfDZbabO1Kmmdt.send?title=服务器关闭失败&desp=服务器关闭失败channel=9"
 }
-export OMP_NUM_THREADS="${OMP_NUM_THREADS:-4}"
 
+export OMP_NUM_THREADS="${OMP_NUM_THREADS:-4}"
 export MMDIFF_RANDOM_SEED="${MMDIFF_RANDOM_SEED:-42}"
-export MMDIFF_RUN_TIMESTAMP="${MMDIFF_RUN_TIMESTAMP:-$(date +%m%d-%H%M)}"
 
 export MMDIFF_CLS_TOKEN_DIM="${MMDIFF_CLS_TOKEN_DIM:-192}"
 export MMDIFF_CLS_HEAD_HIDDEN="${MMDIFF_CLS_HEAD_HIDDEN:-192}"
@@ -32,34 +35,46 @@ export MMDIFF_RGB_STUDENT_CHECKPOINT="${MMDIFF_RGB_STUDENT_CHECKPOINT:-${RGB_STU
 export MMDIFF_FREEZE_RGB_STUDENT="${MMDIFF_FREEZE_RGB_STUDENT:-0}"
 
 export MMDIFF_LOSS_WEIGHT_GLOBAL="${MMDIFF_LOSS_WEIGHT_GLOBAL:-0.25}"
-
 export MMDIFF_MODALITY_COMBO="hsi+rgb+lidar"
 
-# ─────────────────────────────────────────────────────────────
-# 欧氏距离线性 bias 复现（center 行：logits += -alpha*dist；非 exp 核）
-#   α、其余训练设置与此前「最优基线」一致；tau 仅作用于 exp 核，linear 下仍会写入日志。
-#   MMDIFF_CENTER_DISTANCE_BIAS_KERNEL=linear（别名：euclid / euclidean / l2）
-# 跑 1 次后关机（与旧指数核对比时请改用 kernel=exp 或注释掉下面 export）。
-# ─────────────────────────────────────────────────────────────
-
-export MMDIFF_CENTER_DISTANCE_BIAS_KERNEL=linear
 export MMDIFF_CENTER_DISTANCE_BIAS_ALPHA=3.5
 _bias_tau="${MMDIFF_CENTER_DISTANCE_BIAS_TAU:-2.0}"
 export MMDIFF_CENTER_DISTANCE_BIAS_TAU="$_bias_tau"
 _bias_tdot="${_bias_tau//./}"
 
-unset MMDIFF_COUPLING_HIDDEN_FACTOR
-unset MMDIFF_GLOBAL_ANTICENTER_BIAS
-unset MMDIFF_CLS_HEAD_LAYERS
-unset MMDIFF_GLOBAL_QUERY_TOKENS
-unset MMDIFF_CENTER_QUERY_TOKENS
+export MMDIFF_COUPLING_HIDDEN_FACTOR=2
 
-export MMDIFF_MEMORY_COMPRESS_MODE=none
-unset MMDIFF_MEMORY_GRID_SIZE MMDIFF_MEMORY_COMPRESS_TOKENS MMDIFF_MEMORY_KEEP_CENTER_TOKEN
+_cleanup_memory_env() {
+  unset MMDIFF_MEMORY_COMPRESS_MODE MMDIFF_MEMORY_GRID_SIZE MMDIFF_MEMORY_COMPRESS_TOKENS \
+    MMDIFF_MEMORY_KEEP_CENTER_TOKEN MMDIFF_EXPERIMENT_TAG MMDIFF_RUN_TIMESTAMP
+}
 
+# 1) grid 4×4 + ct
+_cleanup_memory_env
 export MMDIFF_RUN_TIMESTAMP="$(date +%m%d-%H%M)"
-export MMDIFF_EXPERIMENT_TAG="a35_linDist_t${_bias_tdot}_resTrue"
+export MMDIFF_EXPERIMENT_TAG="a35_chf2_grid4ct_t${_bias_tdot}"
+export MMDIFF_MEMORY_COMPRESS_MODE=grid
+export MMDIFF_MEMORY_GRID_SIZE=4
+export MMDIFF_MEMORY_KEEP_CENTER_TOKEN=1
 python main.py
-unset MMDIFF_EXPERIMENT_TAG MMDIFF_CENTER_DISTANCE_BIAS_KERNEL
+_cleanup_memory_env
+
+# 2) linear 16 + ct
+export MMDIFF_RUN_TIMESTAMP="$(date +%m%d-%H%M)"
+export MMDIFF_EXPERIMENT_TAG="a35_chf2_linear16ct_t${_bias_tdot}"
+export MMDIFF_MEMORY_COMPRESS_MODE=linear
+export MMDIFF_MEMORY_COMPRESS_TOKENS=16
+export MMDIFF_MEMORY_KEEP_CENTER_TOKEN=1
+python main.py
+_cleanup_memory_env
+
+# 3) latent 16 + ct
+export MMDIFF_RUN_TIMESTAMP="$(date +%m%d-%H%M)"
+export MMDIFF_EXPERIMENT_TAG="a35_chf2_latent16ct_t${_bias_tdot}"
+export MMDIFF_MEMORY_COMPRESS_MODE=latent
+export MMDIFF_MEMORY_COMPRESS_TOKENS=16
+export MMDIFF_MEMORY_KEEP_CENTER_TOKEN=1
+python main.py
+_cleanup_memory_env
 
 do_shutdown

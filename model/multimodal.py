@@ -275,6 +275,52 @@ def _env_int(name: str, default: int) -> int:
     return int(v)
 
 
+def _env_str(name: str, default: str) -> str:
+    v = os.environ.get(name)
+    if v is None or str(v).strip() == "":
+        return str(default)
+    return str(v).strip()
+
+
+def _env_bool01(name: str, default: int = 0) -> bool:
+    v = os.environ.get(name)
+    if v is None or str(v).strip() == "":
+        return bool(int(default))
+    s = str(v).strip().lower()
+    return s not in ("0", "", "false", "off", "no")
+
+
+def _dist121_flat(center_y: float = 5.0, center_x: float = 5.0) -> torch.Tensor:
+    """11×11 格点中心的欧氏距离（展平行列优先），长度为 121。"""
+    yy, xx = torch.meshgrid(torch.arange(11), torch.arange(11), indexing="ij")
+    return torch.sqrt((yy.float() - center_y) ** 2 + (xx.float() - center_x) ** 2).reshape(-1)
+
+
+def _grid_centers_ij_float(grid_size: int) -> Tuple[torch.Tensor, torch.Tensor]:
+    """近似将 G×G 池化胞元中心映射到连续坐标 [0,10]²（与原 11×11 对齐）。"""
+    g = int(grid_size)
+    if g < 1:
+        raise ValueError(f"GRID_SIZE 须 >= 1，当前 {grid_size}")
+    jj, ii = torch.meshgrid(torch.arange(g), torch.arange(g), indexing="ij")
+    scale = 10.0 / float(g)
+    cy = jj.float() * scale + scale * 0.5
+    cx = ii.float() * scale + scale * 0.5
+    return cy.reshape(-1), cx.reshape(-1)
+
+
+def _dist_from_center_for_grid_centers(grid_size: int, center_y: float = 5.0, center_x: float = 5.0) -> torch.Tensor:
+    """G² 长度的距离向量，与 adaptive_avg_pool2d 输出的行列 flatten 顺序一致。"""
+    cy, cx = _grid_centers_ij_float(grid_size)
+    dist = torch.sqrt((cy - center_y) ** 2 + (cx - center_x) ** 2)
+    return dist
+
+
+def _row_softmax_aggregate_dist(linear_weight_rows: torch.Tensor, dist121: torch.Tensor) -> torch.Tensor:
+    """rows softmax(W) @ dist121，每压缩 token 聚合到标量距离。"""
+    w_row = torch.nn.functional.softmax(linear_weight_rows, dim=-1)
+    return torch.matmul(w_row, dist121.unsqueeze(-1)).squeeze(-1)
+
+
 class DualQueryCouplingSpatialFusionDecoderLayer(SpatialFusionDecoderLayer):
     """在 self-attention 子块后：用对组池化向量经 MLP 作为残差耦合到另一 query 组。"""
 
@@ -481,11 +527,50 @@ class MultimodalClassifier(nn.Module):
                 nn.Linear(d_model, 2 * d_model),
             )
 
-        n_spatial = int(self.SPATIAL_TOKENS)
-        n_hsi = n_spatial if self.use_hsi else 0
-        n_rgb = n_spatial if self.use_rgb else 0
-        n_lidar = n_spatial if self.use_lidar else 0
-        self.mem_len = n_hsi + n_rgb + n_lidar
+        raw_mc_mode = (_env_str("MMDIFF_MEMORY_COMPRESS_MODE", "none") or "").lower()
+        memory_compress_allowed = frozenset({"none", "grid", "linear", "latent"})
+        if raw_mc_mode not in memory_compress_allowed:
+            raise ValueError(
+                f"MMDIFF_MEMORY_COMPRESS_MODE 须为 none|grid|linear|latent，当前 {raw_mc_mode!r}"
+            )
+        self.memory_compress_mode = raw_mc_mode
+        memory_grid_sz = max(1, _env_int("MMDIFF_MEMORY_GRID_SIZE", 4))
+        self.memory_grid_size = int(memory_grid_sz)
+        memory_k = max(1, _env_int("MMDIFF_MEMORY_COMPRESS_TOKENS", 16))
+        self.memory_compress_tokens = int(memory_k)
+        self.memory_keep_center_token = _env_bool01("MMDIFF_MEMORY_KEEP_CENTER_TOKEN", 0)
+
+        n_modal = int(sum([self.use_hsi, self.use_rgb, self.use_lidar]))
+        tokens_per_modal_block = int(self.SPATIAL_TOKENS)
+        if self.memory_compress_mode == "grid":
+            tokens_per_modal_block = self.memory_grid_size * self.memory_grid_size
+        elif self.memory_compress_mode in ("linear", "latent"):
+            tokens_per_modal_block = self.memory_compress_tokens
+        if self.memory_compress_mode != "none" and self.memory_keep_center_token:
+            tokens_per_modal_block += 1
+        self._tokens_per_modality_block = int(tokens_per_modal_block)
+        self.mem_len = self._tokens_per_modality_block * n_modal
+
+        self.memory_linear_compress_121_K: Optional[nn.Linear] = None
+        self.memory_latent_attn: Optional[nn.MultiheadAttention] = None
+        self.memory_latent_queries: Optional[nn.Parameter] = None
+        self.memory_latent_dist_logits: Optional[nn.Parameter] = None
+        if self.memory_compress_mode == "linear":
+            self.memory_linear_compress_121_K = nn.Linear(
+                self.SPATIAL_TOKENS, self.memory_compress_tokens, bias=False
+            )
+        elif self.memory_compress_mode == "latent":
+            self.memory_latent_queries = nn.Parameter(torch.randn(self.memory_compress_tokens, d_model))
+            self.memory_latent_attn = nn.MultiheadAttention(
+                d_model,
+                nhead,
+                dropout=tx_dropout,
+                batch_first=True,
+            )
+            # 常量 buffer 上用 softmax(rows) @ dist121 聚合几何距离；与 latent 注意力分离
+            self.memory_latent_dist_logits = nn.Parameter(
+                torch.zeros(self.memory_compress_tokens, self.SPATIAL_TOKENS)
+            )
 
         self._spatial_hsi_proj = nn.Conv2d(
             self.hsi_encoder.backbone_channels, d_model, kernel_size=1, bias=True
@@ -519,8 +604,30 @@ class MultimodalClassifier(nn.Module):
             activation="gelu",
         )
 
-        nm = sum([self.use_hsi, self.use_rgb, self.use_lidar])
-        self.register_buffer("_spatial_dist_mem", _make_spatial_distance_vector(nm))
+        dist121_cpu = _dist121_flat()
+        blk: torch.Tensor
+        if self.memory_compress_mode == "none":
+            blk = dist121_cpu
+        elif self.memory_compress_mode == "grid":
+            blk = _dist_from_center_for_grid_centers(self.memory_grid_size).float()
+            if self.memory_keep_center_token:
+                z = blk.new_zeros(1)
+                blk = torch.cat([blk, z], dim=0)
+        elif self.memory_compress_mode == "linear":
+            assert self.memory_linear_compress_121_K is not None
+            wt = self.memory_linear_compress_121_K.weight.detach().cpu().float()
+            blk = _row_softmax_aggregate_dist(wt, dist121_cpu.float())
+            if self.memory_keep_center_token:
+                z = blk.new_zeros(1)
+                blk = torch.cat([blk, z], dim=0)
+        else:
+            assert self.memory_latent_dist_logits is not None
+            wt = self.memory_latent_dist_logits.detach().cpu().float()
+            blk = _row_softmax_aggregate_dist(wt, dist121_cpu.float())
+            if self.memory_keep_center_token:
+                z = blk.new_zeros(1)
+                blk = torch.cat([blk, z], dim=0)
+        self.register_buffer("_spatial_dist_mem", blk.repeat(n_modal))
 
         self.global_head = ClassifierHead(
             d_model, head_hidden, self.num_classes, num_hidden_layers=head_layers
@@ -545,6 +652,8 @@ class MultimodalClassifier(nn.Module):
         nn.init.normal_(self.global_cls, std=0.02)
         nn.init.normal_(self.center_cls, std=0.02)
         nn.init.normal_(self.pos_embed_tgt, std=0.02)
+        if self.memory_latent_queries is not None:
+            nn.init.normal_(self.memory_latent_queries, std=0.02)
 
         self.loss_func = self._build_loss(cls_cfg)
         self.optimizer = self._build_optimizer(train_cfg)
@@ -554,6 +663,36 @@ class MultimodalClassifier(nn.Module):
         x = self.spatial_bn_down(x)
         x = F.gelu(x)
         return self.spatial_bn_up(x)
+
+    def _memory_tokens_from_spatial(self, feats_bottle: torch.Tensor) -> torch.Tensor:
+        """B×D×11×11 瓶颈后特征图 → 单模态 memory token 序列 (B, L_token, D)。"""
+        mode = self.memory_compress_mode
+        bsz = feats_bottle.size(0)
+
+        if mode == "none":
+            toks = _spatial_flatten(feats_bottle)
+        elif mode == "grid":
+            pooled = F.adaptive_avg_pool2d(feats_bottle, output_size=self.memory_grid_size)
+            toks = pooled.flatten(2).transpose(1, 2).contiguous()
+        elif mode == "linear":
+            if self.memory_linear_compress_121_K is None:
+                raise RuntimeError("linear compress 但未初始化 Linear")
+            flat = _spatial_flatten(feats_bottle)
+            w = self.memory_linear_compress_121_K.weight
+            toks = torch.einsum("kj,bjd->bkd", w, flat)
+        else:
+            if self.memory_latent_queries is None or self.memory_latent_attn is None:
+                raise RuntimeError("latent compress 但未初始化 MultiheadAttention / queries")
+            flat_kv = _spatial_flatten(feats_bottle)
+            q = self.memory_latent_queries.unsqueeze(0).expand(bsz, -1, -1).contiguous()
+            toks_mha, _ = self.memory_latent_attn(q, flat_kv, flat_kv, need_weights=False)
+            toks = toks_mha
+
+        if mode != "none" and self.memory_keep_center_token:
+            ctr = feats_bottle[:, :, 5, 5].unsqueeze(1).contiguous()
+            toks = torch.cat([toks, ctr], dim=1)
+
+        return toks
 
     def _build_cross_attn_logit_bias(self, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
         """(1,1,Lq,mem_len)。
@@ -632,7 +771,7 @@ class MultimodalClassifier(nn.Module):
             h = self.hsi_encoder.forward_spatial_map(hsi)
             h = self._spatial_hsi_proj(h)
             h = self._bottleneck(h)
-            memory_parts.append(_spatial_flatten(h))
+            memory_parts.append(self._memory_tokens_from_spatial(h))
             b = hsi.shape[0]
 
         if self.use_rgb:
@@ -645,7 +784,7 @@ class MultimodalClassifier(nn.Module):
             r = self._spatial_rgb_proj(r)
             r = self._bottleneck(r)
             rgb_map_d = r
-            memory_parts.append(_spatial_flatten(r))
+            memory_parts.append(self._memory_tokens_from_spatial(r))
             b = r.shape[0] if b is None else b
 
         if self.use_lidar:
@@ -665,7 +804,7 @@ class MultimodalClassifier(nn.Module):
                     -1
                 ).unsqueeze(-1)
             l = self._bottleneck(l)
-            memory_parts.append(_spatial_flatten(l))
+            memory_parts.append(self._memory_tokens_from_spatial(l))
             b = l.shape[0] if b is None else b
 
         if b is None:

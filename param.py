@@ -25,7 +25,7 @@ SCHEDULER_COSINE_ETA_MIN_RATIO = 0.01
 SCHEDULER_COSINE_WARMUP_RATIO = 0.1
 SCHEDULER_COSINE_WARMUP_STEPS = 0
 NUM_EPOCHS = 250
-NUM_WORKERS = 7
+NUM_WORKERS = 24
 
 
 def _apply_scheduler_env():
@@ -514,6 +514,8 @@ def _apply_mmdiff_env_overrides():
     MMDIFF_RANDOM_SEED → RANDOM_SEED（torch/np 与划分等）
     MMDIFF_FORWARD_TRACE / MMDIFF_LOG_DATAFLOW=1 → model.log 中按前向打印子模块 in/out 形状（动态数据流）
     MMDIFF_FORWARD_TRACE_DEPTH（默认 3）MMDIFF_FORWARD_TRACE_MAX_FORWARDS（默认 1）
+    Memory 压缩（由 model/multimodal.py 读取环境变量，不改 opt）：MMDIFF_MEMORY_COMPRESS_MODE=none|grid|linear|latent，
+    MMDIFF_MEMORY_GRID_SIZE，MMDIFF_MEMORY_COMPRESS_TOKENS，MMDIFF_MEMORY_KEEP_CENTER_TOKEN=0|1
     """
     g = globals()
 
