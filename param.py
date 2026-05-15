@@ -12,11 +12,12 @@ import utils.logger as Logger
 # ---------------------------------------------------------------------------
 # 数据与训练（常用修改处）
 # ---------------------------------------------------------------------------
-# 本地实验：优先改仓库根目录 run.sh 顶部「今晚实验」短名，由脚本映射为 MMDIFF_*；
-# 或直接 export MMDIFF_* 覆盖（见下方 _apply_mmdiff_env_overrides 文档字符串）。
+# 本地实验：直接改本文件常量，或 export MMDIFF_* 覆盖（见 _apply_mmdiff_env_overrides 文档字符串）。
+# run.sh 仅负责时间戳/实验 tag、关机等；训练默认以本文件为准。
 # ---------------------------------------------------------------------------
-# 直接 python main.py（无 MMDIFF_*）：默认对齐一次典型主实验（与 tf-logs 中 exp_se_cls_shallow 类配置一致，例如
-# lidar 48+2 残差、HSI 5×96+SE32+mean、cls token 320 / 头 320 / decoder 1×384、epochs=250、wd=2e-4、early_stop=20）。
+# 直接 python main.py（无 MMDIFF_*）：以下宽版各模态 stem + 分类头为默认；loss / center 距离 bias 与 historical run.sh 非分支项对齐。
+# 例：lidar 48+2、HSI 5×96+SE32、HSI_AGG=multi_token、cls 192/192、transformer 1×384、LOSS_WEIGHT_GLOBAL=0.25、
+# CENTER_DISTANCE_BIAS_ALPHA=3.5、tau=2.0（bias 仅为 alpha*exp(-dist/tau)，见 model/multimodal.py）。
 SCHED_STEP_RATIOS = [0.6, 0.7]
 SCHED_GAMMAS = [0.4, 0.1]
 SCHEDULER_NAME = 'cosine'
@@ -180,7 +181,7 @@ EVAL_INTERVAL_EPOCHS = 1
 EARLY_STOPPING_PATIENCE = 30
 
 USE_CENTER_LOSS = True
-LOSS_WEIGHT_GLOBAL = 0.2
+LOSS_WEIGHT_GLOBAL = 0.25
 
 
 def _sync_loss_weights_from_global() -> None:
@@ -287,9 +288,9 @@ CLS_TRANSFORMER_HEADS = 4
 CLS_TRANSFORMER_LAYERS = 1
 CLS_TRANSFORMER_FF_DIM = 384
 CLS_HEAD_HIDDEN = 192
-# center query cross-attention：logits += alpha * exp(-dist / tau)
-#   alpha = 中心处获得的最大 logit 奖励；tau 控制衰减尺度（按 11×11 格欧氏距离）
-CENTER_DISTANCE_BIAS_ALPHA = 0.2
+# center query cross-attention logit bias：alpha * exp(-dist / tau)（固定指数核）
+# dist 为 11×11 网格上的空间欧氏距离；alpha、tau 为标量超参。
+CENTER_DISTANCE_BIAS_ALPHA = 3.5
 CENTER_DISTANCE_BIAS_TAU = 2.0
 
 

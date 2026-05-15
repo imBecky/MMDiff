@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# 无人值守训练：通知 + 关机。训练数值默认来自 param.py；此处仅 TB 命名与环境清理。
+#
+# Cross-attention 中心距离 bias 固定为 alpha*exp(-dist/tau)，见 model/multimodal.MultimodalClassifier._build_cross_attn_logit_bias
 
 do_shutdown() {
   sleep 3
@@ -10,43 +13,11 @@ do_shutdown() {
   done
   curl -fsS "https://sctapi.ftqq.com/SCT313662TGZ7JRPbisBQfDZbabO1Kmmdt.send?title=服务器关闭失败&desp=服务器关闭失败channel=9"
 }
+
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-4}"
-
 export MMDIFF_RANDOM_SEED="${MMDIFF_RANDOM_SEED:-42}"
-export MMDIFF_RUN_TIMESTAMP="${MMDIFF_RUN_TIMESTAMP:-$(date +%m%d-%H%M)}"
 
-export MMDIFF_CLS_TOKEN_DIM="${MMDIFF_CLS_TOKEN_DIM:-192}"
-export MMDIFF_CLS_HEAD_HIDDEN="${MMDIFF_CLS_HEAD_HIDDEN:-192}"
-export MMDIFF_CLS_TRANSFORMER_LAYERS="${MMDIFF_CLS_TRANSFORMER_LAYERS:-1}"
-export MMDIFF_CLS_TRANSFORMER_FF_DIM="${MMDIFF_CLS_TRANSFORMER_FF_DIM:-384}"
-
-export MMDIFF_HSI_SE_RATIO="${MMDIFF_HSI_SE_RATIO:-8}"
-export MMDIFF_HSI_RESIDUAL_BLOCKS="${MMDIFF_HSI_RESIDUAL_BLOCKS:-2}"
-export MMDIFF_HSI_CONV_HIDDEN="${MMDIFF_HSI_CONV_HIDDEN:-64}"
-export MMDIFF_HSI_AGG_MODE="${MMDIFF_HSI_AGG_MODE:-multi_token}"
-
-export MMDIFF_LIDAR_HIDDEN="${MMDIFF_LIDAR_HIDDEN:-16}"
-export MMDIFF_LIDAR_EXTRA_BLOCKS="${MMDIFF_LIDAR_EXTRA_BLOCKS:-0}"
-
-export MMDIFF_RGB_STUDENT_CHECKPOINT="${MMDIFF_RGB_STUDENT_CHECKPOINT:-${RGB_STUDENT_CKPT:-}}"
-export MMDIFF_FREEZE_RGB_STUDENT="${MMDIFF_FREEZE_RGB_STUDENT:-0}"
-
-export MMDIFF_LOSS_WEIGHT_GLOBAL="${MMDIFF_LOSS_WEIGHT_GLOBAL:-0.25}"
-
-export MMDIFF_MODALITY_COMBO="hsi+rgb+lidar"
-
-# ─────────────────────────────────────────────────────────────
-# 欧氏距离线性 bias 复现（center 行：logits += -alpha*dist；非 exp 核）
-#   α、其余训练设置与此前「最优基线」一致；tau 仅作用于 exp 核，linear 下仍会写入日志。
-#   MMDIFF_CENTER_DISTANCE_BIAS_KERNEL=linear（别名：euclid / euclidean / l2）
-# 跑 1 次后关机（与旧指数核对比时请改用 kernel=exp 或注释掉下面 export）。
-# ─────────────────────────────────────────────────────────────
-
-export MMDIFF_CENTER_DISTANCE_BIAS_KERNEL=linear
-export MMDIFF_CENTER_DISTANCE_BIAS_ALPHA=3.5
-_bias_tau="${MMDIFF_CENTER_DISTANCE_BIAS_TAU:-2.0}"
-export MMDIFF_CENTER_DISTANCE_BIAS_TAU="$_bias_tau"
-_bias_tdot="${_bias_tau//./}"
+export MMDIFF_MODALITY_COMBO="${MMDIFF_MODALITY_COMBO:-hsi+rgb+lidar}"
 
 unset MMDIFF_COUPLING_HIDDEN_FACTOR
 unset MMDIFF_GLOBAL_ANTICENTER_BIAS
@@ -57,9 +28,15 @@ unset MMDIFF_CENTER_QUERY_TOKENS
 export MMDIFF_MEMORY_COMPRESS_MODE=none
 unset MMDIFF_MEMORY_GRID_SIZE MMDIFF_MEMORY_COMPRESS_TOKENS MMDIFF_MEMORY_KEEP_CENTER_TOKEN
 
+# tag 后缀仅用于日志命名；默认与 param.CENTER_DISTANCE_BIAS_TAU=2.0 一致（可通过环境预先覆盖以供展示）
+_bias_tau="${MMDIFF_CENTER_DISTANCE_BIAS_TAU:-2.0}"
+_bias_tdot="${_bias_tau//./}"
+
 export MMDIFF_RUN_TIMESTAMP="$(date +%m%d-%H%M)"
-export MMDIFF_EXPERIMENT_TAG="a35_linDist_t${_bias_tdot}_resTrue"
+export MMDIFF_EXPERIMENT_TAG="a35_expDist_t${_bias_tdot}_resTrue"
+
 python main.py
-unset MMDIFF_EXPERIMENT_TAG MMDIFF_CENTER_DISTANCE_BIAS_KERNEL
+
+unset MMDIFF_EXPERIMENT_TAG
 
 do_shutdown
