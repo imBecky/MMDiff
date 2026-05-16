@@ -399,7 +399,8 @@ def build_spatial_fusion_decoder_with_dual_query_coupling(
 class MultimodalClassifier(nn.Module):
     """
     空间融合：各模态保留 11×11 特征，对齐到 d_model 后经共享瓶颈，拼为 memory。
-    Center query 在 cross-attention 上对 memory 位置施加 -alpha*dist 的 logit bias。
+    可选可学习模态嵌入（MMDIFF_MODALITY_EMBED）加在 memory 上；Center query 对 memory 施加
+    alpha*exp(-dist/tau) 的 logit bias，可由 MMDIFF_DISTANCE_BIAS_HSI_ONLY 限制为仅 HSI token 列。
     """
     SPATIAL_TOKENS = 121
 
@@ -472,6 +473,10 @@ class MultimodalClassifier(nn.Module):
         self.center_query_tokens = c_qk
         # 旧脚本/工具曾假设两侧对称；若 g≠c，请用 global_query_tokens / center_query_tokens
         self.query_tokens_per_query = g_qk
+
+        self._use_modality_embed = _env_bool01("MMDIFF_MODALITY_EMBED", 1)
+        self._distance_bias_hsi_only = _env_bool01("MMDIFF_DISTANCE_BIAS_HSI_ONLY", 1)
+        self._hsi_mem_tokens = 0
 
         head_layers = _env_int("MMDIFF_CLS_HEAD_LAYERS", 2)
 
@@ -549,6 +554,8 @@ class MultimodalClassifier(nn.Module):
         if self.memory_compress_mode != "none" and self.memory_keep_center_token:
             tokens_per_modal_block += 1
         self._tokens_per_modality_block = int(tokens_per_modal_block)
+        if self.use_hsi:
+            self._hsi_mem_tokens = self._tokens_per_modality_block
         self.mem_len = self._tokens_per_modality_block * n_modal
 
         self.memory_linear_compress_121_K: Optional[nn.Linear] = None
@@ -589,6 +596,9 @@ class MultimodalClassifier(nn.Module):
         self.spatial_bn_up = nn.Conv2d(self._bottleneck_dim, d_model, kernel_size=1, bias=True)
 
         self.pos_embed_mem = nn.Parameter(torch.randn(1, self.mem_len, d_model))
+        self.modality_embed: Optional[nn.Parameter] = None
+        if self._use_modality_embed:
+            self.modality_embed = nn.Parameter(torch.zeros(n_modal, d_model))
         self.global_cls = nn.Parameter(torch.randn(1, g_qk, d_model))
         self.center_cls = nn.Parameter(torch.randn(1, c_qk, d_model))
         self.pos_embed_tgt = nn.Parameter(torch.randn(1, g_qk + c_qk, d_model))
@@ -697,7 +707,8 @@ class MultimodalClassifier(nn.Module):
     def _build_cross_attn_logit_bias(self, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
         """(1,1,Lq,mem_len)。
 
-        center 行：bias = alpha * exp(-dist / tau)
+        center 行：bias = alpha * exp(-dist / tau)；若 MMDIFF_DISTANCE_BIAS_HSI_ONLY=1 且启用 HSI，
+        仅前 _hsi_mem_tokens 列（HSI memory 块）获得该 bias。
         global 行（可选）：-MMDIFF_GLOBAL_ANTICENTER_BIAS * exp(-dist/tau)，与 center 反号拉大分工。
         """
         g_qk = self.global_query_tokens
@@ -707,7 +718,13 @@ class MultimodalClassifier(nn.Module):
         dist = self._spatial_dist_mem.to(device=device, dtype=dtype)
         b1d = self.center_distance_bias_alpha * torch.exp(-dist / self.center_distance_bias_tau)
         m = torch.zeros(total_q, mem_len, device=device, dtype=dtype)
-        m[g_qk : total_q, :] = b1d.unsqueeze(0).expand(c_qk, -1)
+        if self._distance_bias_hsi_only and self.use_hsi and self._hsi_mem_tokens > 0:
+            hsi_b1d = self.center_distance_bias_alpha * torch.exp(
+                -dist[: self._hsi_mem_tokens] / self.center_distance_bias_tau
+            )
+            m[g_qk : total_q, : self._hsi_mem_tokens] = hsi_b1d.unsqueeze(0).expand(c_qk, -1)
+        else:
+            m[g_qk : total_q, :] = b1d.unsqueeze(0).expand(c_qk, -1)
 
         g_ac = float(os.environ.get("MMDIFF_GLOBAL_ANTICENTER_BIAS") or 0.0)
         if g_ac != 0.0:
@@ -814,6 +831,11 @@ class MultimodalClassifier(nn.Module):
             raise RuntimeError(
                 f"memory 长度 {memory.shape[1]} 与预期 {self.mem_len} 不一致"
             )
+        if self.modality_embed is not None:
+            modal_bias = self.modality_embed.repeat_interleave(
+                self._tokens_per_modality_block, dim=0
+            )
+            memory = memory + modal_bias.unsqueeze(0)
         memory = memory + self.pos_embed_mem
 
         g_qk = self.global_query_tokens

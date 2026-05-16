@@ -7,6 +7,7 @@
 """
 import json
 import os
+import random
 import sys
 import time
 from dataclasses import dataclass
@@ -79,6 +80,18 @@ from .loop import (
 from .classification_metrics import accuracies
 
 CreateClassifierFn = Callable[[Any, Any], torch.nn.Module]
+
+
+def _seed_training_for_reproducibility(seed: int) -> None:
+    """与 param.RANDOM_SEED / MMDIFF_RANDOM_SEED 对齐：Python/NumPy/PyTorch/CUDA + cuDNN 确定性。"""
+    s = int(seed)
+    random.seed(s)
+    np.random.seed(s)
+    torch.manual_seed(s)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(s)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
 
 
 def _state_dict_shape_compatible(model: torch.nn.Module, sd: dict) -> dict:
@@ -230,8 +243,7 @@ def run_training(
         logger = get_logger(log_path)
         writer = get_summary_writer(logger, run_dir)
 
-    torch.manual_seed(RANDOM_SEED)
-    np.random.seed(RANDOM_SEED)
+    _seed_training_for_reproducibility(RANDOM_SEED)
     compare_run = _is_compare_run()
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -888,6 +900,7 @@ def verify_projection_gradients(create_classifier: CreateClassifierFn) -> None:
     log_path.parent.mkdir(parents=True, exist_ok=True)
     logger = get_logger(log_path)
     logger.info('[verify_projection_grad] %s', MULTIMODAL_ABLATION_LOG_LINE)
+    _seed_training_for_reproducibility(RANDOM_SEED)
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     fv, rv, tr_ind, ls = load_train_bundle()
     rgb_hr_vol = None

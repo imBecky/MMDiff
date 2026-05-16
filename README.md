@@ -24,7 +24,9 @@
    python main.py
    ```
 
-   常用可选参数：`--verify-projection-grad`、`--no-artifacts`、`--no-conf-detail`（见 [`main.py`](main.py)）。
+   常用可选参数（见 [`main.py`](main.py)）：
+   - `--seed`：与环境变量 **`MMDIFF_RANDOM_SEED`** 共用同一语义；若在 shell 里已 `export MMDIFF_RANDOM_SEED`，则命令行 **`--seed` 必须与其数值一致**，否则进程会报错退出；若环境中未设置 `MMDIFF_RANDOM_SEED`，传 `--seed` 会等价于为该进程写入 `MMDIFF_RANDOM_SEED`，最终在 [`param.py`](param.py) 中体现为 **`RANDOM_SEED`**。
+   - `--verify-projection-grad`、`--no-artifacts`、`--no-conf-detail`
 
 ---
 
@@ -32,7 +34,7 @@
 
 | 脚本 | 作用 |
 |------|------|
-| [`run.sh`](run.sh) | 7 组 `MMDIFF_MODALITY_COMBO` 串行消融；任一步失败即退出；末尾 **通知 webhook + 关机**（仅适合无人值守主机，使用前请按需裁剪）。 |
+| [`run.sh`](run.sh) | 串行 **3 跑**：① `memory=none` + 增大 `MMDIFF_*_QUERY_TOKENS`；② **`linear`** 压缩（K=`MMDIFF_MEMORY_COMPRESS_TOKENS`）；③ **`grid` G×G**（`MMDIFF_MEMORY_GRID_SIZE`，每模态仍为规则空间栅格，`mem_len` 远小于 121）；任一步失败即退出；末尾 webhook/关机按需裁剪。 |
 | [`run_cls_token_dim_ablation.sh`](run_cls_token_dim_ablation.sh) | 文件名历史遗留：**实际消融**中心距离 **`MMDIFF_CENTER_DISTANCE_BIAS_ALPHA`**（见脚本内注释与 `multimodal.py`）；串行两组 α 调用 `python main.py`。 |
 
 脚本内普遍设置：`OMP_NUM_THREADS`、`MMDIFF_RANDOM_SEED`、`MMDIFF_RUN_TIMESTAMP`，并与 `MMDIFF_EXPERIMENT_TAG` / `MMDIFF_EXPERIMENT_NUM` 配合，避免多组实验写入同一 TensorBoard 目录。

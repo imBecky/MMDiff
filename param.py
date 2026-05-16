@@ -517,6 +517,8 @@ def _apply_mmdiff_env_overrides():
     MMDIFF_FORWARD_TRACE_DEPTH（默认 3）MMDIFF_FORWARD_TRACE_MAX_FORWARDS（默认 1）
     Memory 压缩（由 model/multimodal.py 读取环境变量，不改 opt）：MMDIFF_MEMORY_COMPRESS_MODE=none|grid|linear|latent，
     MMDIFF_MEMORY_GRID_SIZE，MMDIFF_MEMORY_COMPRESS_TOKENS，MMDIFF_MEMORY_KEEP_CENTER_TOKEN=0|1
+    MMDIFF_MODALITY_EMBED=1|0（默认 1）→ 是否启用可学习模态嵌入（零初始化，加在 memory 上）
+    MMDIFF_DISTANCE_BIAS_HSI_ONLY=1|0（默认 1）→ center query 距离 bias 是否只作用于 HSI token 列
     """
     g = globals()
 

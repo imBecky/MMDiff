@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import random
 from typing import Optional, Tuple
 
 import numpy as np
@@ -15,6 +16,7 @@ from param import (
     NUM_CLASSES,
     NUM_WORKERS,
     PATCH_WINDOW_SIZE,
+    RANDOM_SEED,
     RGB_HR_META_PATH,
     TEST_LABELS_PATH,
     TRAIN_LABELS_PATH,
@@ -24,6 +26,19 @@ from param import (
     TRAIN_ROT_AUGMENT_FACTOR,
     USE_RGB_PATCHES,
 )
+
+
+def _dataloader_worker_init(_worker_id: int) -> None:
+    """与 DataLoader(generator=...) 配套，固定多 worker 下 numpy/Python 随机源（如旋转增强）。"""
+    w_seed = int(torch.initial_seed() % (2**32))
+    np.random.seed(w_seed)
+    random.seed(w_seed)
+
+
+def _torch_generator(seed: int) -> torch.Generator:
+    g = torch.Generator()
+    g.manual_seed(int(seed))
+    return g
 
 
 def _patch_array_to_float32(x: np.ndarray) -> np.ndarray:
@@ -384,6 +399,8 @@ def build_test_loader(
         shuffle=False,
         num_workers=NUM_WORKERS,
         pin_memory=pin_memory,
+        worker_init_fn=_dataloader_worker_init,
+        generator=_torch_generator(RANDOM_SEED),
     )
 
 
@@ -428,6 +445,8 @@ def build_dataloaders(
         shuffle=True,
         num_workers=NUM_WORKERS,
         pin_memory=pin_memory,
+        worker_init_fn=_dataloader_worker_init,
+        generator=_torch_generator(RANDOM_SEED),
     )
 
     val_loader = None
@@ -451,6 +470,8 @@ def build_dataloaders(
             shuffle=False,
             num_workers=NUM_WORKERS,
             pin_memory=pin_memory,
+            worker_init_fn=_dataloader_worker_init,
+            generator=_torch_generator(RANDOM_SEED),
         )
 
     test_loader = None

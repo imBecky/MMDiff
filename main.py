@@ -9,7 +9,46 @@ except ValueError:
     os.environ["OMP_NUM_THREADS"] = "4"
 
 import argparse
+import sys
 from pathlib import Path
+
+
+def _apply_cli_seed_before_param_import() -> None:
+    """
+    在 import model/pipeline/param 之前执行。
+    - 若未传 ``--seed``：不写环境变量。
+    - 若已设置 ``MMDIFF_RANDOM_SEED`` 且与 ``--seed`` 数值不同：报错退出。
+    - 若未设置 ``MMDIFF_RANDOM_SEED`` 且传了 ``--seed``：写入 ``MMDIFF_RANDOM_SEED``，使 param 与 runner 仍为唯一归宿。
+    """
+    probe = argparse.ArgumentParser(add_help=False)
+    probe.add_argument("--seed", type=int, default=None)
+    args_early, _ = probe.parse_known_args()
+    if args_early.seed is None:
+        return
+    raw = (os.environ.get("MMDIFF_RANDOM_SEED") or "").strip()
+    if raw != "":
+        try:
+            env_seed = int(raw)
+        except ValueError:
+            print(
+                f"MMDIFF_RANDOM_SEED={raw!r} 无法解析为整数，请先修正环境变量或使用 --seed 前 unset。",
+                file=sys.stderr,
+            )
+            sys.exit(2)
+        if env_seed != int(args_early.seed):
+            print(
+                '[错误] `--seed=%s` 与 `MMDIFF_RANDOM_SEED=%s`（=%d）不一致；'
+                "请只保留其一或两者设为同一整数后再运行。"
+                % (args_early.seed, raw, env_seed),
+                file=sys.stderr,
+            )
+            sys.exit(2)
+        return
+    os.environ["MMDIFF_RANDOM_SEED"] = str(int(args_early.seed))
+
+
+if __name__ == "__main__":
+    _apply_cli_seed_before_param_import()
 
 import model as Model
 from pipeline import TrainingRunOptions, run_training, verify_projection_gradients
@@ -23,6 +62,15 @@ def create_classifier(opt_cfg, diffusion=None):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="多模态分类训练 / 投影梯度验证")
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=None,
+        help=(
+            "随机种子（无 MMDIFF_RANDOM_SEED 时写入该环境变量，使与 param.RANDOM_SEED 一致）；"
+            "若环境中已设置 MMDIFF_RANDOM_SEED 则必须与此处数值一致，否则报错退出"
+        ),
+    )
     parser.add_argument(
         "--verify-projection-grad",
         action="store_true",
