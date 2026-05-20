@@ -83,15 +83,41 @@ CreateClassifierFn = Callable[[Any, Any], torch.nn.Module]
 
 
 def _seed_training_for_reproducibility(seed: int) -> None:
-    """与 param.RANDOM_SEED / MMDIFF_RANDOM_SEED 对齐：Python/NumPy/PyTorch/CUDA + cuDNN 确定性。"""
+    """与 param.RANDOM_SEED / MMDIFF_RANDOM_SEED 对齐。
+
+    cuDNN 确定性 + TF32/matmul「最高精度」：避免 Ampere 上默认 TF32/benchmark 轨迹漂移。
+    论文级复现：run.sh 须在 Python 启动前 export ``CUBLAS_WORKSPACE_CONFIG=:4096:8``（cuBLAS GEMM）；
+    关闭 flash/mem_efficient SDP 以消除 Attention backward 非确定性警告；
+    grid 模式 adaptive_avg_pool 已在 multimodal.py 换为确定性手写实现。
+    """
     s = int(seed)
     random.seed(s)
     np.random.seed(s)
     torch.manual_seed(s)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(s)
+    torch.backends.cudnn.enabled = True
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
+    try:
+        torch.set_float32_matmul_precision("highest")
+    except AttributeError:
+        pass
+    if hasattr(torch.backends, "cuda") and hasattr(torch.backends.cuda.matmul, "allow_tf32"):
+        torch.backends.cuda.matmul.allow_tf32 = False
+    if hasattr(torch.backends, "cudnn") and hasattr(torch.backends.cudnn, "allow_tf32"):
+        torch.backends.cudnn.allow_tf32 = False
+    # 关闭 flash / mem_efficient SDP，强制走 math SDP，消除 Attention backward 非确定性警告。
+    try:
+        torch.backends.cuda.enable_flash_sdp(False)
+        torch.backends.cuda.enable_mem_efficient_sdp(False)
+        torch.backends.cuda.enable_math_sdp(True)
+    except Exception:
+        pass
+    try:
+        torch.use_deterministic_algorithms(True, warn_only=True)
+    except Exception:
+        pass
 
 
 def _state_dict_shape_compatible(model: torch.nn.Module, sd: dict) -> dict:
@@ -176,6 +202,9 @@ def run_training(
     no_artifacts = bool(opts.no_artifacts)
     save_conf_detail = bool(opts.save_conf_detail)
 
+    # 早于 TB 目录推断 / 加载数据（避免别处误用 RNG；并尽快覆盖 param 顶层设的 cudnn.benchmark）
+    _seed_training_for_reproducibility(RANDOM_SEED)
+
     resume_ckpt = _normalize_resume_path(RESUME_CHECKPOINT)
     resume_ts = None
     run_log_dir_str = ''
@@ -243,7 +272,6 @@ def run_training(
         logger = get_logger(log_path)
         writer = get_summary_writer(logger, run_dir)
 
-    _seed_training_for_reproducibility(RANDOM_SEED)
     compare_run = _is_compare_run()
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')

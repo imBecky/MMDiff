@@ -7,16 +7,19 @@
 ## 快速开始
 
 1. **准备数据**  
-   - 放置 `houston2018.mat`（键名约定见 [`utils/Houston_mat_convention.md`](utils/Houston_mat_convention.md)）。  
-   - 根据实际情况修改 [`data_prepare.py`](data_prepare.py) 顶部 `DATA_PATH` 与输出 `DATA_DIR`（默认可与 [`param.py`](param.py) 中路径对齐）。
+   - **Houston**：放置 `houston2018.mat`（键名约定见 [`utils/Houston_mat_convention.md`](utils/Houston_mat_convention.md)）。  
+   - **SZUTree 多分文件**：同目录 `HSI.mat`、`LiDAR.mat`、`RGB.mat`、`label.mat`（与 [`utils/extract_szutree_dataset.py`](utils/extract_szutree_dataset.py) 一致）；可直接 `python data_prepare.py --szutree-dir <该目录>`，或先 `--export` 再跑融合 `.mat`。  
+   - 融合 `.mat` 时可根据实际情况修改 [`data_prepare.py`](data_prepare.py) 内 `DATA_PATH`，或传 `--mat`；输出目录可用 `--prepared-dir` 覆盖（不传则按路径是否含 `szutree` 推断，与历史上 `param.py` 的常见布局一致）。训练前请让 [`param.py`](param.py) 的 `DATA_DIR` 指向生成的 `prepared`。
 
 2. **生成 `.npy` 与索引**
 
    ```bash
    python data_prepare.py
+   # SZUTree 四文件同目录时（写出到 <目录>/prepared/）：
+   python data_prepare.py --szutree-dir /path/to/SZUTreeData_R1_2.0
    ```
 
-   主要产物：`train_patches.npy`（HSI+LiDAR）、`train_rgb_patches.npy`、`rgb_hr.npy`、`rgb_hr.meta.json`、`train_labels.npy` / `test_labels.npy`、`label_shift.npy`（详见 `data_prepare.py` 文件头）。
+   主要产物：`train_patches.npy`（HSI+LiDAR）、`train_rgb_patches.npy`、`rgb_hr.npy`（**文件名历史遗留**，实为与 LR 对齐的裁切 RGB 整幅）、`rgb_hr.meta.json`、`train_labels.npy` / `test_labels.npy`、`label_shift.npy`（语义见 `data_prepare.py` 文件头）。
 
 3. **训练**
 
@@ -27,6 +30,15 @@
    常用可选参数（见 [`main.py`](main.py)）：
    - `--seed`：与环境变量 **`MMDIFF_RANDOM_SEED`** 共用同一语义；若在 shell 里已 `export MMDIFF_RANDOM_SEED`，则命令行 **`--seed` 必须与其数值一致**，否则进程会报错退出；若环境中未设置 `MMDIFF_RANDOM_SEED`，传 `--seed` 会等价于为该进程写入 `MMDIFF_RANDOM_SEED`，最终在 [`param.py`](param.py) 中体现为 **`RANDOM_SEED`**。
    - `--verify-projection-grad`、`--no-artifacts`、`--no-conf-detail`
+
+4. **快速验证可复现性**（不必跑完整训练，约 1–3 分钟）
+
+   ```bash
+   export MMDIFF_RANDOM_SEED=42 PYTHONHASHSEED=0 CUBLAS_WORKSPACE_CONFIG=:4096:8
+   python scripts/verify_reproducibility.py
+   ```
+
+   详见 [`scripts/verify_reproducibility.py`](scripts/verify_reproducibility.py) 与 `agent-collab/README.md`。
 
 ---
 
@@ -75,9 +87,9 @@ MSDQ/
 - **TensorBoard run 命名**：`prepare_tb_run_dir()`（时间戳、e 编号、`MMDIFF_EXPERIMENT_TAG` 等）。  
 - **可选损失**：全局 + center 双 CE（`USE_CENTER_LOSS`），`pipeline/loop.compute_classification_loss`。
 
-### RGB 严格视野与高分辨率块
+### RGB 严格视野与 `rgb_hr*.npy` 命名
 
-启用 RGB 时，`pipeline/data.py` 可走 HR 对齐路径（依赖 `rgb_hr.npy` + `rgb_hr.meta.json`，由 `data_prepare.py` 写出）。
+启用 RGB 时，`pipeline/data.py` 走严格视野路径时依赖 **`rgb_hr.npy` + `rgb_hr.meta.json`**（文件名历史遗留；文件内是 **`data_prepare` 按 LR 格网对齐裁切的 RGB**，若 `.mat` 中 RGB 已与 HSI 同尺寸则与 LR 同大，不要求单独再准备一套「HR 数据集」）。
 
 ---
 

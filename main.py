@@ -49,6 +49,10 @@ def _apply_cli_seed_before_param_import() -> None:
 
 if __name__ == "__main__":
     _apply_cli_seed_before_param_import()
+    import param
+    from pipeline.runner import _seed_training_for_reproducibility
+
+    _seed_training_for_reproducibility(param.RANDOM_SEED)
 
 import model as Model
 from pipeline import TrainingRunOptions, run_training, verify_projection_gradients

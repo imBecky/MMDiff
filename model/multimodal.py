@@ -248,7 +248,8 @@ class LidarMorphEncoder(nn.Module):
 
     def forward(self, lidar: torch.Tensor) -> torch.Tensor:
         feat = self.forward_spatial(lidar)
-        pooled = F.adaptive_avg_pool2d(feat, output_size=1).flatten(1)
+        # mean over spatial dims：确定性，等价于 adaptive_avg_pool2d(output_size=1)
+        pooled = feat.mean(dim=(2, 3))
         return self.proj(pooled)
 
 
@@ -256,6 +257,27 @@ def _spatial_flatten(x: torch.Tensor) -> torch.Tensor:
     """B×D×11×11 → B×121×D"""
     b, d, h, w = x.shape
     return x.flatten(2).transpose(1, 2).contiguous()
+
+
+def _det_grid_avg_pool(x: torch.Tensor, grid_size: int) -> torch.Tensor:
+    """确定性 grid 平均池化：B×D×H×W → B×D×G×G。
+
+    用等分 bin 手写，替换 adaptive_avg_pool2d（其 CUDA backward 无确定性实现）。
+    H/W 须能被 grid_size 整除，否则最后一 bin 多包含一行/列（与 adaptive 语义一致）。
+    对 H=W=11、G=6 的典型情况：前 5 个 bin 长 1，最后一个 bin 长 6（11=5×1+6/11 非整除
+    时 adaptive 的 bin 边界按 floor/ceil 分配，此函数复现同一 bin 划分）。
+    """
+    b, d, h, w = x.shape
+    g = int(grid_size)
+    # 按 adaptive_avg_pool2d 的 bin 边界：start_i = floor(i*H/G), end_i = floor((i+1)*H/G)
+    rows = [x[:, :, int(i * h // g):int((i + 1) * h // g), :] for i in range(g)]
+    # 对每行 bin 再沿 W 分 bin
+    cells = []
+    for row_slice in rows:
+        cols = [row_slice[:, :, :, int(j * w // g):int((j + 1) * w // g)] for j in range(g)]
+        cells.append(torch.stack([c.mean(dim=(2, 3)) for c in cols], dim=-1))  # B×D×G
+    # cells: list of G tensors each B×D×G → stack → B×D×G×G
+    return torch.stack(cells, dim=2)  # B×D×G×G
 
 
 def _make_spatial_distance_vector(num_modalities: int) -> torch.Tensor:
@@ -682,7 +704,8 @@ class MultimodalClassifier(nn.Module):
         if mode == "none":
             toks = _spatial_flatten(feats_bottle)
         elif mode == "grid":
-            pooled = F.adaptive_avg_pool2d(feats_bottle, output_size=self.memory_grid_size)
+            # 确定性手写 grid 池化，替换 adaptive_avg_pool2d（backward 无确定性 CUDA 实现）
+            pooled = _det_grid_avg_pool(feats_bottle, self.memory_grid_size)
             toks = pooled.flatten(2).transpose(1, 2).contiguous()
         elif mode == "linear":
             if self.memory_linear_compress_121_K is None:

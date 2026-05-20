@@ -71,16 +71,16 @@ def _require_prepared_data_files():
     if USE_RGB_PATCHES:
         if not TRAIN_RGB_HR_PATH.is_file():
             raise FileNotFoundError(
-                f'启用 rgb 需要 {TRAIN_RGB_HR_PATH}，请运行 data_prepare 生成 rgb_hr.npy'
+                f'启用 rgb 需要 {TRAIN_RGB_HR_PATH}（严格视野 RGB 整幅；文件名为 rgb_hr.npy 属历史遗留），请运行 data_prepare'
             )
         if not RGB_HR_META_PATH.is_file():
             raise FileNotFoundError(
-                f'启用 rgb 需要 {RGB_HR_META_PATH}，请运行 data_prepare 生成 rgb_hr.meta.json'
+                f'启用 rgb 需要 {RGB_HR_META_PATH}（rgb_hr.meta.json），请运行 data_prepare'
             )
 
 
 def load_rgb_hr_meta() -> dict:
-    """读取 rgb_hr.meta.json（rh/rw、LR/HR 形状、严格视野块尺寸）。"""
+    """读取 rgb_hr.meta.json（rh/rw、LR 格与对齐裁切记空间、`strict_*` 块像素尺寸；文件名历史遗留）。"""
     if not RGB_HR_META_PATH.is_file():
         raise FileNotFoundError(f'缺少 {RGB_HR_META_PATH}，请先运行 data_prepare.py')
     with open(RGB_HR_META_PATH, encoding='utf-8') as f:
@@ -88,7 +88,7 @@ def load_rgb_hr_meta() -> dict:
 
 
 def load_rgb_hr_volume():
-    """mmap 整幅归一化 HR RGB（与 train_rgb_patches 栅格对齐的裁切区域）。"""
+    """mmap 严格视野 RGB 整幅（on-disk：`rgb_hr.npy`，与 LR 对齐的裁切区；可能与 LR 同尺寸）。"""
     if not TRAIN_RGB_HR_PATH.is_file():
         raise FileNotFoundError(f'缺少 {TRAIN_RGB_HR_PATH}，请先运行 data_prepare.py')
     return np.load(TRAIN_RGB_HR_PATH, mmap_mode='r')

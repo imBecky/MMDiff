@@ -108,6 +108,8 @@ def prepare_tb_run_dir():
     默认短名（便于 TB 看图）：``{ts}_e{NN}_lr{slug}`` 或 ``{ts}_{紧凑tag}``。
     若同时设置了 ``MMDIFF_EXPERIMENT_NUM`` 与 ``MMDIFF_EXPERIMENT_TAG``，短名会在 e+lr 后
     **追加紧凑 tag**（避免串行多组消融共用同一时间戳时写入同一目录）。
+    **``MMDIFF_TB_SIMPLE_RUN_DIR=1``** 且 **已设 EXPERIMENT_TAG** 时：目录名仅用 ``{前缀}{ts}_{tag}``，
+    **不拼 e 编号与 lr**，与「实验标签从简」脚本一致。
     长目录名：``MMDIFF_TB_LONG_TAG=1`` 时在 e+lr 后再拼**完整** EXPERIMENT_TAG（替代紧凑后缀）。
     """
     TB_LOG_ROOT.mkdir(parents=True, exist_ok=True)
@@ -116,8 +118,23 @@ def prepare_tb_run_dir():
     prefix = (RUN_NAME_PREFIX or '').strip()
     exp_raw = (os.environ.get('MMDIFF_EXPERIMENT_NUM') or '').strip()
     want_long = (os.environ.get('MMDIFF_TB_LONG_TAG') or '').strip().lower() in ('1', 'true', 'yes', 'y')
+    simple_tb = (os.environ.get('MMDIFF_TB_SIMPLE_RUN_DIR') or '').strip().lower() in (
+        '1',
+        'true',
+        'yes',
+        'y',
+    )
 
-    if exp_raw:
+    if simple_tb and tag:
+        if want_long:
+            safe = re.sub(r'[^\w\-.]', '_', tag)
+        else:
+            safe = _compact_tb_tag(tag)
+        if prefix:
+            run_name = f'{prefix}_{ts}_{safe}'
+        else:
+            run_name = f'{ts}_{safe}'
+    elif exp_raw:
         try:
             exp_n = int(exp_raw)
             exp_part = f'e{exp_n:02d}'

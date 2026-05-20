@@ -268,7 +268,7 @@ STUDENT_IN_CHANNELS = 3
 STUDENT_CHANNELS = (128, 256, 512, 512)
 STUDENT_LAYERS_PER_BLOCK = 2
 
-# HR 严格视野（唯一 RGB 空间对齐）：需 data_prepare 生成 rgb_hr.npy + rgb_hr.meta.json
+# RGB 严格视野：data_prepare 写出 rgb_hr*.npy/json（文件名历史遗留；内容与 LR 格网对齐裁切，可与 LR 同尺寸）
 TRAIN_RGB_HR_PATH = DATA_DIR / 'rgb_hr.npy'
 RGB_HR_META_PATH = DATA_DIR / 'rgb_hr.meta.json'
 
@@ -464,8 +464,10 @@ def build_opt():
 opt = Logger.dict_to_nonedict(build_opt())
 opt = Logger.dict_to_nonedict(opt)
 
+# benchmark=False 是复现性所必须；runner._seed_training_for_reproducibility 会再次确认。
+# 若需压测最高吞吐可在完成对照实验后临时改为 True（会破坏 bitwise 复现）。
 torch.backends.cudnn.enabled = True
-torch.backends.cudnn.benchmark = True
+torch.backends.cudnn.benchmark = False
 
 # 覆盖 student 相关维度（与 build_opt 一致，便于单处改 STUDENT_*）
 opt['model']['image_size'] = STUDENT_SIZE
@@ -513,12 +515,12 @@ def _apply_mmdiff_env_overrides():
     MMDIFF_SCHEDULER_NAME / MMDIFF_SCHED_STEP_RATIOS / MMDIFF_SCHED_GAMMAS / MMDIFF_SCHED_COSINE_* → 见文件头 SCHEDULER_*
     MMDIFF_FREEZE_RGB_STUDENT=1 → 冻结轻量 RGB 编码器并重建优化器（续训 resume 时不走该分支）
     MMDIFF_RANDOM_SEED → RANDOM_SEED（torch/np 与划分等）
+    训练入口见 pipeline/runner._seed_training_for_reproducibility：cuDNN deterministic、关 TF32、use_deterministic_algorithms(warn_only=True)；论文级另须在 python 前 export CUBLAS_WORKSPACE_CONFIG=:4096:8（见 run.sh）
     MMDIFF_FORWARD_TRACE / MMDIFF_LOG_DATAFLOW=1 → model.log 中按前向打印子模块 in/out 形状（动态数据流）
     MMDIFF_FORWARD_TRACE_DEPTH（默认 3）MMDIFF_FORWARD_TRACE_MAX_FORWARDS（默认 1）
+    MMDIFF_TB_SIMPLE_RUN_DIR=1|0 → 已设 MMDIFF_EXPERIMENT_TAG 时 TB/run 目录为 ``{ts}_{tag}``，不拼 e 编号/lr（见 logging_utils.prepare_tb_run_dir）
     Memory 压缩（由 model/multimodal.py 读取环境变量，不改 opt）：MMDIFF_MEMORY_COMPRESS_MODE=none|grid|linear|latent，
     MMDIFF_MEMORY_GRID_SIZE，MMDIFF_MEMORY_COMPRESS_TOKENS，MMDIFF_MEMORY_KEEP_CENTER_TOKEN=0|1
-    MMDIFF_MODALITY_EMBED=1|0（默认 1）→ 是否启用可学习模态嵌入（零初始化，加在 memory 上）
-    MMDIFF_DISTANCE_BIAS_HSI_ONLY=1|0（默认 1）→ center query 距离 bias 是否只作用于 HSI token 列
     """
     g = globals()
 

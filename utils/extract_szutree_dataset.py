@@ -280,16 +280,19 @@ def run_inspect(r1_dir: Path, detail: bool = False) -> None:
         print("  LR 前景类像素 (label>0):", int((lr > 0).sum()))
 
 
-def run_export(
+def assemble_szutree_split_mats_payload(
     r1_dir: Path,
-    out_mat: Path,
     train_percent: float,
     seed: int,
     num_classes: int,
     save_train_test_dense: bool,
     *,
     show_progress: bool = True,
-) -> None:
+) -> dict:
+    """
+    与同目录下的 HSI.mat / LiDAR.mat / RGB.mat / label.mat 读出并拼装为 fusion 字典（键与 houston2018 兼容：hsi,lidar,rgb,train,test）。
+    train/test 默认可为 CSR；也可保存前转稠密。供 `extract_szutree_dataset.run_export` 与根目录 `data_prepare.py --szutree-dir` 复用。
+    """
     hsi = load_hsi_h5(r1_dir / "HSI.mat", show_progress=show_progress)
     lidar = load_lidar_h5(r1_dir / "LiDAR.mat", show_progress=show_progress)
     rgb = load_rgb_mat(r1_dir / "RGB.mat", show_progress=show_progress)
@@ -331,31 +334,51 @@ def run_export(
             file=sys.stderr,
         )
 
-    out_mat.parent.mkdir(parents=True, exist_ok=True)
-
+    common = {
+        "hsi": hsi.astype(np.float32, copy=False),
+        "lidar": lidar.astype(np.float32, copy=False),
+        "rgb": rgb.astype(np.uint8, copy=False),
+    }
     if save_train_test_dense:
         if show_progress:
             tqdm.write(
                 "train/test 稀疏 → 稠密（可能较慢、占内存）…",
                 file=sys.stderr,
             )
-        train_arr = train_sp.toarray()
-        test_arr = test_sp.toarray()
-        payload = {
-            "hsi": hsi.astype(np.float32, copy=False),
-            "lidar": lidar.astype(np.float32, copy=False),
-            "rgb": rgb.astype(np.uint8, copy=False),
-            "train": train_arr,
-            "test": test_arr,
+        return {
+            **common,
+            "train": train_sp.toarray(),
+            "test": test_sp.toarray(),
         }
+    return {**common, "train": train_sp, "test": test_sp}
+
+
+def run_export(
+    r1_dir: Path,
+    out_mat: Path,
+    train_percent: float,
+    seed: int,
+    num_classes: int,
+    save_train_test_dense: bool,
+    *,
+    show_progress: bool = True,
+) -> None:
+    payload = assemble_szutree_split_mats_payload(
+        r1_dir,
+        train_percent,
+        seed,
+        num_classes,
+        save_train_test_dense,
+        show_progress=show_progress,
+    )
+    train_sp = payload["train"]
+    if hasattr(train_sp, "nnz"):
+        train_nnz, test_nnz = int(train_sp.nnz), int(payload["test"].nnz)
     else:
-        payload = {
-            "hsi": hsi.astype(np.float32, copy=False),
-            "lidar": lidar.astype(np.float32, copy=False),
-            "rgb": rgb.astype(np.uint8, copy=False),
-            "train": train_sp,
-            "test": test_sp,
-        }
+        train_nnz = int(np.count_nonzero(payload["train"]))
+        test_nnz = int(np.count_nonzero(payload["test"]))
+
+    out_mat.parent.mkdir(parents=True, exist_ok=True)
 
     if show_progress:
         with tqdm(
@@ -372,7 +395,7 @@ def run_export(
         "完成。HSI 为 98 波段、无 PCA。"
         " 运行 data_prepare 与训练前请设置: MMDIFF_HSI_CHANNELS=98"
     )
-    print(f"  train 非零: {train_sp.nnz}, test 非零: {test_sp.nnz}")
+    print(f"  train 非零: {train_nnz}, test 非零: {test_nnz}")
 
 
 def main() -> None:
